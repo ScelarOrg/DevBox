@@ -205,7 +205,7 @@ export const PORT_RANGE = {
 // CDN
 // ---------------------------------------------------------------------------
 
-export const DEFAULT_NODEPOD_CDN = "https://unpkg.com/nodepod/dist/index.js";
+export const DEFAULT_NODEPOD_CDN = "https://unpkg.com/@scelar/nodepod/dist/index.js";
 
 // ---------------------------------------------------------------------------
 // PIDs

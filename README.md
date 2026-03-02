@@ -1,7 +1,7 @@
 # nodepod
 
-[![npm version](https://img.shields.io/npm/v/nodepod.svg)](https://www.npmjs.com/package/nodepod)
-[![license](https://img.shields.io/npm/l/nodepod.svg)](https://github.com/ScelarOrg/Nodepod/blob/main/LICENSE)
+[![npm version](https://img.shields.io/npm/v/@scelar/nodepod.svg)](https://www.npmjs.com/package/@scelar/nodepod)
+[![license](https://img.shields.io/npm/l/@scelar/nodepod.svg)](https://github.com/ScelarOrg/Nodepod/blob/main/LICENSE)
 
 Browser-native Node.js runtime. Run real Node.js code — filesystem, modules, `require()`, npm packages, HTTP servers — entirely inside the browser.
 
@@ -24,13 +24,13 @@ Built by [@R1ck404](https://github.com/R1ck404) — powering [Scelar](https://sc
 ## Install
 
 ```bash
-npm install nodepod
+npm install @scelar/nodepod
 ```
 
 ## Quick Start
 
 ```typescript
-import { Nodepod } from 'nodepod';
+import { Nodepod } from '@scelar/nodepod';
 
 // Boot a nodepod instance with some files
 const nodepod = await Nodepod.boot({
@@ -54,7 +54,7 @@ const content = await nodepod.fs.readFile('/data.json', 'utf8');
 nodepod provides built-in xterm.js terminal support:
 
 ```typescript
-import { Nodepod } from 'nodepod';
+import { Nodepod } from '@scelar/nodepod';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 
@@ -201,10 +201,10 @@ Once published to npm, nodepod is automatically available on CDNs:
 
 ```html
 <!-- unpkg -->
-<script src="https://unpkg.com/nodepod"></script>
+<script src="https://unpkg.com/@scelar/nodepod"></script>
 
 <!-- jsDelivr -->
-<script src="https://cdn.jsdelivr.net/npm/nodepod"></script>
+<script src="https://cdn.jsdelivr.net/npm/@scelar/nodepod"></script>
 ```
 
 ## Development
