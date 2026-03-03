@@ -167,6 +167,12 @@ EventEmitter.prototype.emit = function emit(name: string, ...payload: unknown[])
     return false;
   }
 
+  // Fast path: single listener — avoid slice() allocation
+  if (slot.length === 1) {
+    try { slot[0].apply(this, payload); } catch (_) { /* swallow */ }
+    return true;
+  }
+
   const snapshot = slot.slice();
   for (const handler of snapshot) {
     try {

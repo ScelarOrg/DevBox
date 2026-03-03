@@ -381,8 +381,10 @@ export class MemoryVolume {
 
   private writeInternal(p: string, data: string | Uint8Array, notify: boolean): void {
     const norm = this.normalize(p);
-    const parentPath = this.parentOf(norm);
-    const name = this.nameOf(norm);
+    // Derive parent/name directly — norm is already normalized, no need to re-normalize
+    const lastSlash = norm.lastIndexOf('/');
+    const parentPath = lastSlash <= 0 ? '/' : norm.slice(0, lastSlash);
+    const name = norm.slice(lastSlash + 1);
 
     if (!name) {
       throw new Error(`EISDIR: illegal operation on a directory, '${p}'`);
@@ -822,8 +824,11 @@ export class MemoryVolume {
   }
 
   private triggerWatchers(changedPath: string, event: WatchEventKind): void {
-    const norm = this.normalize(changedPath);
-    const fileName = this.nameOf(norm);
+    // changedPath is already normalized by the caller — no need to re-normalize
+    const norm = changedPath;
+    const lastSlash = norm.lastIndexOf('/');
+    const fileName = norm.slice(lastSlash + 1);
+    const directParent = lastSlash <= 0 ? '/' : norm.slice(0, lastSlash);
 
     const direct = this.activeWatchers.get(norm);
     if (direct) {
@@ -835,7 +840,7 @@ export class MemoryVolume {
     }
 
     // walk up the tree to notify parent/recursive watchers
-    let current = this.parentOf(norm);
+    let current = directParent;
     let relative = fileName;
 
     while (current) {
@@ -843,8 +848,7 @@ export class MemoryVolume {
       if (parentWatchers) {
         for (const w of parentWatchers) {
           if (w.active) {
-            const isDirectChild = this.parentOf(norm) === current;
-            if (w.recursive || isDirectChild) {
+            if (w.recursive || current === directParent) {
               try { w.callback(event, relative); } catch (e) { console.error('Watcher error:', e); }
             }
           }
@@ -852,8 +856,10 @@ export class MemoryVolume {
       }
 
       if (current === '/') break;
-      relative = this.nameOf(current) + '/' + relative;
-      current = this.parentOf(current);
+      const idx = current.lastIndexOf('/');
+      const currentName = current.slice(idx + 1);
+      relative = currentName + '/' + relative;
+      current = idx <= 0 ? '/' : current.slice(0, idx);
     }
 
   }

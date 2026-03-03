@@ -1102,8 +1102,11 @@ function buildResolver(
   codeCache?: Map<string, string>,
   deAsyncImports = false,
 ): ResolverFn {
-  const resolveCache = new Map<string, string | null>();
-  const manifestCache = new Map<string, PackageManifest | null>();
+  // Shared across all resolvers — avoids re-resolving the same paths/manifests per module
+  const resolveCache: Map<string, string | null> =
+    (cache as any).__resolveCache ?? ((cache as any).__resolveCache = new Map());
+  const manifestCache: Map<string, PackageManifest | null> =
+    (cache as any).__manifestCache ?? ((cache as any).__manifestCache = new Map());
   // Shared across all resolvers — deduplicates same-version packages from nested node_modules
   const _pkgIdentityMap: Record<string, string> =
     (cache as any).__pkgIdentityMap ?? ((cache as any).__pkgIdentityMap = {});
@@ -3306,6 +3309,10 @@ export class ScriptEngine {
   clearCache(): void {
     for (const k of Object.keys(this.moduleRegistry))
       delete this.moduleRegistry[k];
+    // Also clear shared resolver/manifest caches
+    (this.moduleRegistry as any).__resolveCache?.clear();
+    (this.moduleRegistry as any).__manifestCache?.clear();
+    delete (this.moduleRegistry as any).__pkgIdentityMap;
   }
 
   getVolume(): MemoryVolume {

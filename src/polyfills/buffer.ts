@@ -6,6 +6,11 @@ import { bytesToBase64, base64ToBytes, bytesToHex, bytesToLatin1 } from '../help
 const textEnc = new TextEncoder();
 const textDec = new TextDecoder('utf-8');
 
+// Pre-computed hex char → nibble value lookup (0-255 for valid hex chars, 0 for invalid)
+const HEX_DECODE = new Uint8Array(128);
+for (let i = 0; i < 10; i++) HEX_DECODE[48 + i] = i;         // '0'-'9'
+for (let i = 0; i < 6; i++) { HEX_DECODE[65 + i] = 10 + i; HEX_DECODE[97 + i] = 10 + i; } // 'A'-'F', 'a'-'f'
+
 // ---- The main BufferPolyfill class ----
 
 class BufferPolyfill extends Uint8Array {
@@ -49,7 +54,7 @@ class BufferPolyfill extends Uint8Array {
       if (enc === 'hex') {
         const octets = new Uint8Array(source.length >>> 1);
         for (let i = 0; i < source.length; i += 2) {
-          octets[i >>> 1] = parseInt(source.substring(i, i + 2), 16);
+          octets[i >>> 1] = (HEX_DECODE[source.charCodeAt(i)] << 4) | HEX_DECODE[source.charCodeAt(i + 1)];
         }
         return new BufferPolyfill(octets);
       }
