@@ -96,11 +96,15 @@ export class Nodepod {
           const result = await this._processManager.dispatchHttpRequest(
             port, method, url, headers, bodyStr,
           );
+          // Body can be ArrayBuffer (binary) or string (text)
+          const respBody = result.body instanceof ArrayBuffer
+            ? Buffer.from(new Uint8Array(result.body))
+            : Buffer.from(result.body);
           return {
             statusCode: result.statusCode,
             statusMessage: result.statusMessage,
             headers: result.headers,
-            body: Buffer.from(result.body),
+            body: respBody,
           };
         },
       };

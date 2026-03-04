@@ -217,7 +217,7 @@ export class ProcessManager extends EventEmitter {
     path: string,
     headers: Record<string, string>,
     body?: string | null,
-  ): Promise<{ statusCode: number; statusMessage: string; headers: Record<string, string>; body: string }> {
+  ): Promise<{ statusCode: number; statusMessage: string; headers: Record<string, string>; body: string | ArrayBuffer }> {
     const pid = this._serverPorts.get(port);
     if (pid === undefined) {
       return Promise.resolve({

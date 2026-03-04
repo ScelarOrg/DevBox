@@ -362,11 +362,12 @@ ServerResponse.prototype.end = function end(
     this._hdrs.forEach((v: string | string[], k: string) => {
       flatHdrs[k] = Array.isArray(v) ? v.join(", ") : v;
     });
+    const finalBody = Buffer.concat(this._chunks);
     this._completionCallback({
       statusCode: this.statusCode,
       statusMessage: this.statusMessage,
       headers: flatHdrs,
-      body: Buffer.concat(this._chunks),
+      body: finalBody,
     });
   }
 

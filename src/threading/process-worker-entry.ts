@@ -511,15 +511,19 @@ async function handleHttpRequest(msg: {
       msg.headers,
       bodyBuf,
     );
-    // Can't transfer Buffer via postMessage, convert to string
-    let bodyStr = "";
+    // Transfer body as ArrayBuffer to avoid UTF-8 corruption of binary data
+    let bodyVal: string | ArrayBuffer = "";
+    const transferList: Transferable[] = [];
     if (result.body) {
       if (typeof result.body === "string") {
-        bodyStr = result.body;
+        bodyVal = result.body;
       } else if (result.body instanceof Uint8Array || Buffer.isBuffer(result.body)) {
-        bodyStr = new TextDecoder().decode(result.body);
+        const bytes = result.body instanceof Uint8Array ? result.body : new Uint8Array(result.body);
+        const ab = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+        bodyVal = ab;
+        transferList.push(ab);
       } else {
-        bodyStr = String(result.body);
+        bodyVal = String(result.body);
       }
     }
 
@@ -529,8 +533,8 @@ async function handleHttpRequest(msg: {
       statusCode: result.statusCode,
       statusMessage: result.statusMessage,
       headers: result.headers,
-      body: bodyStr,
-    } as any);
+      body: bodyVal,
+    } as any, transferList);
   } catch (e: any) {
     console.error(`[DEBUG] handleHttpRequest caught:`, e?.message, "\nStack:", e?.stack?.split?.("\n")?.slice(0, 8)?.join("\n"));
     post({
