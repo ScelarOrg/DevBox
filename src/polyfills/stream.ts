@@ -836,6 +836,7 @@ Writable.prototype.destroy = function destroy(fault?: Error): any {
   this._destroy(fault ?? null, (err: Error | null | undefined) => {
     if (err && !fault) this.errored = err;
     this._parts.length = 0;
+    this._corkedWrites.length = 0;
     this._writableByteLength = 0;
     this._closed = true;
     this.writable = false;

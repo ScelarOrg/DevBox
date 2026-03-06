@@ -13,6 +13,9 @@ import { downloadAndExtract } from "./archive-extractor";
 import { convertPackage, prepareTransformer } from "../module-transformer";
 import type { PackageManifest } from "../types/manifest";
 import * as path from "../polyfills/path";
+import type { IDBSnapshotCache } from "../persistence/idb-cache";
+import { quickDigest } from "../helpers/digest";
+import { base64ToBytes } from "../helpers/byte-encoding";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -87,11 +90,13 @@ export class DependencyInstaller {
   private vol: MemoryVolume;
   private registryClient: RegistryClient;
   private workingDir: string;
+  private _snapshotCache: IDBSnapshotCache | null;
 
-  constructor(vol: MemoryVolume, opts: { cwd?: string } & RegistryConfig = {}) {
+  constructor(vol: MemoryVolume, opts: { cwd?: string; snapshotCache?: IDBSnapshotCache | null } & RegistryConfig = {}) {
     this.vol = vol;
     this.registryClient = new RegistryClient(opts);
     this.workingDir = opts.cwd || "/";
+    this._snapshotCache = opts.snapshotCache ?? null;
   }
 
   // -----------------------------------------------------------------------
@@ -157,6 +162,37 @@ export class DependencyInstaller {
     const raw = this.vol.readFileSync(jsonPath, "utf8");
     const manifest: PackageManifest = JSON.parse(raw);
 
+    // Check IDB snapshot cache — skip full install if we have a cached node_modules
+    const cacheKey = this._snapshotCache ? quickDigest(raw) : null;
+    if (this._snapshotCache && cacheKey) {
+      try {
+        const cached = await this._snapshotCache.get(cacheKey);
+        if (cached) {
+          onProgress?.("Restoring cached node_modules...");
+          const { entries } = cached;
+          // Restore only node_modules entries from the snapshot
+          for (const entry of entries) {
+            if (!entry.path.includes('/node_modules/')) continue;
+            if (entry.kind === 'directory') {
+              if (!this.vol.existsSync(entry.path)) {
+                this.vol.mkdirSync(entry.path, { recursive: true });
+              }
+            } else if (entry.kind === 'file' && entry.data) {
+              const parentDir = entry.path.substring(0, entry.path.lastIndexOf('/')) || '/';
+              if (parentDir !== '/' && !this.vol.existsSync(parentDir)) {
+                this.vol.mkdirSync(parentDir, { recursive: true });
+              }
+              this.vol.writeFileSync(entry.path, base64ToBytes(entry.data));
+            }
+          }
+          onProgress?.(`Restored ${entries.length} cached entries`);
+          return { resolved: new Map(), newPackages: [] };
+        }
+      } catch {
+        // Cache miss or error — proceed with normal install
+      }
+    }
+
     onProgress?.("Resolving dependency tree...");
 
     const resolutionOpts: ResolutionConfig = {
@@ -169,6 +205,18 @@ export class DependencyInstaller {
     const tree = await resolveFromManifest(manifest, resolutionOpts);
 
     const newPkgs = await this.materializePackages(tree, flags);
+
+    // Cache the installed node_modules snapshot for future reuse
+    if (this._snapshotCache && cacheKey && newPkgs.length > 0) {
+      try {
+        const snapshot = this.vol.toSnapshot();
+        // Filter to only node_modules entries to keep cache lean
+        const nmSnapshot = {
+          entries: snapshot.entries.filter(e => e.path.includes('/node_modules/')),
+        };
+        await this._snapshotCache.set(cacheKey, nmSnapshot);
+      } catch { /* cache write failure is non-fatal */ }
+    }
 
     onProgress?.(`Installed ${tree.size} package(s)`);
 

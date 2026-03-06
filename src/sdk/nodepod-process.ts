@@ -15,6 +15,7 @@ export class NodepodProcess extends EventEmitter {
   private _exitCode: number | null = null;
   private _sendStdinFn: ((data: string) => void) | null = null;
   private _killFn: (() => void) | null = null;
+  private _maxOutputBytes: number;
 
   // Resolves when the process exits -- use `await proc.completion`
   readonly completion: Promise<{
@@ -23,8 +24,9 @@ export class NodepodProcess extends EventEmitter {
     exitCode: number;
   }>;
 
-  constructor() {
+  constructor(maxOutputBytes = 4_194_304) {
     super();
+    this._maxOutputBytes = maxOutputBytes;
     this.completion = new Promise((resolve) => {
       this._resolve = resolve;
     });
@@ -40,11 +42,17 @@ export class NodepodProcess extends EventEmitter {
 
   _pushStdout(chunk: string): void {
     this._stdout += chunk;
+    if (this._stdout.length > this._maxOutputBytes) {
+      this._stdout = this._stdout.slice(-Math.floor(this._maxOutputBytes * 0.75));
+    }
     this.emit("output", chunk);
   }
 
   _pushStderr(chunk: string): void {
     this._stderr += chunk;
+    if (this._stderr.length > this._maxOutputBytes) {
+      this._stderr = this._stderr.slice(-Math.floor(this._maxOutputBytes * 0.75));
+    }
     this.emit("error", chunk);
   }
 

@@ -2,12 +2,14 @@
 
 Object.defineProperties(exports, { __esModule: { value: true }, [Symbol.toStringTag]: { value: 'Module' } });
 
-const index = require('./index-C-TQIrdG.cjs');
+const index = require('./index-CyhVjVJU.cjs');
 
 
 
 exports.DependencyInstaller = index.DependencyInstaller;
 exports.IframeSandbox = index.IframeSandbox;
+exports.LRUCache = index.LRUCache;
+exports.MemoryHandler = index.MemoryHandler;
 exports.MemoryVolume = index.MemoryVolume;
 exports.Nodepod = index.Nodepod;
 exports.NodepodFS = index.NodepodFS;

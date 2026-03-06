@@ -19,6 +19,8 @@ import type { ProcessHandle } from "../threading/process-handle";
 import { VFSBridge } from "../threading/vfs-bridge";
 import { isSharedArrayBufferAvailable, SharedVFSController } from "../threading/shared-vfs";
 import { SyncChannelController } from "../threading/sync-channel";
+import { MemoryHandler } from "../memory-handler";
+import { openSnapshotCache } from "../persistence/idb-cache";
 
 // Lazy-load child_process so the shell doesn't get pulled in at import time
 let _shellMod: typeof import("../polyfills/child_process") | null = null;
@@ -41,6 +43,7 @@ export class Nodepod {
   private _sharedVFS: SharedVFSController | null = null;
   private _syncChannel: SyncChannelController | null = null;
   private _unwatchVFS: (() => void) | null = null;
+  private _handler: MemoryHandler;
 
   /* ---- Construction (use Nodepod.boot()) ---- */
 
@@ -50,12 +53,14 @@ export class Nodepod {
     packages: DependencyInstaller,
     proxy: RequestProxy,
     cwd: string,
+    handler: MemoryHandler,
   ) {
     this._volume = volume;
     this._engine = engine;
     this._packages = packages;
     this._proxy = proxy;
     this._cwd = cwd;
+    this._handler = handler;
     this.fs = new NodepodFS(volume);
     this._processManager = new ProcessManager(volume);
     this._vfsBridge = new VFSBridge(volume);
@@ -130,17 +135,30 @@ export class Nodepod {
     }
 
     const cwd = opts.workdir ?? "/";
-    const volume = new MemoryVolume();
+    const handler = new MemoryHandler(opts.memory);
+    handler.startMonitoring();
+    const volume = new MemoryVolume(handler);
     const engine = new ScriptEngine(volume, {
       cwd,
       env: opts.env,
+      handler,
     });
-    const packages = new DependencyInstaller(volume);
+
+    // Open IDB snapshot cache for faster re-boots (opt-out via enableSnapshotCache: false)
+    let snapshotCache = null;
+    if (opts.enableSnapshotCache !== false) {
+      try { snapshotCache = await openSnapshotCache(); } catch { /* IDB unavailable */ }
+    }
+
+    const packages = new DependencyInstaller(volume, { snapshotCache });
     const proxy = getProxyInstance({
       onServerReady: opts.onServerReady,
     });
 
-    const nodepod = new Nodepod(volume, engine, packages, proxy, cwd);
+    const nodepod = new Nodepod(volume, engine, packages, proxy, cwd, handler);
+
+    // Drop module cache under memory pressure (safe — modules re-execute on next require)
+    handler.onPressure(() => engine.clearCache());
 
     if (opts.files) {
       for (const [path, content] of Object.entries(opts.files)) {
@@ -482,12 +500,12 @@ export class Nodepod {
 
   /* ---- snapshot / restore ---- */
 
-  private static readonly SHALLOW_EXCLUDE = ['/node_modules'];
+  /** Directory names excluded from snapshots at any depth when shallow=true. */
+  private static readonly SHALLOW_EXCLUDE_DIRS = new Set(['node_modules', '.cache', '.npm']);
 
   snapshot(opts?: SnapshotOptions): Snapshot {
     const shallow = opts?.shallow ?? true;
-    const excludes = shallow ? Nodepod.SHALLOW_EXCLUDE : undefined;
-    return this._volume.toSnapshot(excludes);
+    return this._volume.toSnapshot(undefined, shallow ? Nodepod.SHALLOW_EXCLUDE_DIRS : undefined);
   }
 
   async restore(snapshot: Snapshot, opts?: SnapshotOptions): Promise<void> {
@@ -512,6 +530,34 @@ export class Nodepod {
     }
     this._engine.clearCache();
     this._processManager.teardown();
+    this._volume.dispose();
+    this._handler.destroy();
+  }
+
+  /* ---- Performance stats ---- */
+
+  memoryStats(): {
+    vfs: { fileCount: number; totalBytes: number; dirCount: number; watcherCount: number };
+    engine: { moduleCacheSize: number; transformCacheSize: number };
+    heap: { usedMB: number; totalMB: number; limitMB: number } | null;
+  } {
+    const vfs = this._volume.getStats();
+    const moduleRegistry = (this._engine as any).moduleRegistry ?? {};
+    const transformCache: Map<string, string> = (this._engine as any).transformCache;
+    const engine = {
+      moduleCacheSize: Object.keys(moduleRegistry).length,
+      transformCacheSize: transformCache?.size ?? 0,
+    };
+    let heap: { usedMB: number; totalMB: number; limitMB: number } | null = null;
+    const perf = typeof performance !== 'undefined' ? (performance as any) : null;
+    if (perf?.memory) {
+      heap = {
+        usedMB: Math.round(perf.memory.usedJSHeapSize / 1048576 * 10) / 10,
+        totalMB: Math.round(perf.memory.totalJSHeapSize / 1048576 * 10) / 10,
+        limitMB: Math.round(perf.memory.jsHeapSizeLimit / 1048576 * 10) / 10,
+      };
+    }
+    return { vfs, engine, heap };
   }
 
   /* ---- Escape hatches ---- */

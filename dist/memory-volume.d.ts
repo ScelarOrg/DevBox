@@ -1,4 +1,5 @@
 import type { VolumeSnapshot } from './engine-types';
+import type { MemoryHandler } from './memory-handler';
 export interface VolumeNode {
     kind: 'file' | 'directory' | 'symlink';
     content?: Uint8Array;
@@ -66,13 +67,22 @@ export declare class MemoryVolume {
     private textDecoder;
     private activeWatchers;
     private subscribers;
-    constructor();
+    private _handler;
+    constructor(handler?: MemoryHandler | null);
     on(event: 'change', handler: FileChangeHandler): this;
     on(event: 'delete', handler: FileDeleteHandler): this;
     off(event: 'change', handler: FileChangeHandler): this;
     off(event: 'delete', handler: FileDeleteHandler): this;
     private broadcast;
-    toSnapshot(excludePrefixes?: string[]): VolumeSnapshot;
+    getStats(): {
+        fileCount: number;
+        totalBytes: number;
+        dirCount: number;
+        watcherCount: number;
+    };
+    /** Clean up all watchers, subscribers, and global listeners. */
+    dispose(): void;
+    toSnapshot(excludePrefixes?: string[], excludeDirNames?: Set<string>): VolumeSnapshot;
     private collectEntries;
     static fromBinarySnapshot(snapshot: {
         manifest: Array<{

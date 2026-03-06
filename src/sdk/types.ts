@@ -1,4 +1,5 @@
 import type { VolumeSnapshot } from "../engine-types";
+import type { MemoryHandlerOptions } from "../memory-handler";
 
 /* ---- Boot options ---- */
 
@@ -10,6 +11,10 @@ export interface NodepodOptions {
   onServerReady?: (port: number, url: string) => void;
   /** Show a small "nodepod" watermark link in preview iframes. Defaults to true. */
   watermark?: boolean;
+  /** Memory optimization settings. Omit to use defaults. */
+  memory?: MemoryHandlerOptions;
+  /** Cache installed node_modules in IndexedDB for faster re-boots. Default: true. */
+  enableSnapshotCache?: boolean;
 }
 
 /* ---- Terminal ---- */

@@ -336,6 +336,17 @@ export class ProcessManager extends EventEmitter {
           this.emit("server-close", handle.pid, port);
         }
       }
+      // Clean up any pending HTTP callbacks for this worker to prevent leaks
+      for (const [reqId, cb] of this._httpCallbacks) {
+        cb({
+          type: "http-response",
+          requestId: reqId,
+          statusCode: 503,
+          statusMessage: "Worker Exited",
+          headers: {},
+          body: "Worker process exited before completing the request",
+        } as WorkerToMain_HttpResponse);
+      }
       this.emit("exit", handle.pid, exitCode);
       // Delay removal so event handlers finish
       setTimeout(() => {

@@ -10,6 +10,7 @@ import type {
 } from "./engine-types";
 import type { PackageManifest } from "./types/manifest";
 import { quickDigest } from "./helpers/digest";
+import { LRUCache as _LRUCache } from "./memory-handler";
 import { bytesToBase64, bytesToHex } from "./helpers/byte-encoding";
 import { buildFileSystemBridge, FsBridge } from "./polyfills/fs";
 import * as pathPolyfill from "./polyfills/path";
@@ -876,6 +877,7 @@ export interface EngineOptions {
     workerData: unknown;
     threadId: number;
   };
+  handler?: import('./memory-handler').MemoryHandler;
 }
 
 export interface ResolverFn {
@@ -1119,12 +1121,17 @@ function buildResolver(
   deAsyncImports = false,
 ): ResolverFn {
   // Shared across all resolvers — avoids re-resolving the same paths/manifests per module
+  // Use bounded LRU when a memory handler is available, else plain Map
   const resolveCache: Map<string, string | null> =
     (cache as any).__resolveCache ??
-    ((cache as any).__resolveCache = new Map());
+    ((cache as any).__resolveCache = opts.handler
+      ? new _LRUCache<string, string | null>(opts.handler.options.resolveCacheSize)
+      : new Map());
   const manifestCache: Map<string, PackageManifest | null> =
     (cache as any).__manifestCache ??
-    ((cache as any).__manifestCache = new Map());
+    ((cache as any).__manifestCache = opts.handler
+      ? new _LRUCache<string, PackageManifest | null>(opts.handler.options.manifestCacheSize)
+      : new Map());
   // Shared across all resolvers — deduplicates same-version packages from nested node_modules
   const _pkgIdentityMap: Record<string, string> =
     (cache as any).__pkgIdentityMap ?? ((cache as any).__pkgIdentityMap = {});
@@ -2913,9 +2920,15 @@ export class ScriptEngine {
   private proc: ProcessObject;
   private moduleRegistry: Record<string, ModuleRecord> = {};
   private opts: EngineOptions;
-  private transformCache: Map<string, string> = new Map();
+  private transformCache: Map<string, string>;
 
   constructor(vol: MemoryVolume, opts: EngineOptions = {}) {
+    // Use handler's LRU transform cache if available, else a plain Map
+    if (opts.handler) {
+      this.transformCache = opts.handler.transformCache as unknown as Map<string, string>;
+    } else {
+      this.transformCache = new Map();
+    }
     this.vol = vol;
     this.proc = buildProcessEnv({
       cwd: opts.cwd || "/",
@@ -3339,6 +3352,7 @@ export class ScriptEngine {
     code: string,
     filename: string = "/index.js",
   ): { exports: unknown; module: ModuleRecord } {
+    this._trimModuleCache();
     const dir = pathPolyfill.dirname(filename);
     // Only write when the content differs to avoid triggering file watchers
     // (e.g. nodemon/chokidar) with a no-op write that causes restart loops.
@@ -3608,6 +3622,20 @@ export class ScriptEngine {
     (this.moduleRegistry as any).__resolveCache?.clear();
     (this.moduleRegistry as any).__manifestCache?.clear();
     delete (this.moduleRegistry as any).__pkgIdentityMap;
+    this.transformCache.clear();
+  }
+
+  /** Evict one node_modules entry when module cache exceeds soft limit. */
+  private _trimModuleCache(): void {
+    const limit = this.opts.handler?.options.moduleSoftCacheSize ?? 512;
+    const keys = Object.keys(this.moduleRegistry);
+    if (keys.length < limit) return;
+    for (const k of keys) {
+      if (k.includes('/node_modules/')) {
+        delete this.moduleRegistry[k];
+        return; // One eviction per call — amortized O(1)
+      }
+    }
   }
 
   getVolume(): MemoryVolume {

@@ -3,6 +3,7 @@
 import type { VolumeSnapshot, VolumeEntry } from './engine-types';
 import { bytesToBase64, base64ToBytes } from './helpers/byte-encoding';
 import { MOCK_IDS, MOCK_FS } from './constants/config';
+import type { MemoryHandler } from './memory-handler';
 
 export interface VolumeNode {
   kind: 'file' | 'directory' | 'symlink';
@@ -172,8 +173,10 @@ export class MemoryVolume {
   private textDecoder = new TextDecoder();
   private activeWatchers = new Map<string, Set<ActiveWatcher>>();
   private subscribers = new Map<string, Set<VolumeEventHandler>>();
+  private _handler: MemoryHandler | null;
 
-  constructor() {
+  constructor(handler?: MemoryHandler | null) {
+    this._handler = handler ?? null;
     this.tree = {
       kind: 'directory',
       children: new Map(),
@@ -216,15 +219,55 @@ export class MemoryVolume {
     }
   }
 
+  // ---- Stats ----
+
+  getStats(): { fileCount: number; totalBytes: number; dirCount: number; watcherCount: number } {
+    let fileCount = 0;
+    let totalBytes = 0;
+    let dirCount = 0;
+    const walk = (node: VolumeNode) => {
+      if (node.kind === 'file') {
+        fileCount++;
+        totalBytes += node.content?.byteLength ?? 0;
+      } else if (node.kind === 'directory') {
+        dirCount++;
+        if (node.children) {
+          for (const child of node.children.values()) walk(child);
+        }
+      }
+    };
+    walk(this.tree);
+    let watcherCount = 0;
+    for (const set of this.activeWatchers.values()) watcherCount += set.size;
+    return { fileCount, totalBytes, dirCount, watcherCount };
+  }
+
+  /** Clean up all watchers, subscribers, and global listeners. */
+  dispose(): void {
+    this.activeWatchers.clear();
+    this.subscribers.clear();
+    this.globalChangeListeners.clear();
+    if (this._handler) {
+      this._handler.statCache.clear();
+      this._handler.pathNormCache.clear();
+    }
+  }
+
   // ---- Snapshot serialization ----
 
-  toSnapshot(excludePrefixes?: string[]): VolumeSnapshot {
+  toSnapshot(excludePrefixes?: string[], excludeDirNames?: Set<string>): VolumeSnapshot {
     const entries: VolumeEntry[] = [];
-    this.collectEntries('/', this.tree, entries, excludePrefixes);
+    this.collectEntries('/', this.tree, entries, excludePrefixes, excludeDirNames);
     return { entries };
   }
 
-  private collectEntries(currentPath: string, node: VolumeNode, result: VolumeEntry[], excludePrefixes?: string[]): void {
+  private collectEntries(
+    currentPath: string,
+    node: VolumeNode,
+    result: VolumeEntry[],
+    excludePrefixes?: string[],
+    excludeDirNames?: Set<string>,
+  ): void {
     if (excludePrefixes) {
       for (const prefix of excludePrefixes) {
         if (currentPath === prefix || currentPath.startsWith(prefix + '/')) return;
@@ -243,8 +286,10 @@ export class MemoryVolume {
       result.push({ path: currentPath, kind: 'directory' });
       if (node.children) {
         for (const [name, child] of node.children) {
+          // Skip excluded directory names at any depth (e.g. node_modules, .cache)
+          if (excludeDirNames && child.kind === 'directory' && excludeDirNames.has(name)) continue;
           const childPath = currentPath === '/' ? `/${name}` : `${currentPath}/${name}`;
-          this.collectEntries(childPath, child, result, excludePrefixes);
+          this.collectEntries(childPath, child, result, excludePrefixes, excludeDirNames);
         }
       }
     }
@@ -313,6 +358,10 @@ export class MemoryVolume {
   // ---- Path utilities ----
 
   private normalize(p: string): string {
+    if (this._handler) {
+      const cached = this._handler.pathNormCache.get(p);
+      if (cached !== undefined) return cached;
+    }
     if (!p.startsWith('/')) p = '/' + p;
     const parts = p.split('/').filter(Boolean);
     const resolved: string[] = [];
@@ -320,7 +369,9 @@ export class MemoryVolume {
       if (part === '..') resolved.pop();
       else if (part !== '.') resolved.push(part);
     }
-    return '/' + resolved.join('/');
+    const result = '/' + resolved.join('/');
+    if (this._handler) this._handler.pathNormCache.set(p, result);
+    return result;
   }
 
   // assumes pre-normalized input (starts with '/', no '..' or double slashes)
@@ -418,6 +469,8 @@ export class MemoryVolume {
       modified: Date.now(),
     });
 
+    if (this._handler) this._handler.invalidateStat(norm);
+
     if (notify) {
       this.triggerWatchers(norm, existed ? 'change' : 'rename');
       this.broadcast('change', norm, typeof data === 'string' ? data : this.textDecoder.decode(data));
@@ -433,13 +486,19 @@ export class MemoryVolume {
 
   statSync(p: string): FileStat {
     const norm = this.normalize(p);
+
+    if (this._handler) {
+      const cached = this._handler.statCache.get(norm);
+      if (cached !== undefined) return cached;
+    }
+
     const node = this.locate(norm);
     if (!node) throw makeSystemError('ENOENT', 'stat', p);
 
     const fileSize = node.kind === 'file' ? (node.content?.length || 0) : 0;
     const ts = node.modified;
 
-    return {
+    const result: FileStat = {
       isFile: () => node.kind === 'file',
       isDirectory: () => node.kind === 'directory',
       isSymbolicLink: () => false,
@@ -470,6 +529,9 @@ export class MemoryVolume {
       ctimeNs: BigInt(ts) * 1000000n,
       birthtimeNs: BigInt(ts) * 1000000n,
     };
+
+    if (this._handler) this._handler.statCache.set(norm, result);
+    return result;
   }
 
   lstatSync(p: string): FileStat {
@@ -579,6 +641,7 @@ export class MemoryVolume {
     if (target.kind !== 'file') throw makeSystemError('EISDIR', 'unlink', p);
 
     parent.children!.delete(name);
+    if (this._handler) this._handler.invalidateStat(norm);
     this.triggerWatchers(norm, 'rename');
     this.broadcast('delete', norm);
     this.notifyGlobalListeners(norm, 'unlink');
@@ -600,6 +663,7 @@ export class MemoryVolume {
     if (target.children!.size > 0) throw makeSystemError('ENOTEMPTY', 'rmdir', p);
 
     parent.children!.delete(name);
+    if (this._handler) this._handler.invalidateStat(norm);
   }
 
   renameSync(from: string, to: string): void {
@@ -938,7 +1002,7 @@ export class MemoryVolume {
     const self = this;
     const pending: Uint8Array[] = [];
     const handlers: Record<string, ((...args: unknown[]) => void)[]> = {};
-    const enc = new TextEncoder();
+    const enc = this.textEncoder;
 
     return {
       write(data: string | Uint8Array): boolean {

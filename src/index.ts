@@ -170,6 +170,8 @@ export type {
   Snapshot,
   SpawnOptions,
 } from "./sdk/types";
+export { MemoryHandler, LRUCache } from "./memory-handler";
+export type { MemoryHandlerOptions } from "./memory-handler";
 
 /* ---- Threading / Worker Infrastructure ---- */
 

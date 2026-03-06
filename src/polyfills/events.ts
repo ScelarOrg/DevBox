@@ -11,7 +11,7 @@ const DEFAULT_CEILING = 10;
 // complete in browser, so we detect FSWatchers by _watched Map and bridge
 // VFS file changes directly to the watcher.
 const _vfsBridged = new WeakSet<object>();
-let _vfsBridgeCleanups: (() => void)[] = [];
+const _vfsBridgeCleanups = new Set<() => void>();
 
 function _bridgeVfsToWatcher(watcher: EventEmitter): void {
   const vol = (globalThis as any).__nodepodVolume;
@@ -45,7 +45,11 @@ function _bridgeVfsToWatcher(watcher: EventEmitter): void {
       }, DEBOUNCE_MS),
     });
   });
-  _vfsBridgeCleanups.push(cleanup);
+  const selfCleanup = () => {
+    cleanup();
+    _vfsBridgeCleanups.delete(selfCleanup);
+  };
+  _vfsBridgeCleanups.add(selfCleanup);
 }
 
 // lazily init the listener map (handles Object.create() bypassing constructor)

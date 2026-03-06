@@ -7,12 +7,13 @@ export declare class NodepodProcess extends EventEmitter {
     private _exitCode;
     private _sendStdinFn;
     private _killFn;
+    private _maxOutputBytes;
     readonly completion: Promise<{
         stdout: string;
         stderr: string;
         exitCode: number;
     }>;
-    constructor();
+    constructor(maxOutputBytes?: number);
     _setSendStdin(fn: (data: string) => void): void;
     _setKillFn(fn: () => void): void;
     _pushStdout(chunk: string): void;

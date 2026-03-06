@@ -74,6 +74,8 @@ export { NodepodTerminal } from "./sdk/nodepod-terminal";
 export { NodepodProcess } from "./sdk/nodepod-process";
 export { NodepodFS } from "./sdk/nodepod-fs";
 export type { NodepodOptions, TerminalOptions, TerminalTheme, StatResult, Snapshot, SpawnOptions, } from "./sdk/types";
+export { MemoryHandler, LRUCache } from "./memory-handler";
+export type { MemoryHandlerOptions } from "./memory-handler";
 export { ProcessManager } from "./threading/process-manager";
 export { ProcessHandle } from "./threading/process-handle";
 export type { ProcessState } from "./threading/process-handle";

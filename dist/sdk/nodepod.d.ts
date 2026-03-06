@@ -19,6 +19,7 @@ export declare class Nodepod {
     private _sharedVFS;
     private _syncChannel;
     private _unwatchVFS;
+    private _handler;
     private constructor();
     static boot(opts?: NodepodOptions): Promise<Nodepod>;
     spawn(cmd: string, args?: string[], opts?: SpawnOptions): Promise<NodepodProcess>;
@@ -27,10 +28,28 @@ export declare class Nodepod {
     setPreviewScript(script: string): Promise<void>;
     clearPreviewScript(): Promise<void>;
     port(num: number): string | null;
-    private static readonly SHALLOW_EXCLUDE;
+    /** Directory names excluded from snapshots at any depth when shallow=true. */
+    private static readonly SHALLOW_EXCLUDE_DIRS;
     snapshot(opts?: SnapshotOptions): Snapshot;
     restore(snapshot: Snapshot, opts?: SnapshotOptions): Promise<void>;
     teardown(): void;
+    memoryStats(): {
+        vfs: {
+            fileCount: number;
+            totalBytes: number;
+            dirCount: number;
+            watcherCount: number;
+        };
+        engine: {
+            moduleCacheSize: number;
+            transformCacheSize: number;
+        };
+        heap: {
+            usedMB: number;
+            totalMB: number;
+            limitMB: number;
+        } | null;
+    };
     get volume(): MemoryVolume;
     get engine(): ScriptEngine;
     get packages(): DependencyInstaller;

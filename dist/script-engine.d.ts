@@ -23,6 +23,7 @@ export interface EngineOptions {
         workerData: unknown;
         threadId: number;
     };
+    handler?: import('./memory-handler').MemoryHandler;
 }
 export interface ResolverFn {
     (id: string): unknown;
@@ -67,6 +68,8 @@ export declare class ScriptEngine {
     }>;
     runFileAsync(filename: string): Promise<ExecutionOutcome>;
     clearCache(): void;
+    /** Evict one node_modules entry when module cache exceeds soft limit. */
+    private _trimModuleCache;
     getVolume(): MemoryVolume;
     getProcess(): ProcessObject;
     createREPL(): {

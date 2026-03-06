@@ -1,6 +1,7 @@
 import { MemoryVolume } from "../memory-volume";
 import { RegistryConfig } from "./registry-client";
 import { ResolvedDependency } from "./version-resolver";
+import type { IDBSnapshotCache } from "../persistence/idb-cache";
 export interface InstallFlags {
     registry?: string;
     persist?: boolean;
@@ -22,8 +23,10 @@ export declare class DependencyInstaller {
     private vol;
     private registryClient;
     private workingDir;
+    private _snapshotCache;
     constructor(vol: MemoryVolume, opts?: {
         cwd?: string;
+        snapshotCache?: IDBSnapshotCache | null;
     } & RegistryConfig);
     install(packageName: string, version?: string, flags?: InstallFlags): Promise<InstallOutcome>;
     installFromManifest(manifestPath?: string, flags?: InstallFlags): Promise<InstallOutcome>;

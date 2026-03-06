@@ -1,7 +1,7 @@
 var __defProp = Object.defineProperty;
 var __defNormalProp = (obj, key, value) => key in obj ? __defProp(obj, key, { enumerable: true, configurable: true, writable: true, value }) : obj[key] = value;
 var __publicField = (obj, key, value) => __defNormalProp(obj, typeof key !== "symbol" ? key + "" : key, value);
-import { n as normalize, b as basename, d as dirname, L as LS_BLOCK_SIZE, Y as YES_REPEAT_COUNT, e as extname, N as NPM_REGISTRY_URL_SLASH, V as VERSIONS, r as resolve, a as relative, c as createHash, D as DEFAULT_ENV, E as EventEmitter, M as MOCK_PID, W as Writable, R as Readable, S as ScriptEngine, f as format, g as getAllServers, h as ref, u as unref, i as addDrainListener, T as TIMEOUTS, j as closeAllServers, k as resetRefCount, B as Buffer2, l as getActiveContext, m as getRefCount, o as resetActiveInterfaceCount, __tla as __tla_0 } from "./index-B8lyh_ti.js";
+import { n as normalize, b as basename, d as dirname, L as LS_BLOCK_SIZE, Y as YES_REPEAT_COUNT, e as extname, N as NPM_REGISTRY_URL_SLASH, V as VERSIONS, r as resolve, a as relative, c as createHash, D as DEFAULT_ENV, E as EventEmitter, M as MOCK_PID, W as Writable, R as Readable, S as ScriptEngine, f as format, g as getAllServers, h as ref, u as unref, i as addDrainListener, T as TIMEOUTS, j as closeAllServers, k as resetRefCount, B as Buffer2, l as getActiveContext, m as getRefCount, o as resetActiveInterfaceCount, __tla as __tla_0 } from "./index-D8Hn2kWU.js";
 let ShellProcess, clearStreamingCallbacks, child_process, exec, execFile, execFileSync, execSync, executeNodeBinary, fork, getShellCwd, handleIPCFromParent, initShellExec, isStdinRaw, sendStdin, setForkChildCallback, setIPCReceiveHandler, setIPCSend, setShellCwd, setSpawnChildCallback, setStreamingCallbacks, setSyncChannel, shellExec, spawn, spawnSync;
 let __tla = Promise.all([
   (() => {
@@ -6757,10 +6757,10 @@ ${A_DIM}Done in ${elapsed}s${A_RESET}`;
     }
   }
   async function installPackages(args, ctx, pm = "npm") {
-    const { DependencyInstaller } = await import("./index-B8lyh_ti.js").then(async (m) => {
+    const { DependencyInstaller } = await import("./index-D8Hn2kWU.js").then(async (m) => {
       await m.__tla;
       return m;
-    }).then((n) => n.ad);
+    }).then((n) => n.af);
     const installer = new DependencyInstaller(_vol, {
       cwd: ctx.cwd
     });
@@ -6866,10 +6866,10 @@ ${A_DIM}Done in ${elapsed}s${A_RESET}`;
     };
   }
   async function listPackages(ctx, pm = "npm") {
-    const { DependencyInstaller } = await import("./index-B8lyh_ti.js").then(async (m) => {
+    const { DependencyInstaller } = await import("./index-D8Hn2kWU.js").then(async (m) => {
       await m.__tla;
       return m;
-    }).then((n) => n.ad);
+    }).then((n) => n.af);
     const installer = new DependencyInstaller(_vol, {
       cwd: ctx.cwd
     });
@@ -7025,10 +7025,10 @@ ${JSON.stringify(pkg, null, 2)}
       }
     }
     try {
-      const { RegistryClient } = await import("./index-B8lyh_ti.js").then(async (m) => {
+      const { RegistryClient } = await import("./index-D8Hn2kWU.js").then(async (m) => {
         await m.__tla;
         return m;
-      }).then((n) => n.as);
+      }).then((n) => n.au);
       const client = new RegistryClient();
       const meta = await client.fetchManifest(name);
       const latest = (_a = meta["dist-tags"]) == null ? void 0 : _a.latest;
