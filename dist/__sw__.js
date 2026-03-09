@@ -29,6 +29,12 @@ let previewScript = null;
 // Watermark badge shown in preview iframes. On by default.
 let watermarkEnabled = true;
 
+// auth token from init, checked on control messages
+let authToken = null;
+
+// ws bridge token, gets baked into the shim script
+let wsToken = null;
+
 // Standard MIME types by file extension — used as a safety net when
 // the virtual server returns text/html (SPA fallback) or omits Content-Type
 // for paths that are clearly not HTML.
@@ -110,10 +116,20 @@ self.addEventListener("activate", (event) => {
 
 self.addEventListener("message", (event) => {
   const data = event.data;
+
+  // init sets up the port + grabs the auth token
   if (data?.type === "init" && data.port) {
     port = data.port;
     port.onmessage = onPortMessage;
+    if (data.token) {
+      authToken = data.token;
+    }
+    return;
   }
+
+  // everything else needs the right token
+  if (authToken && data?.token !== authToken) return;
+
   // Allow main thread to register/unregister preview clients
   if (data?.type === "register-preview") {
     previewClients.set(data.clientId, data.serverPort);
@@ -126,6 +142,9 @@ self.addEventListener("message", (event) => {
   }
   if (data?.type === "set-watermark") {
     watermarkEnabled = !!data.enabled;
+  }
+  if (data?.type === "set-ws-token") {
+    wsToken = data.wsToken ?? null;
   }
 });
 
@@ -245,12 +264,15 @@ self.addEventListener("fetch", (event) => {
 // to the main thread's request-proxy, which dispatches upgrade events on the
 // virtual HTTP server. Works with any framework/library, not specific to Vite.
 
-const WS_SHIM_SCRIPT = `<script>
+function getWsShimScript() {
+  const tokenStr = wsToken ? JSON.stringify(wsToken) : "null";
+  return `<script>
 (function() {
   if (window.__nodepodWsShim) return;
   window.__nodepodWsShim = true;
   var NativeWS = window.WebSocket;
   var bc = new BroadcastChannel("nodepod-ws");
+  var _wsToken = ${tokenStr};
   var nextId = 0;
   var active = {};
 
@@ -300,7 +322,8 @@ const WS_SHIM_SCRIPT = `<script>
       uid: uid,
       port: port,
       path: path,
-      protocols: Array.isArray(protocols) ? protocols.join(",") : (protocols || "")
+      protocols: Array.isArray(protocols) ? protocols.join(",") : (protocols || ""),
+      token: _wsToken
     });
 
     // Timeout: if no ws-open within 5s, fire error
@@ -347,12 +370,12 @@ const WS_SHIM_SCRIPT = `<script>
       type = "binary";
       payload = Array.from(data);
     }
-    bc.postMessage({ kind: "ws-send", uid: this._uid, data: payload, type: type });
+    bc.postMessage({ kind: "ws-send", uid: this._uid, data: payload, type: type, token: _wsToken });
   };
   NodepodWS.prototype.close = function(code, reason) {
     if (this.readyState >= 2) return;
     this.readyState = 2;
-    bc.postMessage({ kind: "ws-close", uid: this._uid, code: code || 1000, reason: reason || "" });
+    bc.postMessage({ kind: "ws-close", uid: this._uid, code: code || 1000, reason: reason || "", token: _wsToken });
     var self = this;
     setTimeout(function() {
       self.readyState = 3;
@@ -375,6 +398,8 @@ const WS_SHIM_SCRIPT = `<script>
   bc.onmessage = function(ev) {
     var d = ev.data;
     if (!d || !d.uid) return;
+    // check bridge token
+    if (_wsToken && d.token !== _wsToken) return;
     var ws = active[d.uid];
     if (!ws) return;
 
@@ -414,6 +439,7 @@ const WS_SHIM_SCRIPT = `<script>
   window.WebSocket = NodepodWS;
 })();
 </script>`;
+}
 
 // Small "nodepod" badge in the bottom-right corner of preview iframes.
 const WATERMARK_SCRIPT = `<script>
@@ -571,7 +597,7 @@ async function proxyToVirtualServer(request, serverPort, path, originalRequest) 
     let finalBody = responseBody;
     const ct = respHeaders["content-type"] || respHeaders["Content-Type"] || "";
     if (ct.includes("text/html") && responseBody) {
-      let injection = WS_SHIM_SCRIPT;
+      let injection = getWsShimScript();
       if (previewScript) {
         injection += `<script>${previewScript}<` + `/script>`;
       }

@@ -2,7 +2,7 @@
 
 Object.defineProperty(exports, Symbol.toStringTag, { value: 'Module' });
 
-const index = require('./index-NinyWmnj.cjs');
+const index = require('./index-DVbLKdL5.cjs');
 
 function expandVariables(raw, env, lastExit) {
   let result = "";
@@ -3765,10 +3765,6 @@ function createNpxCommand(deps) {
   };
 }
 
-async function proxiedFetch(url, init) {
-  return fetch(url, init);
-}
-
 const RED = "\x1B[31m";
 const YELLOW = "\x1B[33m";
 const BOLD = "\x1B[1m";
@@ -4311,7 +4307,7 @@ async function githubApi(path, token, method = "GET", body) {
     "User-Agent": "nodepod-git"
   };
   if (body) headers["Content-Type"] = "application/json";
-  const resp = await proxiedFetch(url, {
+  const resp = await index.proxiedFetch(url, {
     method,
     headers,
     body: body ? JSON.stringify(body) : void 0
@@ -6091,7 +6087,7 @@ function formatWarn(msg, pm) {
   }
 }
 async function installPackages(args, ctx, pm = "npm") {
-  const { DependencyInstaller } = await Promise.resolve().then(() => require('./index-NinyWmnj.cjs')).then(n => n.installer);
+  const { DependencyInstaller } = await Promise.resolve().then(() => require('./index-DVbLKdL5.cjs')).then(n => n.installer);
   const installer = new DependencyInstaller(_vol, { cwd: ctx.cwd });
   let out = "";
   const write = _stdoutSink ?? ((_s) => {
@@ -6188,7 +6184,7 @@ async function uninstallPackages(args, ctx, pm = "npm") {
   return { stdout: out, stderr: "", exitCode: 0 };
 }
 async function listPackages(ctx, pm = "npm") {
-  const { DependencyInstaller } = await Promise.resolve().then(() => require('./index-NinyWmnj.cjs')).then(n => n.installer);
+  const { DependencyInstaller } = await Promise.resolve().then(() => require('./index-DVbLKdL5.cjs')).then(n => n.installer);
   const installer = new DependencyInstaller(_vol, { cwd: ctx.cwd });
   const pkgs = installer.listInstalled();
   const entries = Object.entries(pkgs);
@@ -6325,7 +6321,7 @@ async function npmInfo(args, ctx) {
     }
   }
   try {
-    const { RegistryClient } = await Promise.resolve().then(() => require('./index-NinyWmnj.cjs')).then(n => n.registryClient);
+    const { RegistryClient } = await Promise.resolve().then(() => require('./index-DVbLKdL5.cjs')).then(n => n.registryClient);
     const client = new RegistryClient();
     const meta = await client.fetchManifest(name);
     const latest = meta["dist-tags"]?.latest;
@@ -7432,4 +7428,4 @@ exports.setSyncChannel = setSyncChannel;
 exports.shellExec = shellExec;
 exports.spawn = spawn;
 exports.spawnSync = spawnSync;
-//# sourceMappingURL=child_process-bGGe8mTj.cjs.map
+//# sourceMappingURL=child_process-BD0fAFc1.cjs.map

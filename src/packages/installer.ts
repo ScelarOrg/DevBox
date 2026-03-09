@@ -320,6 +320,7 @@ export class DependencyInstaller {
 
           await downloadAndExtract(dep.tarballUrl, this.vol, targetDir, {
             stripComponents: 1,
+            expectedShasum: dep.shasum,
           });
 
           if (shouldTransform) {

@@ -18,6 +18,7 @@ import { NodepodFS } from "./nodepod-fs";
 import { NodepodProcess } from "./nodepod-process";
 import { NodepodTerminal } from "./nodepod-terminal";
 import { ProcessManager } from "../threading/process-manager";
+import { setAllowedDomains } from "../cross-origin";
 import type { ProcessHandle } from "../threading/process-handle";
 import { VFSBridge } from "../threading/vfs-bridge";
 import {
@@ -170,6 +171,13 @@ export class Nodepod {
     const proxy = getProxyInstance({
       onServerReady: opts.onServerReady,
     });
+
+    // set up fetch domain whitelist (null = allow everything)
+    if (opts.allowedFetchDomains === null) {
+      setAllowedDomains(null);
+    } else {
+      setAllowedDomains(opts.allowedFetchDomains ?? []);
+    }
 
     const nodepod = new Nodepod(volume, packages, proxy, cwd, handler);
 

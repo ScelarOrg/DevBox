@@ -12,6 +12,9 @@ export interface NodepodOptions {
     memory?: MemoryHandlerOptions;
     /** Cache installed node_modules in IndexedDB for faster re-boots. Default: true. */
     enableSnapshotCache?: boolean;
+    /** domains allowed through the cors proxy. merged with built-in defaults
+     *  (npm, github, esm.sh etc). pass null to allow everything */
+    allowedFetchDomains?: string[] | null;
 }
 export interface TerminalTheme {
     background?: string;

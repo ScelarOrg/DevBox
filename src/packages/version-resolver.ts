@@ -11,6 +11,7 @@ export interface ResolvedDependency {
   version: string;
   tarballUrl: string;
   dependencies: Record<string, string>;
+  shasum?: string;
 }
 
 export interface ResolutionConfig {
@@ -354,6 +355,7 @@ async function walkDependency(
       version: chosenVersion,
       tarballUrl: versionInfo.dist.tarball,
       dependencies: versionInfo.dependencies || {},
+      shasum: versionInfo.dist.shasum,
     });
 
     // non-optional peers are included (npm v7+ behaviour)

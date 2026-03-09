@@ -3,6 +3,8 @@ export interface ExtractionOptions {
     stripComponents?: number;
     filter?: (entryPath: string) => boolean;
     onProgress?: (msg: string) => void;
+    /** expected sha1 hex from the npm registry, checked after download */
+    expectedShasum?: string;
 }
 type EntryKind = "file" | "directory" | "link" | "other";
 interface ArchiveEntry {

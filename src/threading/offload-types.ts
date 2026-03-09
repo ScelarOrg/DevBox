@@ -41,6 +41,7 @@ export interface ExtractTask {
   tarballUrl: string;
   stripComponents: number;
   priority: TaskPriority;
+  expectedShasum?: string;
 }
 
 export interface ExtractedFile {

@@ -4,6 +4,7 @@ export interface ResolvedDependency {
     version: string;
     tarballUrl: string;
     dependencies: Record<string, string>;
+    shasum?: string;
 }
 export interface ResolutionConfig {
     registry?: RegistryClient;

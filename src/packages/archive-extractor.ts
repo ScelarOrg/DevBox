@@ -18,6 +18,8 @@ export interface ExtractionOptions {
   stripComponents?: number;
   filter?: (entryPath: string) => boolean;
   onProgress?: (msg: string) => void;
+  /** expected sha1 hex from the npm registry, checked after download */
+  expectedShasum?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -197,6 +199,7 @@ export async function downloadAndExtract(
     tarballUrl: url,
     stripComponents: opts.stripComponents ?? 1,
     priority: TaskPriority.NORMAL,
+    expectedShasum: opts.expectedShasum,
   });
 
   const writtenPaths: string[] = [];

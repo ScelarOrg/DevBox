@@ -57,6 +57,8 @@ export class RequestProxy extends EventEmitter {
   private _processManager: any | null = null;
   private _workerWsConns = new Map<string, { pid: number }>();
   private _previewScript: string | null = null;
+  private _swAuthToken: string | null = null;
+  private _wsBridgeToken: string | null = null;
 
   constructor(opts: ProxyOptions = {}) {
     super();
@@ -109,6 +111,7 @@ export class RequestProxy extends EventEmitter {
       navigator.serviceWorker.controller.postMessage({
         type: "set-watermark",
         enabled,
+        token: this._swAuthToken,
       });
     }
   }
@@ -121,6 +124,20 @@ export class RequestProxy extends EventEmitter {
       navigator.serviceWorker.controller.postMessage({
         type: "set-preview-script",
         script: this._previewScript,
+        token: this._swAuthToken,
+      });
+    }
+  }
+
+  private _sendWsTokenToSW(): void {
+    if (
+      typeof navigator !== "undefined" &&
+      navigator.serviceWorker?.controller
+    ) {
+      navigator.serviceWorker.controller.postMessage({
+        type: "set-ws-token",
+        wsToken: this._wsBridgeToken,
+        token: this._swAuthToken,
       });
     }
   }
@@ -201,9 +218,11 @@ export class RequestProxy extends EventEmitter {
       sw.addEventListener("statechange", check);
     });
 
+    this._swAuthToken = crypto.randomUUID();
+
     this.channel = new MessageChannel();
     this.channel.port1.onmessage = this.onSWMessage.bind(this);
-    sw.postMessage({ type: "init", port: this.channel.port2 }, [
+    sw.postMessage({ type: "init", port: this.channel.port2, token: this._swAuthToken }, [
       this.channel.port2,
     ]);
 
@@ -214,12 +233,16 @@ export class RequestProxy extends EventEmitter {
         this.channel = new MessageChannel();
         this.channel.port1.onmessage = this.onSWMessage.bind(this);
         navigator.serviceWorker.controller.postMessage(
-          { type: "init", port: this.channel.port2 },
+          { type: "init", port: this.channel.port2, token: this._swAuthToken },
           [this.channel.port2],
         );
         // Resend preview script to the new SW controller
         if (this._previewScript !== null) {
           this._sendPreviewScriptToSW();
+        }
+        // re-send ws bridge token too
+        if (this._wsBridgeToken) {
+          this._sendWsTokenToSW();
         }
       }
     };
@@ -438,10 +461,15 @@ export class RequestProxy extends EventEmitter {
     if (typeof BroadcastChannel === "undefined") return;
     if (this._wsBridge) return;
 
+    this._wsBridgeToken = crypto.randomUUID();
+
     this._wsBridge = new BroadcastChannel("nodepod-ws");
     this._wsBridge.onmessage = (ev: MessageEvent) => {
       const d = ev.data;
       if (!d || !d.kind) return;
+
+      // check token
+      if (this._wsBridgeToken && d.token !== this._wsBridgeToken) return;
 
       if (d.kind === "ws-connect") {
         this._handleWsConnect(d.uid, d.port, d.path, d.protocols);
@@ -451,6 +479,9 @@ export class RequestProxy extends EventEmitter {
         this._handleWsClose(d.uid, d.code, d.reason);
       }
     };
+
+    // Send the WS bridge token to the Service Worker so it can embed it in the WS shim
+    this._sendWsTokenToSW();
   }
 
   private _handleWsConnect(
@@ -487,6 +518,7 @@ export class RequestProxy extends EventEmitter {
         kind: "ws-error",
         uid,
         message: `No server on port ${port}`,
+        token: this._wsBridgeToken,
       });
       return;
     }
@@ -511,7 +543,7 @@ export class RequestProxy extends EventEmitter {
         const text = new TextDecoder().decode(raw);
         if (text.startsWith("HTTP/1.1 101")) {
           handshakeDone = true;
-          bridge.postMessage({ kind: "ws-open", uid });
+          bridge.postMessage({ kind: "ws-open", uid, token: this._wsBridgeToken });
           if (fn) queueMicrotask(() => fn(null));
           return true;
         }
@@ -535,6 +567,7 @@ export class RequestProxy extends EventEmitter {
               uid,
               data: text,
               type: "text",
+              token: this._wsBridgeToken,
             });
             break;
           }
@@ -544,6 +577,7 @@ export class RequestProxy extends EventEmitter {
               uid,
               data: Array.from(frame.data),
               type: "binary",
+              token: this._wsBridgeToken,
             });
             break;
           case WS_OPCODE.CLOSE: {
@@ -551,7 +585,7 @@ export class RequestProxy extends EventEmitter {
               frame.data.length >= 2
                 ? (frame.data[0] << 8) | frame.data[1]
                 : 1000;
-            bridge.postMessage({ kind: "ws-closed", uid, code });
+            bridge.postMessage({ kind: "ws-closed", uid, code, token: this._wsBridgeToken });
             break;
           }
           case WS_OPCODE.PING:
@@ -580,20 +614,20 @@ export class RequestProxy extends EventEmitter {
 
     switch (msg.kind) {
       case "open":
-        bridge.postMessage({ kind: "ws-open", uid });
+        bridge.postMessage({ kind: "ws-open", uid, token: this._wsBridgeToken });
         break;
       case "text":
-        bridge.postMessage({ kind: "ws-message", uid, data: msg.data, type: "text" });
+        bridge.postMessage({ kind: "ws-message", uid, data: msg.data, type: "text", token: this._wsBridgeToken });
         break;
       case "binary":
-        bridge.postMessage({ kind: "ws-message", uid, data: msg.bytes, type: "binary" });
+        bridge.postMessage({ kind: "ws-message", uid, data: msg.bytes, type: "binary", token: this._wsBridgeToken });
         break;
       case "close":
-        bridge.postMessage({ kind: "ws-closed", uid, code: msg.code || 1000 });
+        bridge.postMessage({ kind: "ws-closed", uid, code: msg.code || 1000, token: this._wsBridgeToken });
         this._workerWsConns.delete(uid);
         break;
       case "error":
-        bridge.postMessage({ kind: "ws-error", uid, message: msg.message });
+        bridge.postMessage({ kind: "ws-error", uid, message: msg.message, token: this._wsBridgeToken });
         this._workerWsConns.delete(uid);
         break;
     }

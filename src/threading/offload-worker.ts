@@ -267,6 +267,21 @@ const workerEndpoint: OffloadWorkerEndpoint = {
     }
 
     const compressed = new Uint8Array(await response.arrayBuffer());
+
+    // check sha1 against what the registry told us
+    if (task.expectedShasum) {
+      const hashBuffer = await crypto.subtle.digest("SHA-1", compressed);
+      const hashHex = Array.from(new Uint8Array(hashBuffer))
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join("");
+      if (hashHex !== task.expectedShasum) {
+        throw new Error(
+          `Integrity check failed for ${task.tarballUrl}: ` +
+            `expected shasum ${task.expectedShasum}, got ${hashHex}`,
+        );
+      }
+    }
+
     const tarBytes = pakoModule.inflate(compressed) as Uint8Array;
 
     const files: ExtractedFile[] = [];

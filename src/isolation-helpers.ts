@@ -31,12 +31,16 @@ import { DEFAULT_NODEPOD_CDN } from "./constants/config";
 export interface SandboxPageConfig {
   nodepodUrl?: string;
   enableServiceWorker?: boolean;
+  /** parent page origin, e.g. 'https://myapp.com'. locks down who can
+   *  talk to the sandbox. defaults to '*' for backwards compat */
+  parentOrigin?: string;
 }
 
 export function getSandboxPageHtml(config: SandboxPageConfig | string = {}): string {
   const opts: SandboxPageConfig = typeof config === 'string' ? { nodepodUrl: config } : config;
   const nodepodUrl = opts.nodepodUrl ?? DEFAULT_NODEPOD_CDN;
   const withSW = opts.enableServiceWorker ?? true;
+  const parentOriginJs = opts.parentOrigin ? JSON.stringify(opts.parentOrigin) : "'*'";
 
   const swBlock = withSW ? `
   if ('serviceWorker' in navigator) {
@@ -53,10 +57,12 @@ export function getSandboxPageHtml(config: SandboxPageConfig | string = {}): str
 <script type="module">
   import { MemoryVolume, ScriptEngine } from '${nodepodUrl}';
 ${swBlock}
+  const PARENT_ORIGIN = ${parentOriginJs};
   let volume = null;
   let engine = null;
 
   window.addEventListener('message', async (event) => {
+    if (PARENT_ORIGIN !== '*' && event.origin !== PARENT_ORIGIN) return;
     const { type, id, code, filename, snapshot, config, path, content } = event.data;
     try {
       switch (type) {
@@ -66,7 +72,7 @@ ${swBlock}
             cwd: config?.cwd,
             env: config?.env,
             onConsole: (method, args) => {
-              parent.postMessage({ type: 'console', consoleMethod: method, consoleArgs: args }, '*');
+              parent.postMessage({ type: 'console', consoleMethod: method, consoleArgs: args }, PARENT_ORIGIN);
             },
           });
           break;
@@ -77,23 +83,23 @@ ${swBlock}
           }
           break;
         case 'execute':
-          if (!engine) { parent.postMessage({ type: 'error', id, error: 'Engine not initialized' }, '*'); return; }
-          parent.postMessage({ type: 'result', id, result: engine.execute(code, filename) }, '*');
+          if (!engine) { parent.postMessage({ type: 'error', id, error: 'Engine not initialized' }, PARENT_ORIGIN); return; }
+          parent.postMessage({ type: 'result', id, result: engine.execute(code, filename) }, PARENT_ORIGIN);
           break;
         case 'runFile':
-          if (!engine) { parent.postMessage({ type: 'error', id, error: 'Engine not initialized' }, '*'); return; }
-          parent.postMessage({ type: 'result', id, result: engine.runFile(filename) }, '*');
+          if (!engine) { parent.postMessage({ type: 'error', id, error: 'Engine not initialized' }, PARENT_ORIGIN); return; }
+          parent.postMessage({ type: 'result', id, result: engine.runFile(filename) }, PARENT_ORIGIN);
           break;
         case 'clearCache':
           if (engine) engine.clearCache();
           break;
       }
     } catch (err) {
-      if (id) parent.postMessage({ type: 'error', id, error: err instanceof Error ? err.message : String(err) }, '*');
+      if (id) parent.postMessage({ type: 'error', id, error: err instanceof Error ? err.message : String(err) }, PARENT_ORIGIN);
     }
   });
 
-  parent.postMessage({ type: 'ready' }, '*');
+  parent.postMessage({ type: 'ready' }, PARENT_ORIGIN);
 </script>
 </body>
 </html>`;

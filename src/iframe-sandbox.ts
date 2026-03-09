@@ -41,6 +41,7 @@ export class IframeSandbox implements IScriptEngine {
     // @ts-expect-error - credentialless attribute may not exist in types
     this.frame.credentialless = true;
     this.frame.setAttribute('credentialless', '');
+    this.frame.setAttribute('sandbox', 'allow-scripts');
     document.body.appendChild(this.frame);
 
     this.bindMessageHandler();
@@ -50,7 +51,8 @@ export class IframeSandbox implements IScriptEngine {
 
   private bindMessageHandler(): void {
     this.onMessage = (event: MessageEvent) => {
-      if (event.origin !== this.targetOrigin) return;
+      // sandbox="allow-scripts" without allow-same-origin makes the origin "null"
+      if (event.origin !== 'null' && event.origin !== this.targetOrigin) return;
       const msg = event.data as CrossOriginMessage;
 
       if (msg.type === 'result' && msg.id) {
@@ -69,7 +71,7 @@ export class IframeSandbox implements IScriptEngine {
   private awaitReady(): Promise<void> {
     return new Promise(resolve => {
       const handler = (event: MessageEvent) => {
-        if (event.origin !== this.targetOrigin) return;
+        if (event.origin !== 'null' && event.origin !== this.targetOrigin) return;
         if ((event.data as CrossOriginMessage).type === 'ready') {
           window.removeEventListener('message', handler);
           resolve();
@@ -85,17 +87,19 @@ export class IframeSandbox implements IScriptEngine {
       snapshot: this.vol.toSnapshot(),
       config: { cwd: this.cfg.cwd, env: this.cfg.env },
     };
-    this.frame.contentWindow?.postMessage(msg, this.targetOrigin);
+    // '*' is fine here — we're posting to this.frame.contentWindow directly,
+    // and sandboxed iframes have a "null" origin so we cant target them specifically
+    this.frame.contentWindow?.postMessage(msg, '*');
   }
 
   private attachVolumeSync(): void {
     this.onFileChange = (path, content) => {
-      this.frame.contentWindow?.postMessage({ type: 'syncFile', path, content } as CrossOriginMessage, this.targetOrigin);
+      this.frame.contentWindow?.postMessage({ type: 'syncFile', path, content } as CrossOriginMessage, '*');
     };
     this.vol.on('change', this.onFileChange);
 
     this.onFileDelete = (path) => {
-      this.frame.contentWindow?.postMessage({ type: 'syncFile', path, content: null } as CrossOriginMessage, this.targetOrigin);
+      this.frame.contentWindow?.postMessage({ type: 'syncFile', path, content: null } as CrossOriginMessage, '*');
     };
     this.vol.on('delete', this.onFileDelete);
   }
@@ -104,7 +108,7 @@ export class IframeSandbox implements IScriptEngine {
     return new Promise((resolve, reject) => {
       const id = String(this.nextId++);
       this.pendingCalls.set(id, { resolve, reject });
-      this.frame.contentWindow?.postMessage({ ...msg, id }, this.targetOrigin);
+      this.frame.contentWindow?.postMessage({ ...msg, id }, '*');
       setTimeout(() => {
         if (this.pendingCalls.has(id)) {
           this.pendingCalls.delete(id);
@@ -125,7 +129,7 @@ export class IframeSandbox implements IScriptEngine {
   }
 
   clearCache(): void {
-    this.frame.contentWindow?.postMessage({ type: 'clearCache' } as CrossOriginMessage, this.targetOrigin);
+    this.frame.contentWindow?.postMessage({ type: 'clearCache' } as CrossOriginMessage, '*');
   }
 
   getVolume(): MemoryVolume { return this.vol; }

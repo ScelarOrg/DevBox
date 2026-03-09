@@ -49,7 +49,7 @@ export declare class Nodepod {
         } | null;
     };
     get volume(): MemoryVolume;
-    /** @deprecated Main-thread engine removed for security. All code runs in isolated Web Workers via spawn(). */
+    /** @deprecated Main-thread engine removed for security. all code now runs in isolated Web Workers via spawn() <-- this removes fatal security flaws. */
     get engine(): never;
     get packages(): DependencyInstaller;
     get proxy(): RequestProxy;

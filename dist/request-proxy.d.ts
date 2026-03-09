@@ -34,6 +34,8 @@ export declare class RequestProxy extends EventEmitter {
     private _processManager;
     private _workerWsConns;
     private _previewScript;
+    private _swAuthToken;
+    private _wsBridgeToken;
     constructor(opts?: ProxyOptions);
     setProcessManager(pm: any): void;
     register(server: Server | IVirtualServer, port: number, hostname?: string): void;
@@ -41,6 +43,7 @@ export declare class RequestProxy extends EventEmitter {
     setPreviewScript(script: string | null): void;
     setWatermark(enabled: boolean): void;
     private _sendPreviewScriptToSW;
+    private _sendWsTokenToSW;
     serverUrl(port: number): string;
     activePorts(): number[];
     handleRequest(port: number, method: string, url: string, headers: Record<string, string>, body?: ArrayBuffer): Promise<CompletedResponse>;

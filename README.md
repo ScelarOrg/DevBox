@@ -119,6 +119,7 @@ Creates a fully wired nodepod instance.
 | `swUrl` | `string` | — | Service Worker URL (enables preview iframes) |
 | `watermark` | `boolean` | `true` | Show a small "nodepod" badge in preview iframes |
 | `onServerReady` | `(port, url) => void` | — | Callback when a virtual server starts listening |
+| `allowedFetchDomains` | `string[] \| null` | npm/github defaults | Extra domains allowed through the CORS proxy. Pass `null` to allow all |
 
 ### Instance Methods
 
@@ -150,6 +151,17 @@ Returned by `spawn()`. An EventEmitter with:
 | `exit` | `number` | exit code |
 
 Property: `completion` — a `Promise<void>` that resolves when the process exits.
+
+## Security
+
+nodepod includes several security measures for running untrusted code:
+
+- **CORS proxy domain whitelist** — Proxied fetch requests only go through to whitelisted domains (npm registry, GitHub, esm.sh, etc by default). Extend via the `allowedFetchDomains` boot option or pass `null` to disable
+- **Service Worker auth** — Control messages to the SW require a random token generated at boot, so other scripts on the same origin can't inject preview content
+- **WebSocket bridge auth** — The BroadcastChannel used for WS bridging between preview iframes and the main thread is token-authenticated
+- **Package integrity** — Downloaded npm tarballs are checked against the registry's `shasum` before extraction
+- **Iframe sandbox** — The cross-origin iframe mode uses `sandbox="allow-scripts"` to prevent top-frame navigation, popups, and form submissions
+- **Origin-checked messaging** — The sandbox page validates `event.origin` on incoming messages and only responds to the configured parent origin
 
 ## Architecture
 
