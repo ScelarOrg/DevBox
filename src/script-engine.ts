@@ -877,7 +877,7 @@ export interface EngineOptions {
     workerData: unknown;
     threadId: number;
   };
-  handler?: import('./memory-handler').MemoryHandler;
+  handler?: import("./memory-handler").MemoryHandler;
 }
 
 export interface ResolverFn {
@@ -951,8 +951,8 @@ const CORE_MODULES: Record<string, unknown> = {
   sea: seaPolyfill,
   sqlite: sqlitePolyfill,
   quic: quicPolyfill,
-  // lightningcss: lightningcssPolyfill,
-  // "@tailwindcss/oxide": tailwindOxidePolyfill,
+  lightningcss: lightningcssPolyfill,
+  "@tailwindcss/oxide": tailwindOxidePolyfill,
   sys: helpersPolyfill,
   "util/types": helpersPolyfill.types,
   "path/posix": pathPolyfill,
@@ -1125,12 +1125,16 @@ function buildResolver(
   const resolveCache: Map<string, string | null> =
     (cache as any).__resolveCache ??
     ((cache as any).__resolveCache = opts.handler
-      ? new _LRUCache<string, string | null>(opts.handler.options.resolveCacheSize)
+      ? new _LRUCache<string, string | null>(
+          opts.handler.options.resolveCacheSize,
+        )
       : new Map());
   const manifestCache: Map<string, PackageManifest | null> =
     (cache as any).__manifestCache ??
     ((cache as any).__manifestCache = opts.handler
-      ? new _LRUCache<string, PackageManifest | null>(opts.handler.options.manifestCacheSize)
+      ? new _LRUCache<string, PackageManifest | null>(
+          opts.handler.options.manifestCacheSize,
+        )
       : new Map());
   // Shared across all resolvers — deduplicates same-version packages from nested node_modules
   const _pkgIdentityMap: Record<string, string> =
@@ -2822,7 +2826,6 @@ function buildResolver(
             // not installed yet
           }
         }
-
       }
       throw resolveErr;
     }
@@ -2925,7 +2928,10 @@ export class ScriptEngine {
   constructor(vol: MemoryVolume, opts: EngineOptions = {}) {
     // Use handler's LRU transform cache if available, else a plain Map
     if (opts.handler) {
-      this.transformCache = opts.handler.transformCache as unknown as Map<string, string>;
+      this.transformCache = opts.handler.transformCache as unknown as Map<
+        string,
+        string
+      >;
     } else {
       this.transformCache = new Map();
     }
@@ -2976,7 +2982,9 @@ export class ScriptEngine {
           } catch {
             vfsPath = decodeURIComponent(url.slice(7));
           }
-          const v = (globalThis as any).__nodepodVolume as MemoryVolume | undefined;
+          const v = (globalThis as any).__nodepodVolume as
+            | MemoryVolume
+            | undefined;
           if (v) {
             try {
               const data = v.readFileSync(vfsPath);
@@ -2988,13 +2996,16 @@ export class ScriptEngine {
                 ? "application/wasm"
                 : "application/octet-stream";
               return Promise.resolve(
-                new Response(bytes.buffer.slice(
-                  bytes.byteOffset,
-                  bytes.byteOffset + bytes.byteLength,
-                ) as ArrayBuffer, {
-                  status: 200,
-                  headers: { "Content-Type": contentType },
-                }),
+                new Response(
+                  bytes.buffer.slice(
+                    bytes.byteOffset,
+                    bytes.byteOffset + bytes.byteLength,
+                  ) as ArrayBuffer,
+                  {
+                    status: 200,
+                    headers: { "Content-Type": contentType },
+                  },
+                ),
               );
             } catch {
               return Promise.resolve(
@@ -3631,7 +3642,7 @@ export class ScriptEngine {
     const keys = Object.keys(this.moduleRegistry);
     if (keys.length < limit) return;
     for (const k of keys) {
-      if (k.includes('/node_modules/')) {
+      if (k.includes("/node_modules/")) {
         delete this.moduleRegistry[k];
         return; // One eviction per call — amortized O(1)
       }

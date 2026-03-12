@@ -23,7 +23,7 @@ export interface EngineOptions {
         workerData: unknown;
         threadId: number;
     };
-    handler?: import('./memory-handler').MemoryHandler;
+    handler?: import("./memory-handler").MemoryHandler;
 }
 export interface ResolverFn {
     (id: string): unknown;
