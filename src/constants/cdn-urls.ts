@@ -9,7 +9,12 @@ export const CDN_ESBUILD_ESM = `https://esm.sh/esbuild-wasm@${PINNED_ESBUILD_WAS
 export const CDN_ESBUILD_BINARY = `https://esm.sh/esbuild-wasm@${PINNED_ESBUILD_WASM}/esbuild.wasm`;
 export const CDN_ESBUILD_BROWSER = `https://esm.sh/esbuild-wasm@${PINNED_ESBUILD_WASM}/esm/browser.min.js`;
 export const CDN_ROLLUP_BROWSER = `https://esm.sh/@rollup/browser@${PINNED_ROLLUP_BROWSER}`;
-export const CDN_BROTLI_WASM = `https://esm.sh/brotli-wasm@${PINNED_BROTLI_WASM}`;
+// Use the web entry point explicitly — esm.sh's default resolution picks
+// the `browser` / `pkg.bundler` variant whose circular WASM ↔ JS-glue
+// dependency isn't correctly linked after esm.sh re-bundles it, causing
+// `(void 0) is not a function` at runtime.  The web variant has a proper
+// `init()` that fetches + instantiates the WASM with correct imports.
+export const CDN_BROTLI_WASM = `https://esm.sh/brotli-wasm@${PINNED_BROTLI_WASM}/index.web.js`;
 export const CDN_LIGHTNINGCSS_WASM = `https://esm.sh/lightningcss-wasm@${PINNED_LIGHTNINGCSS_WASM}`;
 
 // new Function hides import() from bundler static analysis so CDN URLs work at runtime

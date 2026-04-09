@@ -6,7 +6,7 @@ import { CDN_BROTLI_WASM, cdnImport } from "../constants/cdn-urls";
 import pako from "pako";
 
 
-type BrotliEngine = {
+export type BrotliEngine = {
   compress: (input: Uint8Array) => Uint8Array;
   decompress: (input: Uint8Array) => Uint8Array;
 };
@@ -14,21 +14,58 @@ type BrotliEngine = {
 let brotliInstance: BrotliEngine | null = null;
 let brotliLoading: Promise<BrotliEngine | null> | null = null;
 
+async function loadBrotli(): Promise<BrotliEngine | null> {
+  // Strategy 1 — CDN import (browser / Nodepod runtime).
+  // cdnImport uses `new Function` to hide from the bundler.
+  try {
+    const mod = await cdnImport(CDN_BROTLI_WASM);
+    brotliInstance = await mod.default;
+    return brotliInstance;
+  } catch { /* CDN unreachable or not in browser */ }
+
+  // Strategy 2 — Node.js CJS require (vitest / server / SSR).
+  // Uses a standard dynamic import so it works in contexts where
+  // `new Function`-based import doesn't (e.g. vitest VM).
+  try {
+    const { createRequire } = await import(/* @vite-ignore */ "node:module");
+    const { cwd } = await import(/* @vite-ignore */ "node:process");
+    const req = createRequire(cwd() + "/package.json");
+    const pkg = req("brotli-wasm");
+    brotliInstance = pkg as unknown as BrotliEngine;
+    return brotliInstance;
+  } catch { /* not in Node.js or package not installed */ }
+
+  return null;
+}
+
 async function ensureBrotli(): Promise<BrotliEngine | null> {
   if (brotliInstance) return brotliInstance;
-  if (!brotliLoading) {
-    brotliLoading = (async () => {
-      try {
-        const mod = await cdnImport(CDN_BROTLI_WASM);
-        brotliInstance = await mod.default;
-        return brotliInstance;
-      } catch {
-        return null;
-      }
-    })();
+  // If a previous attempt already resolved to null, allow a retry —
+  // the environment may not have been ready yet (e.g. eager preload
+  // ran before the module system was fully initialised).
+  if (brotliLoading) {
+    const prev = await brotliLoading;
+    if (prev) return prev;
   }
+  brotliLoading = loadBrotli();
   return brotliLoading;
 }
+
+/**
+ * Pre-load the brotli WASM engine so that synchronous functions
+ * (`brotliCompressSync`, `brotliDecompressSync`) and brotli streams
+ * work without having to call an async variant first.
+ *
+ * Resolves to `true` when the engine is ready, `false` if loading failed.
+ */
+export async function preloadBrotli(): Promise<boolean> {
+  return (await ensureBrotli()) !== null;
+}
+
+// Eagerly kick off brotli loading so it's available for sync callers ASAP.
+// This is fire-and-forget — if it fails the sync functions will still throw
+// a descriptive error, and the async functions will retry on next call.
+ensureBrotli();
 
 
 type CompressCallback = (err: Error | null, result: Buffer) => void;
@@ -172,7 +209,7 @@ export function brotliCompressSync(
 ): Buffer {
   if (!brotliInstance) {
     throw new Error(
-      "Brotli WASM not loaded yet. Use async brotliCompress first.",
+      "Brotli WASM not loaded yet. Call `await preloadBrotli()` or use async brotliCompress first.",
     );
   }
   const data = typeof input === "string" ? Buffer.from(input) : input;
@@ -182,7 +219,7 @@ export function brotliCompressSync(
 export function brotliDecompressSync(input: Buffer, _opts?: unknown): Buffer {
   if (!brotliInstance) {
     throw new Error(
-      "Brotli WASM not loaded yet. Use async brotliDecompress first.",
+      "Brotli WASM not loaded yet. Call `await preloadBrotli()` or use async brotliDecompress first.",
     );
   }
   return Buffer.from(brotliInstance.decompress(new Uint8Array(input)));
@@ -857,6 +894,7 @@ export default {
   inflateRawSync,
   brotliCompressSync,
   brotliDecompressSync,
+  preloadBrotli,
   Gzip,
   Gunzip,
   Deflate,
