@@ -36,6 +36,7 @@ export class Nodepod {
   private _packages: DependencyInstaller;
   private _proxy: RequestProxy;
   private _cwd: string;
+  private _env: Record<string, string>;
 
   private _processManager: ProcessManager;
   private _vfsBridge: VFSBridge;
@@ -52,11 +53,13 @@ export class Nodepod {
     proxy: RequestProxy,
     cwd: string,
     handler: MemoryHandler,
+    env: Record<string, string>,
   ) {
     this._volume = volume;
     this._packages = packages;
     this._proxy = proxy;
     this._cwd = cwd;
+    this._env = env;
     this._handler = handler;
     this.fs = new NodepodFS(volume);
     this._processManager = new ProcessManager(volume);
@@ -153,6 +156,8 @@ export class Nodepod {
     }
 
     const cwd = opts.workdir ?? "/";
+    const env = opts.env ?? {};
+
     const handler = new MemoryHandler(opts.memory);
     handler.startMonitoring();
     const volume = new MemoryVolume(handler);
@@ -179,7 +184,7 @@ export class Nodepod {
       setAllowedDomains(opts.allowedFetchDomains ?? []);
     }
 
-    const nodepod = new Nodepod(volume, packages, proxy, cwd, handler);
+    const nodepod = new Nodepod(volume, packages, proxy, cwd, handler, env);
 
     if (opts.files) {
       for (const [path, content] of Object.entries(opts.files)) {
@@ -230,12 +235,13 @@ export class Nodepod {
   ): Promise<NodepodProcess> {
     const proc = new NodepodProcess();
     const execCwd = opts?.cwd ?? this._cwd;
+    const combinedEnv = { ...this._env, ...(opts?.env ?? {}) };
 
     const handle = this._processManager.spawn({
       command: cmd,
       args: args ?? [],
       cwd: execCwd,
-      env: opts?.env ?? {},
+      env: combinedEnv,
     });
 
     handle.on("stdout", (data: string) => {
@@ -342,7 +348,7 @@ export class Nodepod {
         command: "shell",
         args: [],
         cwd: this._cwd,
-        env: {},
+        env: this._env,
       });
       shellReady = new Promise<void>((resolve) => {
         if (shellHandle!.state === "running") {

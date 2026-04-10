@@ -1,7 +1,7 @@
 var __defProp = Object.defineProperty;
 var __defNormalProp = (obj, key, value) => key in obj ? __defProp(obj, key, { enumerable: true, configurable: true, writable: true, value }) : obj[key] = value;
 var __publicField = (obj, key, value) => __defNormalProp(obj, typeof key !== "symbol" ? key + "" : key, value);
-import { n as normalize, b as basename, d as dirname, L as LS_BLOCK_SIZE, Y as YES_REPEAT_COUNT, e as extname, N as NPM_REGISTRY_URL_SLASH, V as VERSIONS, r as resolve, a as relative, c as createHash, p as proxiedFetch, D as DEFAULT_ENV, E as EventEmitter, M as MOCK_PID, W as Writable, R as Readable, S as ScriptEngine, f as format, g as getAllServers, h as ref, u as unref, i as addDrainListener, T as TIMEOUTS, j as closeAllServers, k as resetRefCount, l as resetActiveInterfaceCount, B as Buffer2, m as getActiveContext, o as getRefCount, __tla as __tla_0 } from "./index-CK6KRbI1.js";
+import { n as normalize, b as basename, d as dirname, L as LS_BLOCK_SIZE, Y as YES_REPEAT_COUNT, e as extname, N as NPM_REGISTRY_URL_SLASH, V as VERSIONS, r as resolve, a as relative, c as createHash, p as proxiedFetch, D as DEFAULT_ENV, E as EventEmitter, M as MOCK_PID, W as Writable, R as Readable, S as ScriptEngine, f as format, g as getAllServers, h as ref, u as unref, i as addDrainListener, T as TIMEOUTS, j as closeAllServers, k as resetRefCount, l as resetActiveInterfaceCount, B as Buffer2, m as getActiveContext, o as getRefCount, __tla as __tla_0 } from "./index-DQ74lrOh.js";
 let ShellProcess, clearStreamingCallbacks, child_process, exec, execFile, execFileSync, execSync, executeNodeBinary, fork, getShellCwd, handleIPCFromParent, initShellExec, isStdinRaw, sendStdin, setForkChildCallback, setIPCReceiveHandler, setIPCSend, setShellCwd, setSpawnChildCallback, setStreamingCallbacks, setSyncChannel, shellExec, spawn, spawnSync;
 let __tla = Promise.all([
   (() => {
@@ -6754,7 +6754,7 @@ ${A_DIM}Done in ${elapsed}s${A_RESET}`;
     }
   }
   async function installPackages(args, ctx, pm = "npm") {
-    const { DependencyInstaller } = await import("./index-CK6KRbI1.js").then(async (m) => {
+    const { DependencyInstaller } = await import("./index-DQ74lrOh.js").then(async (m) => {
       await m.__tla;
       return m;
     }).then((n) => n.ag);
@@ -6863,7 +6863,7 @@ ${A_DIM}Done in ${elapsed}s${A_RESET}`;
     };
   }
   async function listPackages(ctx, pm = "npm") {
-    const { DependencyInstaller } = await import("./index-CK6KRbI1.js").then(async (m) => {
+    const { DependencyInstaller } = await import("./index-DQ74lrOh.js").then(async (m) => {
       await m.__tla;
       return m;
     }).then((n) => n.ag);
@@ -7022,7 +7022,7 @@ ${JSON.stringify(pkg, null, 2)}
       }
     }
     try {
-      const { RegistryClient } = await import("./index-CK6KRbI1.js").then(async (m) => {
+      const { RegistryClient } = await import("./index-DQ74lrOh.js").then(async (m) => {
         await m.__tla;
         return m;
       }).then((n) => n.av);

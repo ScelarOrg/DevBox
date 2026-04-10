@@ -30610,7 +30610,7 @@ ${scanErr.stack}` : "";
       });
       this.fsBridge = buildFileSystemBridge(vol, () => this.proc.cwd());
       this.opts = opts;
-      import("./child_process-eiM1_nmq.js").then(async (m) => {
+      import("./child_process-DZQ7oC2G.js").then(async (m) => {
         await m.__tla;
         return m;
       }).then((mod) => {
@@ -36529,12 +36529,13 @@ miniExpose(endpoint);
     };
   }
   Nodepod = (_c = class {
-    constructor(volume, packages, proxy2, cwd, handler) {
+    constructor(volume, packages, proxy2, cwd, handler, env) {
       __publicField(this, "fs");
       __publicField(this, "_volume");
       __publicField(this, "_packages");
       __publicField(this, "_proxy");
       __publicField(this, "_cwd");
+      __publicField(this, "_env");
       __publicField(this, "_processManager");
       __publicField(this, "_vfsBridge");
       __publicField(this, "_sharedVFS", null);
@@ -36545,6 +36546,7 @@ miniExpose(endpoint);
       this._packages = packages;
       this._proxy = proxy2;
       this._cwd = cwd;
+      this._env = env;
       this._handler = handler;
       this.fs = new NodepodFS(volume);
       this._processManager = new ProcessManager(volume);
@@ -36603,6 +36605,7 @@ miniExpose(endpoint);
         throw new Error("[Nodepod] SharedArrayBuffer is required. Ensure Cross-Origin-Isolation headers are set (Cross-Origin-Opener-Policy: same-origin, Cross-Origin-Embedder-Policy: credentialless).");
       }
       const cwd = opts.workdir ?? "/";
+      const env = opts.env ?? {};
       const handler = new MemoryHandler(opts.memory);
       handler.startMonitoring();
       const volume = new MemoryVolume(handler);
@@ -36624,7 +36627,7 @@ miniExpose(endpoint);
       } else {
         setAllowedDomains(opts.allowedFetchDomains ?? []);
       }
-      const nodepod = new Nodepod(volume, packages, proxy2, cwd, handler);
+      const nodepod = new Nodepod(volume, packages, proxy2, cwd, handler, env);
       if (opts.files) {
         for (const [path2, content] of Object.entries(opts.files)) {
           const dir = path2.substring(0, path2.lastIndexOf("/")) || "/";
@@ -36667,11 +36670,15 @@ miniExpose(endpoint);
     async spawn(cmd, args, opts) {
       const proc = new NodepodProcess();
       const execCwd = (opts == null ? void 0 : opts.cwd) ?? this._cwd;
+      const combinedEnv = {
+        ...this._env,
+        ...(opts == null ? void 0 : opts.env) ?? {}
+      };
       const handle = this._processManager.spawn({
         command: cmd,
         args: args ?? [],
         cwd: execCwd,
-        env: (opts == null ? void 0 : opts.env) ?? {}
+        env: combinedEnv
       });
       handle.on("stdout", (data2) => {
         if (!proc.exited) proc._pushStdout(data2);
@@ -36759,7 +36766,7 @@ miniExpose(endpoint);
           command: "shell",
           args: [],
           cwd: this._cwd,
-          env: {}
+          env: this._env
         });
         shellReady = new Promise((resolve2) => {
           if (shellHandle.state === "running") {
@@ -37159,7 +37166,7 @@ miniExpose(endpoint);
   };
   let _shellMod = null;
   async function getShellMod() {
-    if (!_shellMod) _shellMod = await import("./child_process-eiM1_nmq.js").then(async (m) => {
+    if (!_shellMod) _shellMod = await import("./child_process-DZQ7oC2G.js").then(async (m) => {
       await m.__tla;
       return m;
     });

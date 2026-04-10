@@ -32600,7 +32600,7 @@ class ScriptEngine {
     });
     this.fsBridge = buildFileSystemBridge(vol, () => this.proc.cwd());
     this.opts = opts;
-    Promise.resolve().then(() => require('./child_process-DldQfPd9.cjs')).then((mod) => {
+    Promise.resolve().then(() => require('./child_process-CW-z_hoC.cjs')).then((mod) => {
       _shellExecPolyfill = mod;
       mod.initShellExec;
     }).catch(() => {
@@ -33578,7 +33578,7 @@ function generateUUID() {
 }
 
 function createWorker() {
-  const base = (typeof document === 'undefined' ? require('u' + 'rl').pathToFileURL(__filename).href : (_documentCurrentScript && _documentCurrentScript.tagName.toUpperCase() === 'SCRIPT' && _documentCurrentScript.src || new URL('index-DfyUKyNH.cjs', document.baseURI).href));
+  const base = (typeof document === 'undefined' ? require('u' + 'rl').pathToFileURL(__filename).href : (_documentCurrentScript && _documentCurrentScript.tagName.toUpperCase() === 'SCRIPT' && _documentCurrentScript.src || new URL('index-lVFpjksc.cjs', document.baseURI).href));
   const path = "./threading/engine-worker.ts";
   const url = new globalThis.URL(path, base);
   return new globalThis.Worker(url, { type: "module" });
@@ -35442,7 +35442,7 @@ function readServiceWorkerSource() {
     let dir;
     try {
       const url = _req("url");
-      dir = path.dirname(url.fileURLToPath((typeof document === 'undefined' ? require('u' + 'rl').pathToFileURL(__filename).href : (_documentCurrentScript && _documentCurrentScript.tagName.toUpperCase() === 'SCRIPT' && _documentCurrentScript.src || new URL('index-DfyUKyNH.cjs', document.baseURI).href))));
+      dir = path.dirname(url.fileURLToPath((typeof document === 'undefined' ? require('u' + 'rl').pathToFileURL(__filename).href : (_documentCurrentScript && _documentCurrentScript.tagName.toUpperCase() === 'SCRIPT' && _documentCurrentScript.src || new URL('index-lVFpjksc.cjs', document.baseURI).href))));
     } catch {
       dir = typeof __dirname !== "undefined" ? __dirname : ".";
     }
@@ -38463,6 +38463,7 @@ class Nodepod {
   _packages;
   _proxy;
   _cwd;
+  _env;
   _processManager;
   _vfsBridge;
   _sharedVFS = null;
@@ -38470,11 +38471,12 @@ class Nodepod {
   _unwatchVFS = null;
   _handler;
   /* ---- Construction (use Nodepod.boot()) ---- */
-  constructor(volume, packages, proxy, cwd, handler) {
+  constructor(volume, packages, proxy, cwd, handler, env) {
     this._volume = volume;
     this._packages = packages;
     this._proxy = proxy;
     this._cwd = cwd;
+    this._env = env;
     this._handler = handler;
     this.fs = new NodepodFS(volume);
     this._processManager = new ProcessManager(volume);
@@ -38548,6 +38550,7 @@ class Nodepod {
       );
     }
     const cwd = opts.workdir ?? "/";
+    const env = opts.env ?? {};
     const handler = new MemoryHandler(opts.memory);
     handler.startMonitoring();
     const volume = new MemoryVolume(handler);
@@ -38567,7 +38570,7 @@ class Nodepod {
     } else {
       setAllowedDomains(opts.allowedFetchDomains ?? []);
     }
-    const nodepod = new Nodepod(volume, packages, proxy, cwd, handler);
+    const nodepod = new Nodepod(volume, packages, proxy, cwd, handler, env);
     if (opts.files) {
       for (const [path, content] of Object.entries(opts.files)) {
         const dir = path.substring(0, path.lastIndexOf("/")) || "/";
@@ -38601,11 +38604,12 @@ class Nodepod {
   async spawn(cmd, args, opts) {
     const proc = new NodepodProcess();
     const execCwd = opts?.cwd ?? this._cwd;
+    const combinedEnv = { ...this._env, ...opts?.env ?? {} };
     const handle = this._processManager.spawn({
       command: cmd,
       args: args ?? [],
       cwd: execCwd,
-      env: opts?.env ?? {}
+      env: combinedEnv
     });
     handle.on("stdout", (data) => {
       if (!proc.exited) proc._pushStdout(data);
@@ -38696,7 +38700,7 @@ class Nodepod {
         command: "shell",
         args: [],
         cwd: this._cwd,
-        env: {}
+        env: this._env
       });
       shellReady = new Promise((resolve) => {
         if (shellHandle.state === "running") {
@@ -39111,7 +39115,7 @@ class WorkerVFS {
 
 let _shellMod = null;
 async function getShellMod() {
-  if (!_shellMod) _shellMod = await Promise.resolve().then(() => require('./child_process-DldQfPd9.cjs'));
+  if (!_shellMod) _shellMod = await Promise.resolve().then(() => require('./child_process-CW-z_hoC.cjs'));
   return _shellMod;
 }
 function createWorkspace(config) {
@@ -39251,4 +39255,4 @@ exports.unref = unref;
 exports.urlPolyfill = urlPolyfill;
 exports.watcherPolyfill = watcherPolyfill;
 exports.wsPolyfill = wsPolyfill;
-//# sourceMappingURL=index-DfyUKyNH.cjs.map
+//# sourceMappingURL=index-lVFpjksc.cjs.map
