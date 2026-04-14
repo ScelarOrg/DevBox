@@ -214,6 +214,11 @@ export class NodepodShell {
       expandedArgs = [...aliasArgs, ...expandedArgs.slice(1)];
     }
 
+    // extract "sh -c" commands and execute them
+    if (expandedArgs[0] === "sh" && expandedArgs[1] === "-c" && expandedArgs[2]) {
+      return this.exec(expandedArgs[2], { cwd: this.cwd, env: this.env });
+    }
+
     const name = expandedArgs[0];
     const args = expandedArgs.slice(1);
 

@@ -154,4 +154,26 @@ describe("NodepodShell", () => {
       expect(result.stdout).not.toContain("c.js");
     });
   });
+
+  describe("sh -c support", () => {
+    it("sh -c executes simple command", async () => {
+      const { shell } = createShell();
+      const result = await shell.exec("sh -c 'echo hello'");
+      expect(result.stdout).toBe("hello\n");
+      expect(result.exitCode).toBe(0);
+    });
+
+    it("sh -c handles pipes correctly", async () => {
+      const { shell } = createShell();
+      const result = await shell.exec("sh -c 'echo hello world | wc -w'");
+      expect(result.stdout.trim()).toBe("2");
+      expect(result.exitCode).toBe(0);
+    });
+
+    it("sh -c handles chained commands", async () => {
+      const { shell } = createShell();
+      const result = await shell.exec("sh -c 'echo a && echo b'");
+      expect(result.stdout).toBe("a\nb\n");
+    });
+  });
 });
