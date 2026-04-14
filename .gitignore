@@ -1,7 +1,8 @@
 # Dependencies
 node_modules/
 
-# Build output (dist/ is NOT ignored — it's published to npm)
+# Build output (included in npm via "files" field, but not tracked in git)
+dist/
 
 # Environment variables
 .env

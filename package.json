@@ -56,7 +56,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "bench": "vitest bench",
-    "bench:run": "vitest bench --run"
+    "bench:run": "vitest bench --run",
+    "prepublishOnly": "npm run build:publish"
   },
   "dependencies": {
     "acorn": "^8.15.0",

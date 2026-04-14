@@ -1,71 +1,52 @@
 # nodepod
 
-[![npm version](https://img.shields.io/npm/v/@scelar/nodepod.svg)](https://www.npmjs.com/package/@scelar/nodepod)
-[![license](https://img.shields.io/npm/l/@scelar/nodepod.svg)](https://github.com/ScelarOrg/Nodepod/blob/main/LICENSE)
+[![npm](https://img.shields.io/npm/v/@scelar/nodepod.svg)](https://www.npmjs.com/package/@scelar/nodepod)
+[![license](https://img.shields.io/npm/l/@scelar/nodepod.svg)](./LICENSE)
 
-Browser-native Node.js runtime. Run real Node.js code — filesystem, modules, `require()`, npm packages, HTTP servers — entirely inside the browser.
-
-No backend. No containers. No WASM Node binary. Just polyfills, an in-memory filesystem, and a JavaScript execution engine.
-
-Built by [@R1ck404](https://github.com/R1ck404) — powering [Scelar](https://scelar.com), the AI app builder that actually COMPLETELY builds your apps, from idea to production in a matter of minutes.
-
-## Features
-
-- **Virtual Filesystem** — Full in-memory `fs` API (read, write, watch, streams, symlinks, glob)
-- **Module System** — `require()`, `import`, `module.exports`, `package.json` resolution, conditional exports
-- **npm Packages** — Install real packages from the npm registry, extracted and resolved in-browser
-- **HTTP Servers** — Run Express, Hono, Elysia, vite and other frameworks with real request/response routing
-- **Shell** — Built-in bash-like shell with 35+ commands (ls, cat, grep, find, sed, etc.), pipes, redirections, variable expansion
-- **Process Model** — Web Worker-based processes with `child_process.exec/spawn/fork`, `worker_threads`, and IPC
-- **Terminal** — Drop-in xterm.js integration with line editing, history, raw mode, Ctrl+C
-- **Preview** — Service Worker-based iframe preview with script injection and WebSocket bridging
-- **Snapshots** — Save and restore the entire filesystem state
-
-## Install
+Run Node.js in the browser. Filesystem, shell, npm packages, HTTP servers, no backend required.
 
 ```bash
 npm install @scelar/nodepod
 ```
 
-## Quick Start
+## Usage
 
 ```typescript
 import { Nodepod } from '@scelar/nodepod';
 
-// Boot a nodepod instance with some files
 const nodepod = await Nodepod.boot({
   files: {
     '/index.js': 'console.log("Hello from the browser!")',
   },
 });
 
-// Run a script
 const proc = await nodepod.spawn('node', ['index.js']);
 proc.on('output', (text) => console.log(text));
 await proc.completion;
-
-// Read/write files
-await nodepod.fs.writeFile('/data.json', JSON.stringify({ hello: 'world' }));
-const content = await nodepod.fs.readFile('/data.json', 'utf8');
 ```
 
-## Terminal Integration
+### Terminal
 
-nodepod provides built-in xterm.js terminal support:
+Plug in xterm.js for an interactive shell:
 
 ```typescript
-import { Nodepod } from '@scelar/nodepod';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 
-const nodepod = await Nodepod.boot();
 const terminal = nodepod.createTerminal({ Terminal, FitAddon });
 terminal.attach('#terminal-container');
 ```
 
-The terminal handles line editing, command history, prompt rendering, raw/cooked mode, and streaming output out of the box.
+### npm packages
 
-## Running an Express Server
+```typescript
+await nodepod.install(['express']);
+const proc = await nodepod.spawn('node', ['server.js']);
+```
+
+### HTTP servers
+
+Works with Express, Hono, Vite, and anything that calls `listen()`:
 
 ```typescript
 const nodepod = await Nodepod.boot({
@@ -73,151 +54,87 @@ const nodepod = await Nodepod.boot({
     '/server.js': `
       const express = require('express');
       const app = express();
-      app.get('/', (req, res) => res.json({ status: 'ok' }));
-      app.listen(3000, () => console.log('Server running on port 3000'));
+      app.get('/', (req, res) => res.json({ ok: true }));
+      app.listen(3000);
     `,
   },
 });
 
-// Install express
 await nodepod.install(['express']);
+await nodepod.spawn('node', ['server.js']);
 
-// Run the server
-const proc = await nodepod.spawn('node', ['server.js']);
-
-// Dispatch requests to the virtual server
 const response = await nodepod.request(3000, 'GET', '/');
-console.log(response.body); // { status: 'ok' }
+console.log(response.body); // { ok: true }
 ```
 
-## Preview Script Injection
+### Snapshots
 
-Inject scripts into preview iframes before any page content loads — useful for setting up bridges between the main window and the iframe:
+Save and restore the filesystem:
 
 ```typescript
-await nodepod.setPreviewScript(`
-  window.__bridge = {
-    sendToParent(msg) { window.parent.postMessage(msg, '*'); }
-  };
-`);
-
-// Remove it later
-await nodepod.clearPreviewScript();
+const snapshot = await nodepod.snapshot();
+// ... later
+await nodepod.restore(snapshot);
 ```
 
-## SDK API
+## API
 
 ### `Nodepod.boot(options?)`
 
-Creates a fully wired nodepod instance.
+| Option | Type | Description |
+|--------|------|-------------|
+| `files` | `Record<string, string \| Uint8Array>` | Initial files |
+| `workdir` | `string` | Working directory (default `"/"`) |
+| `env` | `Record<string, string>` | Environment variables |
+| `swUrl` | `string` | Service Worker URL for preview iframes |
+| `watermark` | `boolean` | Show nodepod badge in previews (default `true`) |
+| `onServerReady` | `(port, url) => void` | Called when a virtual server starts |
+| `allowedFetchDomains` | `string[] \| null` | Extra CORS proxy domains. `null` = allow all |
 
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `files` | `Record<string, string>` | — | Initial files to populate the filesystem |
-| `workdir` | `string` | `"/"` | Working directory |
-| `env` | `Record<string, string>` | — | Environment variables |
-| `swUrl` | `string` | — | Service Worker URL (enables preview iframes) |
-| `watermark` | `boolean` | `true` | Show a small "nodepod" badge in preview iframes |
-| `onServerReady` | `(port, url) => void` | — | Callback when a virtual server starts listening |
-| `allowedFetchDomains` | `string[] \| null` | npm/github defaults | Extra domains allowed through the CORS proxy. Pass `null` to allow all |
-
-### Instance Methods
+### Instance methods
 
 | Method | Description |
 |--------|-------------|
-| `spawn(cmd, args?)` | Run a command, returns `NodepodProcess` |
-| `createTerminal(opts)` | Create an interactive terminal |
+| `spawn(cmd, args?, opts?)` | Run a command |
 | `install(packages)` | Install npm packages |
+| `createTerminal(opts)` | Create an xterm.js terminal |
 | `fs.readFile(path, enc?)` | Read a file |
 | `fs.writeFile(path, data)` | Write a file |
-| `fs.readdir(path)` | List directory contents |
-| `fs.stat(path)` | Get file stats |
-| `fs.mkdir(path, opts?)` | Create a directory |
-| `fs.rm(path, opts?)` | Remove files/directories |
+| `fs.readdir(path)` | List directory |
+| `fs.stat(path)` | File stats |
+| `fs.mkdir(path, opts?)` | Create directory |
+| `fs.rm(path, opts?)` | Remove file/directory |
 | `snapshot()` | Capture filesystem state |
-| `restore(snapshot)` | Restore filesystem from snapshot |
-| `setPreviewScript(script)` | Inject JS into preview iframes |
-| `clearPreviewScript()` | Remove injected preview script |
-| `port(num)` | Get preview URL for a virtual server port |
+| `restore(snapshot)` | Restore from snapshot |
+| `request(port, method, path)` | Send request to virtual server |
+| `port(num)` | Get preview URL for a port |
+| `setPreviewScript(js)` | Inject JS into preview iframes |
+| `clearPreviewScript()` | Remove injected script |
 
-### `NodepodProcess`
+### Process events
 
-Returned by `spawn()`. An EventEmitter with:
+`spawn()` returns a `NodepodProcess`:
 
-| Event | Payload | Description |
-|-------|---------|-------------|
-| `output` | `string` | stdout data |
-| `error` | `string` | stderr data |
-| `exit` | `number` | exit code |
-
-Property: `completion` — a `Promise<void>` that resolves when the process exits.
-
-## Security
-
-nodepod includes several security measures for running untrusted code:
-
-- **CORS proxy domain whitelist** — Proxied fetch requests only go through to whitelisted domains (npm registry, GitHub, esm.sh, etc by default). Extend via the `allowedFetchDomains` boot option or pass `null` to disable
-- **Service Worker auth** — Control messages to the SW require a random token generated at boot, so other scripts on the same origin can't inject preview content
-- **WebSocket bridge auth** — The BroadcastChannel used for WS bridging between preview iframes and the main thread is token-authenticated
-- **Package integrity** — Downloaded npm tarballs are checked against the registry's `shasum` before extraction
-- **Iframe sandbox** — The cross-origin iframe mode uses `sandbox="allow-scripts"` to prevent top-frame navigation, popups, and form submissions
-- **Origin-checked messaging** — The sandbox page validates `event.origin` on incoming messages and only responds to the configured parent origin
-
-## Architecture
-
-```
-nodepod
-├── src/
-│   ├── script-engine.ts       # JavaScript execution engine (require, ESM→CJS, REPL)
-│   ├── memory-volume.ts       # In-memory virtual filesystem
-│   ├── syntax-transforms.ts   # ESM-to-CJS conversion via acorn
-│   ├── module-transformer.ts  # esbuild-wasm code transforms
-│   ├── polyfills/             # Node.js built-in module polyfills
-│   │   ├── fs.ts              #   Filesystem (read, write, watch, streams, glob)
-│   │   ├── http.ts            #   HTTP server/client
-│   │   ├── stream.ts          #   Readable, Writable, Transform, Duplex
-│   │   ├── events.ts          #   EventEmitter
-│   │   ├── path.ts            #   Path operations
-│   │   ├── crypto.ts          #   Hashing, randomBytes, randomUUID
-│   │   ├── child_process.ts   #   exec, spawn, fork, execSync
-│   │   ├── net.ts             #   TCP Socket, Server
-│   │   └── ...                #   40+ more polyfills
-│   ├── shell/                 # Bash-like shell interpreter
-│   │   ├── shell-parser.ts    #   Tokenizer + recursive-descent parser
-│   │   ├── shell-builtins.ts  #   35+ built-in commands
-│   │   └── shell-interpreter.ts # AST executor, pipes, redirections
-│   ├── packages/              # npm package management
-│   │   ├── installer.ts       #   Package installer
-│   │   ├── registry-client.ts #   npm registry client
-│   │   └── version-resolver.ts #  Semver resolution
-│   ├── threading/             # Worker-based process model
-│   │   ├── process-manager.ts #   Process lifecycle management
-│   │   └── process-handle.ts  #   Process I/O handle
-│   └── sdk/                   # Public SDK layer
-│       ├── nodepod.ts          #   Nodepod.boot() entry point
-│       ├── nodepod-fs.ts       #   Async filesystem facade
-│       ├── nodepod-process.ts  #   Process handle
-│       └── nodepod-terminal.ts #   xterm.js terminal integration
-└── static/
-    └── __sw__.js              # Service Worker for HTTP request interception
+```typescript
+proc.on('output', (text) => { }); // stdout
+proc.on('error', (text) => { });  // stderr
+proc.on('exit', (code) => { });   // exit code
+await proc.completion;             // wait for exit
 ```
 
-## Supported Node.js Modules
+## Polyfills
 
-**Full implementations:** fs, path, events, stream, buffer, process, http, https, net, crypto, zlib, url, querystring, util, os, tty, child_process, assert, readline, module, timers, string_decoder, perf_hooks, constants, punycode
+**Full:** fs, path, events, stream, buffer, process, http, https, net, crypto, zlib, url, querystring, util, os, tty, child_process, assert, readline, module, timers, string_decoder, perf_hooks, constants, punycode
 
-**Shims/stubs:** dns, worker_threads, vm, v8, tls, dgram, cluster, http2, inspector, domain, diagnostics_channel, async_hooks
+**Stubs:** dns, worker_threads, vm, v8, tls, dgram, cluster, http2, inspector, domain, diagnostics_channel, async_hooks
 
-## CDN Usage
-Once published to npm, nodepod is automatically available on CDNs:
+**In development:** Native WASI/WASM loading for napi-rs based packages (rolldown, lightningcss, etc.)
 
-```html
-<!-- unpkg -->
-<script src="https://unpkg.com/@scelar/nodepod"></script>
+## Why nodepod?
 
-<!-- jsDelivr -->
-<script src="https://cdn.jsdelivr.net/npm/@scelar/nodepod"></script>
-```
+We built nodepod for [Scelar](https://scelar.com), an AI app builder that takes you from idea to production in minutes. Scelar needed a way to run real Node.js code directly in the browser so users could build, preview, and interact with their apps instantly without waiting for remote servers to spin up. No containers, no cold starts, no infrastructure to manage.
+
+We open-sourced it because we think running Node in the browser shouldn't be a proprietary black box. If you're building a web IDE, coding playground, AI dev tool, or anything that needs server-side JS in the browser, nodepod is for you.
 
 ## Development
 
@@ -225,28 +142,56 @@ Once published to npm, nodepod is automatically available on CDNs:
 git clone https://github.com/ScelarOrg/Nodepod.git
 cd Nodepod
 npm install
-npm run type-check    # TypeScript validation
-npm run build:lib     # Build ESM + CJS bundles
-npm test              # Run tests
+npm run build:publish   # build library + types
+npm test                # run tests
 ```
 
-## Contributing
+### Publishing a new version
 
-See [CONTRIBUTING.md](./CONTRIBUTING.md) for setup instructions and guidelines.
+```bash
+npm version patch       # or minor / major
+npm publish             # auto-builds before publishing
+git push && git push --tags
+```
 
-## Author
+### Contributing
 
-Created by [@R1ck404](https://github.com/R1ck404). Part of the [Scelar](https://scelar.com) ecosystem.
+Contributions are really appreciated. This is a big project and it's hard to maintain and push updates on my own. If you want to help out, feel free to open a PR.
+
+Note that nodepod is not my main focus, [Scelar](https://scelar.com) is. I work on nodepod when I have time for it, so responses to issues and PRs might take a bit.
+
+Before opening a PR, make sure these pass:
+
+```bash
+npm run type-check      # 0 TypeScript errors
+npm run build:publish   # builds cleanly
+npm test                # tests pass
+```
+
+**Code style:**
+
+- Files are **kebab-case** (`shell-parser.ts`, `memory-volume.ts`). Polyfills match their Node.js module name (`fs.ts`, `crypto.ts`).
+- Classes and types are **PascalCase** (`MemoryVolume`, `ShellResult`). Functions and variables are **camelCase**.
+- Private properties and internal helpers use a **leading underscore** (`_registry`, `_ensureSlot()`).
+- Use **named exports**. Default exports only for polyfills that need to match Node's `module.exports` shape.
+
+**Commit messages** follow conventional commits:
+
+```
+feat: add readline support
+fix: resolve path edge case in fs.watch
+chore: bump dependencies
+```
+
+**If you're writing a polyfill:**
+
+- Polyfill files live in `src/polyfills/` and must be named after the Node.js module they replace.
+- EventEmitter methods must use `_reg()` for lazy init, never access `this._registry` directly.
+- Polyfills registered in `CORE_MODULES` must not use `async` functions.
+- ESM-to-CJS replacement strings must include trailing semicolons.
 
 ## License
 
-[MIT + Commons Clause](./LICENSE)
+[MIT + Commons Clause](./LICENSE). Use it in anything, just don't resell nodepod itself.
 
-This project uses the MIT license with the [Commons Clause](https://commonsclause.com/) restriction. In plain terms:
-
-- **Use it** freely in your own projects, including commercial ones
-- **Modify it**, fork it, learn from it
-- **Ship products** built with nodepod — that's totally fine
-- **Don't resell nodepod itself** as a standalone product or hosted service
-
-Basically, build whatever you want with it — just don't take nodepod, rebrand it, and sell it as your own thing.
+Built by [@R1ck404](https://github.com/R1ck404), part of [Scelar](https://scelar.com).
