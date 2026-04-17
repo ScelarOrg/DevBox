@@ -95,6 +95,7 @@ import * as sqlitePolyfill from "./polyfills/sqlite";
 import * as quicPolyfill from "./polyfills/quic";
 import * as lightningcssPolyfill from "./polyfills/lightningcss";
 import * as tailwindOxidePolyfill from "./polyfills/tailwindcss-oxide";
+import { createNapiWorkerFactory, isNapiWasiWorkerScript } from "./helpers/napi-wasm-worker";
 import {
   promises as streamPromises,
   Readable,
@@ -951,8 +952,7 @@ const CORE_MODULES: Record<string, unknown> = {
   sea: seaPolyfill,
   sqlite: sqlitePolyfill,
   quic: quicPolyfill,
-  lightningcss: lightningcssPolyfill,
-  "@tailwindcss/oxide": tailwindOxidePolyfill,
+  // native packages (lightningcss, tailwindcss/oxide, rolldown, @node-rs/*) load via generic WASM fallback, no hardcoded polyfills
   sys: helpersPolyfill,
   "util/types": helpersPolyfill.types,
   "path/posix": pathPolyfill,
@@ -1042,6 +1042,13 @@ const CORE_MODULES: Record<string, unknown> = {
     parseAst: rollupPolyfill.parseAst,
     parseAstAsync: rollupPolyfill.parseAstAsync,
   },
+};
+
+// last-resort CDN polyfills used only when a native package fails to load and no WASM npm alt works
+// installed WASM packages always win, loaded on-demand
+const NATIVE_PACKAGE_POLYFILLS: Record<string, unknown> = {
+  // lightningcss-wasm is tried first but its 15.9MB .wasm often fails to extract, so we fall back to loading from CDN
+  lightningcss: lightningcssPolyfill,
 };
 
 // ── Console wrapper ──
@@ -1208,928 +1215,13 @@ function buildResolver(
       return id;
     }
 
-    if (id.startsWith("@rolldown/binding-")) {
-      if (!CORE_MODULES[id]) {
-        const makeParseResult = (source: string, opts?: any) => {
-          const lang = opts?.lang || "js";
-          const useJsx = lang === "jsx" || lang === "tsx";
-          const ast = rollupPolyfill.parseAst(source, { jsx: useJsx });
-          return {
-            program: JSON.stringify({ node: ast, fixes: [] }),
-            module: {
-              hasModuleSyntax: false,
-              staticImports: [],
-              staticExports: [],
-              dynamicImports: [],
-              importMetas: [],
-            },
-            comments: [],
-            errors: [],
-          };
-        };
-        const applyDefineReplacements = (
-          code: string,
-          define?: Record<string, string>,
-        ): string => {
-          if (!define || typeof define !== "object") return code;
-          for (const [key, value] of Object.entries(define)) {
-            if (!key) continue;
-            const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-            const re = new RegExp(`\\b${escaped}\\b`, "g");
-            code = code.replace(re, value);
-          }
-          return code;
-        };
-        const noop = () => {};
-        const noopAsync = async () => {};
-        CORE_MODULES[id] = {
-          // Parser
-          parseSync: (_filename: string, source: string, opts?: any) =>
-            makeParseResult(source, opts),
-          parse: async (_filename: string, source: string, opts?: any) =>
-            makeParseResult(source, opts),
-          initTraceSubscriber: noop,
-          shutdownAsyncRuntime: noop,
-          startAsyncRuntime: noop,
-          createTokioRuntime: noop,
-          registerPlugins: noop,
-          rawTransferSupported: () => false,
-          sync: noop,
-          transform: async (filename: string, code: string, opts?: any) => {
-            code = applyDefineReplacements(code, opts?.define);
-            if (
-              !isCSSFile(filename) &&
-              (isTypeScriptFile(filename) || looksLikeTypeScript(code))
-            )
-              code = stripTypeScript(code);
-            return { code, map: null, errors: [], warnings: [] };
-          },
-          transformSync: (filename: string, code: string, opts?: any) => {
-            code = applyDefineReplacements(code, opts?.define);
-            if (
-              !isCSSFile(filename) &&
-              (isTypeScriptFile(filename) || looksLikeTypeScript(code))
-            )
-              code = stripTypeScript(code);
-            return { code, map: null, errors: [], warnings: [] };
-          },
-          enhancedTransform: async (
-            filename: string,
-            code: string,
-            opts?: any,
-          ) => {
-            code = applyDefineReplacements(code, opts?.define);
-            if (
-              !isCSSFile(filename) &&
-              (isTypeScriptFile(filename) || looksLikeTypeScript(code))
-            )
-              code = stripTypeScript(code);
-            return {
-              code,
-              map: null,
-              errors: [],
-              warnings: [],
-              helpersUsed: {},
-              tsconfigFilePaths: [],
-            };
-          },
-          enhancedTransformSync: (
-            filename: string,
-            code: string,
-            opts?: any,
-          ) => {
-            code = applyDefineReplacements(code, opts?.define);
-            if (
-              !isCSSFile(filename) &&
-              (isTypeScriptFile(filename) || looksLikeTypeScript(code))
-            )
-              code = stripTypeScript(code);
-            return {
-              code,
-              map: null,
-              errors: [],
-              warnings: [],
-              helpersUsed: {},
-              tsconfigFilePaths: [],
-            };
-          },
-          minify: async (_filename: string, code: string) => ({
-            code,
-            map: null,
-            errors: [],
-            warnings: [],
-          }),
-          minifySync: (_filename: string, code: string) => ({
-            code,
-            map: null,
-            errors: [],
-            warnings: [],
-          }),
-          isolatedDeclaration: async (_filename: string, code: string) => ({
-            code,
-            map: null,
-            errors: [],
-            warnings: [],
-          }),
-          isolatedDeclarationSync: (_filename: string, code: string) => ({
-            code,
-            map: null,
-            errors: [],
-            warnings: [],
-          }),
-          moduleRunnerTransform: async (filename: string, code: string) => {
-            if (
-              !isCSSFile(filename) &&
-              (isTypeScriptFile(filename) || looksLikeTypeScript(code))
-            )
-              code = stripTypeScript(code);
-            return { code, map: null, deps: [], dynamicDeps: [], errors: [] };
-          },
-          moduleRunnerTransformSync: (filename: string, code: string) => {
-            if (
-              !isCSSFile(filename) &&
-              (isTypeScriptFile(filename) || looksLikeTypeScript(code))
-            )
-              code = stripTypeScript(code);
-            return { code, map: null, deps: [], dynamicDeps: [], errors: [] };
-          },
-          Severity: { Error: "Error", Warning: "Warning", Advice: "Advice" },
-          ParseResult: class {},
-          ResolverFactory: class {},
-          EnforceExtension: { Auto: 0, Enabled: 1, Disabled: 2 },
-          ModuleType: {},
-          HelperMode: {},
-          TraceSubscriberGuard: class {},
-          BindingBundler: class {
-            closed = false;
-            #watchFiles: string[] = [];
-            async generate(opts: any) {
-              return this.#bundle(opts);
-            }
-            async write(opts: any) {
-              const result = await this.#bundle(opts);
-              const outputOpts = opts?.outputOptions ?? {};
-              const dir = outputOpts.dir || "/dist";
-              try {
-                if (!vol.existsSync(dir)) {
-                  vol.mkdirSync(dir, { recursive: true });
-                }
-              } catch {
-                /* best effort */
-              }
-              for (const chunk of result.chunks) {
-                const outPath = pathPolyfill.join(dir, chunk.getFileName());
-                try {
-                  const outDir = pathPolyfill.dirname(outPath);
-                  if (!vol.existsSync(outDir)) {
-                    vol.mkdirSync(outDir, { recursive: true });
-                  }
-                  const code = chunk.getCode();
-                  vol.writeFileSync(outPath, code);
-                } catch {
-                  /* best effort */
-                }
-              }
-              return result;
-            }
-            // Dependency scanning for Vite's dep optimizer — invokes plugin resolveId hooks
-            // so Vite's scan plugin discovers bare imports to pre-bundle
-            async scan(opts?: any) {
-              try {
-                const inputOpts = opts?.inputOptions ?? {};
-                const plugins: any[] = (inputOpts.plugins ?? []).filter(
-                  Boolean,
-                );
-                const entries: { name?: string; import: string }[] =
-                  Array.isArray(inputOpts.input) ? inputOpts.input : [];
-                const cwd = inputOpts.cwd || "/";
-                if (!entries.length || !plugins.length) return;
-
-                const mockCtx = {
-                  resolve: async () => null,
-                  load: async () => ({}),
-                  emitFile: () => "",
-                  getFileName: () => "",
-                  getModuleInfo: () => null,
-                  getModuleIds: () => [],
-                  addWatchFile: () => {},
-                  parse: (code: string) =>
-                    acorn.parse(code, {
-                      ecmaVersion: "latest" as any,
-                      sourceType: "module",
-                    }),
-                };
-
-                const extractImports = (code: string): string[] => {
-                  const specs: string[] = [];
-                  try {
-                    const ast: any = acorn.parse(code, {
-                      ecmaVersion: "latest" as any,
-                      sourceType: "module",
-                      allowImportExportEverywhere: true,
-                    });
-                    for (const node of ast.body) {
-                      if (
-                        node.type === "ImportDeclaration" &&
-                        node.source?.value
-                      )
-                        specs.push(node.source.value);
-                      if (
-                        node.type === "ExportNamedDeclaration" &&
-                        node.source?.value
-                      )
-                        specs.push(node.source.value);
-                      if (
-                        node.type === "ExportAllDeclaration" &&
-                        node.source?.value
-                      )
-                        specs.push(node.source.value);
-                    }
-                  } catch {
-                    /* fallback to regex */
-                  }
-                  const dynRe = /\bimport\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
-                  let m;
-                  while ((m = dynRe.exec(code)) !== null) specs.push(m[1]);
-                  return [...new Set(specs)];
-                };
-
-                for (const p of plugins) {
-                  if (p.buildStart) {
-                    try {
-                      await p.buildStart(mockCtx, {});
-                    } catch (hookErr) {
-                      const msg =
-                        hookErr instanceof Error
-                          ? hookErr.message
-                          : String(hookErr);
-                      _nativeConsole.warn(
-                        "[rolldown scan] buildStart hook error:",
-                        msg,
-                      );
-                    }
-                  }
-                }
-
-                // BFS: load files, extract imports, call resolveId, follow local files
-                const visitedSpecs = new Set<string>();
-                const visitedFiles = new Set<string>();
-                const queue: string[] = [];
-
-                for (const entry of entries) {
-                  const ep = entry.import?.startsWith("/")
-                    ? entry.import
-                    : pathPolyfill.resolve(cwd, entry.import);
-                  queue.push(ep);
-                }
-
-                const loadFile = async (
-                  filePath: string,
-                  usePlugins: boolean,
-                ): Promise<string> => {
-                  if (usePlugins) {
-                    for (const p of plugins) {
-                      if (p.load) {
-                        try {
-                          const r = await p.load(mockCtx, filePath);
-                          if (r && typeof r === "object" && r.code)
-                            return r.code;
-                        } catch (loadErr) {
-                          const msg =
-                            loadErr instanceof Error
-                              ? loadErr.message
-                              : String(loadErr);
-                          _nativeConsole.warn(
-                            "[rolldown scan] load hook error:",
-                            filePath,
-                            msg,
-                          );
-                        }
-                      }
-                    }
-                  }
-                  return vol.readFileSync(filePath, "utf8");
-                };
-
-                const MAX_DEPTH = LIMITS.MAX_RESOLVE_DEPTH;
-                let processed = 0;
-                const entryPaths = new Set(queue);
-                while (queue.length > 0 && processed < MAX_DEPTH) {
-                  const filePath = queue.shift()!;
-                  if (visitedFiles.has(filePath)) continue;
-                  visitedFiles.add(filePath);
-                  processed++;
-
-                  let code: string;
-                  try {
-                    code = await loadFile(filePath, entryPaths.has(filePath));
-                  } catch {
-                    continue;
-                  }
-
-                  const specifiers = extractImports(code);
-
-                  for (const spec of specifiers) {
-                    const key = `${spec}\0${filePath}`;
-                    if (visitedSpecs.has(key)) continue;
-                    visitedSpecs.add(key);
-
-                    for (const p of plugins) {
-                      if (p.resolveId) {
-                        try {
-                          await p.resolveId(mockCtx, spec, filePath, {
-                            isEntry: false,
-                            kind: "import-statement",
-                            custom: undefined,
-                          });
-                        } catch (resolveErr) {
-                          const msg =
-                            resolveErr instanceof Error
-                              ? resolveErr.message
-                              : String(resolveErr);
-                          _nativeConsole.warn(
-                            "[rolldown scan] resolveId hook error:",
-                            spec,
-                            msg,
-                          );
-                        }
-                      }
-                    }
-
-                    // Follow local files to discover deeper imports
-                    if (spec.startsWith(".") || spec.startsWith("/")) {
-                      const dir = pathPolyfill.dirname(filePath);
-                      let resolved = "";
-                      try {
-                        resolved = resolveId(spec, dir, true);
-                      } catch {
-                        /* not found */
-                      }
-                      // Vite treats absolute paths as project-root-relative
-                      if (!resolved && spec.startsWith("/")) {
-                        try {
-                          const cwdSpec = pathPolyfill.join(cwd, spec);
-                          resolved = resolveId(cwdSpec, cwd, true);
-                        } catch {
-                          /* not found */
-                        }
-                      }
-                      if (
-                        resolved &&
-                        !resolved.includes("/node_modules/") &&
-                        !visitedFiles.has(resolved)
-                      ) {
-                        queue.push(resolved);
-                      }
-                    }
-                  }
-                }
-
-                for (const p of plugins) {
-                  if (p.buildEnd) {
-                    try {
-                      await p.buildEnd(mockCtx);
-                    } catch (endErr) {
-                      const msg =
-                        endErr instanceof Error
-                          ? endErr.message
-                          : String(endErr);
-                      _nativeConsole.warn(
-                        "[rolldown scan] buildEnd hook error:",
-                        msg,
-                      );
-                    }
-                  }
-                }
-              } catch (scanErr) {
-                const msg =
-                  scanErr instanceof Error ? scanErr.message : String(scanErr);
-                const detail =
-                  scanErr instanceof Error && scanErr.stack
-                    ? `\n${scanErr.stack}`
-                    : "";
-                _nativeConsole.warn("[rolldown scan]", msg);
-              }
-            }
-            async close() {
-              this.closed = true;
-            }
-            getWatchFiles() {
-              return this.#watchFiles;
-            }
-            async #bundle(opts: any) {
-              const inputOpts = opts?.inputOptions ?? {};
-              const entries: { name: string; import: string }[] = Array.isArray(
-                inputOpts.input,
-              )
-                ? inputOpts.input
-                : [];
-              const cwd = inputOpts.cwd || "/";
-              const outputOpts = opts?.outputOptions ?? {};
-              const format = outputOpts.format ?? "esm";
-              const entryFileNames = outputOpts.entryFileNames || "[name].js";
-
-              const extractExports = (src: string): string[] => {
-                try {
-                  const ast = acorn.parse(src, {
-                    ecmaVersion: "latest",
-                    sourceType: "module",
-                    allowImportExportEverywhere: true,
-                  }) as any;
-                  const names: string[] = [];
-                  for (const node of ast.body) {
-                    if (
-                      node.type === "ExportNamedDeclaration" &&
-                      node.specifiers
-                    ) {
-                      for (const s of node.specifiers) {
-                        if (s.exported?.name) names.push(s.exported.name);
-                      }
-                      if (node.declaration) {
-                        if (node.declaration.id?.name) {
-                          names.push(node.declaration.id.name);
-                        } else if (node.declaration.declarations) {
-                          for (const d of node.declaration.declarations) {
-                            if (d.id?.name) names.push(d.id.name);
-                          }
-                        }
-                      }
-                    } else if (node.type === "ExportDefaultDeclaration") {
-                      names.push("default");
-                    } else if (node.type === "ExportAllDeclaration") {
-                      // Can't statically enumerate re-exports
-                    }
-                  }
-                  return names;
-                } catch {
-                  return [];
-                }
-              };
-
-              // Re-resolve using browser ESM conditions when esbuild produces empty output
-              // (happens with thin ESM re-exports pointing at CJS like vue/index.mjs)
-              const reResolveEntry = (origPath: string): string | null => {
-                // Only applicable inside node_modules
-                const nmIdx = origPath.lastIndexOf("/node_modules/");
-                if (nmIdx === -1) return null;
-                const afterNm = origPath.slice(nmIdx + "/node_modules/".length);
-                const parts = afterNm.split("/");
-                const scoped = parts[0].startsWith("@");
-                const pkgName = scoped ? parts.slice(0, 2).join("/") : parts[0];
-                const pkgRoot =
-                  origPath.slice(0, nmIdx) + "/node_modules/" + pkgName;
-                const pkgJsonPath = pkgRoot + "/package.json";
-                try {
-                  if (!vol.existsSync(pkgJsonPath)) return null;
-                  const manifest = JSON.parse(
-                    vol.readFileSync(pkgJsonPath, "utf8"),
-                  );
-                  for (const conds of [
-                    { browser: true, import: true },
-                    { import: true },
-                  ] as const) {
-                    try {
-                      const resolved = resolveExports(manifest, ".", conds);
-                      if (resolved?.length) {
-                        const full = pathPolyfill.join(pkgRoot, resolved[0]);
-                        if (vol.existsSync(full) && full !== origPath)
-                          return full;
-                      }
-                    } catch {
-                      /* try next */
-                    }
-                  }
-                } catch {
-                  /* can't re-resolve */
-                }
-                return null;
-              };
-
-              const esbuildMod = CORE_MODULES["esbuild"] as any;
-              const chunks: any[] = [];
-              for (const entry of entries) {
-                let entryPath = entry.import.startsWith("/")
-                  ? entry.import
-                  : pathPolyfill.resolve(cwd, entry.import);
-                let code: string;
-                const esbuildPlatform =
-                  inputOpts.platform === "browser" ? "browser" : "node";
-                const esbuildFormat = format === "cjs" ? "cjs" : "esm";
-
-                const doBuild = async (ep: string) => {
-                  const result = await esbuildMod.build({
-                    entryPoints: [ep],
-                    bundle: true,
-                    write: false,
-                    format: esbuildFormat,
-                    platform: esbuildPlatform,
-                    sourcemap: outputOpts.sourcemap ? "inline" : false,
-                    target: "esnext",
-                    logLevel: "warning",
-                  });
-                  return (
-                    result.outputFiles?.[0]?.text ??
-                    vol.readFileSync(ep, "utf8")
-                  );
-                };
-
-                try {
-                  code = await doBuild(entryPath);
-
-                  // Empty output = thin ESM re-export of CJS; try browser-ESM re-resolve
-                  if (
-                    esbuildFormat === "esm" &&
-                    esbuildPlatform === "browser" &&
-                    code.length < 300 &&
-                    extractExports(code).length === 0
-                  ) {
-                    const alt = reResolveEntry(entryPath);
-                    if (alt) {
-                      const altCode = await doBuild(alt);
-                      if (altCode.length > code.length) {
-                        code = altCode;
-                        entryPath = alt;
-                      }
-                    }
-                  }
-                } catch (buildErr) {
-                  const buildMsg =
-                    buildErr instanceof Error
-                      ? buildErr.message
-                      : String(buildErr);
-                  _nativeConsole.warn(
-                    "[rolldown bundle] esbuild failed for",
-                    entryPath,
-                    buildMsg,
-                  );
-                  try {
-                    code = vol.readFileSync(entryPath, "utf8");
-                  } catch {
-                    code = "";
-                  }
-                }
-                const name =
-                  entry.name ||
-                  pathPolyfill.basename(
-                    entryPath,
-                    pathPolyfill.extname(entryPath),
-                  );
-                const fileName =
-                  typeof entryFileNames === "string"
-                    ? entryFileNames.replace("[name]", name)
-                    : name + ".js";
-                const exports = extractExports(code);
-                this.#watchFiles.push(entryPath);
-                chunks.push({
-                  dropInner: () => ({ freed: true }),
-                  getFileName: () => fileName,
-                  getName: () => name,
-                  getCode: () => code,
-                  getExports: () => exports,
-                  getIsEntry: () => true,
-                  getIsDynamicEntry: () => false,
-                  getFacadeModuleId: () => entryPath,
-                  getSourcemapFileName: () => null,
-                  getPreliminaryFileName: () => fileName,
-                  getModules: () => ({ values: [], keys: [] }),
-                  getImports: () => [],
-                  getDynamicImports: () => [],
-                  getModuleIds: () => [entryPath],
-                  getMap: () => null,
-                });
-              }
-              return { chunks, assets: [] };
-            }
-          },
-          // Constructor (not class) so methods are own-enumerable — Vite iterates with for...in
-          BindingCallableBuiltinPlugin: function (this: any, _opts: any) {
-            this.resolveId = async function (
-              specifier: string,
-              importer?: string | null,
-            ) {
-              if (!specifier || typeof specifier !== "string") return null;
-              if (specifier.startsWith("\0")) return null;
-              if (
-                specifier.includes(":") &&
-                !specifier.startsWith("/") &&
-                !specifier.startsWith(".")
-              )
-                return null;
-
-              // Preserve query/hash (Vue SFC virtual modules need them)
-              let cleanSpec = specifier;
-              let querySuffix = "";
-              const qIdx = cleanSpec.indexOf("?");
-              if (qIdx !== -1) {
-                querySuffix = cleanSpec.slice(qIdx);
-                cleanSpec = cleanSpec.slice(0, qIdx);
-              }
-              const hIdx = cleanSpec.indexOf("#");
-              if (hIdx !== -1) {
-                querySuffix = cleanSpec.slice(hIdx) + querySuffix;
-                cleanSpec = cleanSpec.slice(0, hIdx);
-              }
-
-              // Strip Vite dev server prefixes like /@fs/ and /@id/
-              let stripped = cleanSpec;
-              if (
-                stripped.startsWith("/@") &&
-                stripped.length > 2 &&
-                stripped[2] !== "/"
-              ) {
-                const secondSlash = stripped.indexOf("/", 2);
-                if (secondSlash !== -1) {
-                  stripped = stripped.slice(secondSlash);
-                }
-              }
-
-              const fromDir = importer
-                ? pathPolyfill.dirname(
-                    importer.startsWith("/@")
-                      ? importer.slice(importer.indexOf("/", 2))
-                      : importer,
-                  )
-                : (typeof globalThis !== "undefined" &&
-                    (globalThis as any).process?.cwd?.()) ||
-                  "/";
-
-              for (const candidate of stripped !== cleanSpec
-                ? [stripped, cleanSpec]
-                : [cleanSpec]) {
-                try {
-                  const resolved = resolveId(candidate, fromDir, true);
-                  if (resolved) {
-                    return { id: resolved + querySuffix };
-                  }
-                } catch (_e) {
-                  /* not found */
-                }
-
-                if (candidate.startsWith("/")) {
-                  if (vol.existsSync(candidate))
-                    return { id: candidate + querySuffix };
-                  const cwd =
-                    (typeof globalThis !== "undefined" &&
-                      (globalThis as any).process?.cwd?.()) ||
-                    "/";
-                  if (cwd !== "/") {
-                    const abs = cwd + candidate;
-                    if (vol.existsSync(abs)) return { id: abs + querySuffix };
-                    for (const ext of RESOLVE_EXTENSIONS) {
-                      if (vol.existsSync(abs + ext))
-                        return { id: abs + ext + querySuffix };
-                    }
-                  }
-                }
-              }
-              return null;
-            };
-            this.load = async function () {
-              return null;
-            };
-            this.transform = async function () {
-              return null;
-            };
-            this.watchChange = async function () {};
-            this.buildStart = function () {};
-            this.buildEnd = function () {};
-            this.renderChunk = function () {
-              return null;
-            };
-            this.generateBundle = function () {};
-            this.moduleParsed = function () {};
-          },
-          resolveTsconfig: () => ({
-            tsconfig: {
-              compilerOptions: {},
-            },
-            tsconfigFilePaths: [],
-          }),
-          collapseSourcemaps: () => null,
-          freeExternalMemory: noop,
-          scan: noopAsync,
-          BindingWatcher: class {
-            constructor(_options?: any, _notifyOption?: any) {}
-            async close() {}
-            async start(_listener: any) {}
-          },
-          BindingWatcherBundler: class {
-            async close() {}
-          },
-          BindingDevEngine: class {
-            constructor(_options?: any, _devOptions?: any) {}
-            async run() {}
-            async ensureCurrentBuildFinish() {}
-            async getBundleState() {
-              return { lastFullBuildFailed: false, hasStaleOutput: false };
-            }
-            async ensureLatestBuildOutput() {}
-            async invalidate() {
-              return [];
-            }
-            async registerModules() {}
-            async removeClient() {}
-            async close() {}
-            async compileEntry() {
-              return "";
-            }
-          },
-          BindingPluginContext: class {},
-          BindingTransformPluginContext: class {},
-          BindingLoadPluginContext: class {},
-          BindingChunkingContext: class {},
-          BindingOutputChunk: class {},
-          BindingOutputAsset: class {},
-          BindingRenderedChunk: class {},
-          BindingRenderedChunkMeta: class {},
-          BindingRenderedModule: class {},
-          BindingModuleInfo: class {},
-          BindingNormalizedOptions: class {},
-          BindingSourceMap: class {},
-          BindingDecodedMap: class {},
-          BindingBundleEndEventData: class {},
-          BindingBundleErrorEventData: class {},
-          BindingWatcherChangeData: class {},
-          BindingWatcherEvent: class {},
-          TsconfigCache: class {},
-          ParallelJsPluginRegistry: class {},
-          ScheduledBuild: class {},
-          ExportExportNameKind: {},
-          ExportImportNameKind: {},
-          ExportLocalNameKind: {},
-          ImportNameKind: {},
-          FilterTokenKind: {},
-          BindingChunkModuleOrderBy: { ModuleId: 0, ExecOrder: 1 },
-          BindingPluginOrder: { Pre: 0, Post: 1 },
-          BindingAttachDebugInfo: { None: 0, Simple: 1, Full: 2 },
-          BindingLogLevel: { Silent: 0, Debug: 1, Warn: 2, Info: 3 },
-          BindingPropertyReadSideEffects: { Always: 0, False: 1 },
-          BindingPropertyWriteSideEffects: { Always: 0, False: 1 },
-          BindingBuiltinPluginName: {},
-          BindingRebuildStrategy: { Always: 0, Auto: 1, Never: 2 },
-          BindingMagicString: class {
-            _str: string;
-            _original: string;
-            _changed: boolean;
-            _filename: string | null;
-            constructor(source?: string, opts?: any) {
-              this._str = source ?? "";
-              this._original = this._str;
-              this._changed = false;
-              this._filename = opts?.filename ?? null;
-            }
-            get filename() {
-              return this._filename;
-            }
-            replace(from: string, to: string) {
-              this._str = this._str.replace(from, to);
-              if (this._str !== this._original) this._changed = true;
-              return this;
-            }
-            replaceAll(from: string, to: string) {
-              this._str = this._str.split(from).join(to);
-              if (this._str !== this._original) this._changed = true;
-              return this;
-            }
-            prepend(content: string) {
-              this._str = content + this._str;
-              this._changed = true;
-              return this;
-            }
-            append(content: string) {
-              this._str += content;
-              this._changed = true;
-              return this;
-            }
-            prependLeft(idx: number, content: string) {
-              this._str =
-                this._str.slice(0, idx) + content + this._str.slice(idx);
-              this._changed = true;
-              return this;
-            }
-            prependRight(idx: number, content: string) {
-              this._str =
-                this._str.slice(0, idx) + content + this._str.slice(idx);
-              this._changed = true;
-              return this;
-            }
-            appendLeft(idx: number, content: string) {
-              this._str =
-                this._str.slice(0, idx) + content + this._str.slice(idx);
-              this._changed = true;
-              return this;
-            }
-            appendRight(idx: number, content: string) {
-              this._str =
-                this._str.slice(0, idx) + content + this._str.slice(idx);
-              this._changed = true;
-              return this;
-            }
-            overwrite(start: number, end: number, content: string) {
-              this._str =
-                this._str.slice(0, start) + content + this._str.slice(end);
-              this._changed = true;
-              return this;
-            }
-            update(start: number, end: number, content: string) {
-              return this.overwrite(start, end, content);
-            }
-            remove(start: number, end: number) {
-              return this.overwrite(start, end, "");
-            }
-            toString() {
-              return this._str;
-            }
-            hasChanged() {
-              return this._changed;
-            }
-            length() {
-              return this._str.length;
-            }
-            isEmpty() {
-              return this._str.length === 0;
-            }
-            insert(_index: number, _content: string): never {
-              throw new Error(
-                "magicString.insert(...) is deprecated. Use prependRight(...) or appendLeft(...) instead",
-              );
-            }
-            indent(indentor?: string) {
-              const ind = indentor ?? "\t";
-              this._str = this._str.replace(/^/gm, ind);
-              this._changed = true;
-              return this;
-            }
-            trim(_charType?: string) {
-              this._str = this._str.trim();
-              if (this._str !== this._original) this._changed = true;
-              return this;
-            }
-            trimStart(_charType?: string) {
-              this._str = this._str.trimStart();
-              if (this._str !== this._original) this._changed = true;
-              return this;
-            }
-            trimEnd(_charType?: string) {
-              this._str = this._str.trimEnd();
-              if (this._str !== this._original) this._changed = true;
-              return this;
-            }
-            trimLines() {
-              this._str = this._str.replace(/^\n+/, "").replace(/\n+$/, "");
-              if (this._str !== this._original) this._changed = true;
-              return this;
-            }
-            clone() {
-              const c = new (this.constructor as any)(this._str);
-              c._original = this._original;
-              c._changed = this._changed;
-              return c;
-            }
-            lastChar() {
-              return this._str[this._str.length - 1] || "";
-            }
-            lastLine() {
-              const idx = this._str.lastIndexOf("\n");
-              return idx === -1 ? this._str : this._str.slice(idx + 1);
-            }
-            snip(start: number, end: number) {
-              return new (this.constructor as any)(this._str.slice(start, end));
-            }
-            reset(start: number, end: number) {
-              const s = start < 0 ? this._original.length + start : start;
-              const e = end < 0 ? this._original.length + end : end;
-              const original = this._original.slice(s, e);
-              this._str = this._str.slice(0, s) + original + this._str.slice(e);
-              return this;
-            }
-            slice(start?: number, end?: number) {
-              return this._str.slice(start, end);
-            }
-            relocate(start: number, end: number, to: number) {
-              const chunk = this._str.slice(start, end);
-              const without = this._str.slice(0, start) + this._str.slice(end);
-              const adjustedTo = to > end ? to - (end - start) : to;
-              this._str =
-                without.slice(0, adjustedTo) +
-                chunk +
-                without.slice(adjustedTo);
-              this._changed = true;
-              return this;
-            }
-            move(start: number, end: number, index: number) {
-              return this.relocate(start, end, index);
-            }
-            generateMap(_opts?: any) {
-              return { version: 3, sources: [], mappings: "", names: [] };
-            }
-            generateDecodedMap(_opts?: any) {
-              return { version: 3, sources: [], mappings: [], names: [] };
-            }
-          },
-        };
-      }
-      return id;
+    if (id.startsWith("@rolldown/binding-") && !id.includes("wasm32-wasi")) {
+      // platform-specific native binding (e.g. @rolldown/binding-linux-x64-gnu) — redirect to the wasm32-wasi variant via the generic napi-rs fallback below
+      const e = new Error(
+        `Cannot load native addon '${id}' — install @rolldown/binding-wasm32-wasi`,
+      ) as Error & { code: string };
+      e.code = "MODULE_NOT_FOUND";
+      throw e;
     }
 
     if (id.startsWith("#")) {
@@ -2284,7 +1376,16 @@ function buildResolver(
           const condExtra =
             extraConditions.length > 0 ? { conditions: extraConditions } : {};
 
-          const baseSets: Record<string, unknown>[] = preferEsm
+          // for WASM packages prefer Node.js conditions — browser entry needs native Worker(url) or async init, Node.js entry uses polyfilled worker_threads and sync init
+          const isWasmPkg = pkgName.includes("wasm32-wasi") || pkgName.endsWith("-wasm") || (Array.isArray((manifest as any).cpu) && (manifest as any).cpu.includes("wasm32"));
+          const baseSets: Record<string, unknown>[] = isWasmPkg
+            ? [
+                { node: true, require: true, ...condExtra },
+                { require: true, ...condExtra },
+                { node: true, import: true, ...condExtra },
+                { import: true, ...condExtra },
+              ]
+            : preferEsm
             ? [
                 { node: true, import: true, ...condExtra },
                 { browser: true, import: true, ...condExtra },
@@ -2329,10 +1430,18 @@ function buildResolver(
 
         if (!exportsResolved && pkgName === moduleId) {
           let entry: string | undefined;
-          if (typeof manifest.browser === "string") entry = manifest.browser;
+          // for WASM packages prefer Node.js "main" over "browser" — same reason as above (browser entry needs native Worker(url) or async init)
+          const isWasmPkg = pkgName.includes("wasm32-wasi") || pkgName.endsWith("-wasm") || (Array.isArray((manifest as any).cpu) && (manifest as any).cpu.includes("wasm32"));
+          if (!isWasmPkg && typeof manifest.browser === "string") entry = manifest.browser;
           if (!entry && manifest.module) entry = manifest.module as string;
           if (!entry) entry = manifest.main || "index.js";
-          const found = tryFile(pathPolyfill.join(pkgRoot, entry));
+          let found = tryFile(pathPolyfill.join(pkgRoot, entry));
+          // apply browser field object remapping (e.g. lightningcss maps "./node/index.js" to "./browser.js")
+          if (found && !isWasmPkg) {
+            const remapped = applyBrowserRemap(found, manifest, pkgRoot);
+            if (remapped === null) found = null; // browser: { "./file": false } means "ignore"
+            else if (remapped !== found) found = remapped;
+          }
           if (found) return found;
         }
       }
@@ -2454,6 +1563,13 @@ function buildResolver(
       ) as Error & { code: string };
       e.code = "ERR_DLOPEN_FAILED";
       throw e;
+    }
+
+    // raw .wasm bytes — napi-rs loaders read these via fs.readFileSync and feed them to WebAssembly.instantiate
+    if (resolved.endsWith(".wasm")) {
+      record.exports = vol.readFileSync(resolved);
+      record.loaded = true;
+      return record;
     }
 
     const rawSource = vol.readFileSync(resolved, "utf8");
@@ -2784,6 +1900,19 @@ function buildResolver(
       (PerEngineModule as any).default = PerEngineModule;
       return PerEngineModule;
     }
+    // inject VFS-backed fs into WASI so any napi-rs .wasi.cjs loader gets filesystem access
+    if (id === "wasi") {
+      const origWASI = wasiPolyfill.WASI;
+      return {
+        ...wasiPolyfill,
+        WASI: function WASIWithFs(this: any, options?: any) {
+          const opts = { ...options };
+          if (!opts.fs) opts.fs = fsBridge;
+          return new (origWASI as any)(opts);
+        },
+      };
+    }
+
     if (CORE_MODULES[id]) return CORE_MODULES[id];
 
     let resolved: string;
@@ -2853,9 +1982,21 @@ function buildResolver(
             const altResolved = resolveId(alt, baseDir);
             const altRec = loadModule(altResolved, resolver._ownerRecord);
             return altRec.exports;
-          } catch {
-            // not available
+          } catch (altErr: any) {
+            // surface WASM alt errors so they don't silently vanish
+            if (altErr?.code !== "MODULE_NOT_FOUND") {
+              _nativeConsole.warn(`[wasm-fallback] ${alt}:`, altErr?.message?.slice(0, 200));
+            }
           }
+        }
+        // last resort — built-in CDN polyfill (e.g. lightningcss)
+        // if it has async init(), block via syncAwait so sync APIs work immediately after
+        const polyfillFallback = NATIVE_PACKAGE_POLYFILLS[id] as any;
+        if (polyfillFallback) {
+          if (typeof polyfillFallback.init === "function") {
+            try { syncAwait(polyfillFallback.init()); } catch { /* best effort */ }
+          }
+          return polyfillFallback;
         }
       }
       throw loadErr;
@@ -2964,6 +2105,25 @@ export class ScriptEngine {
 
     (globalThis as any).__nodepodVolume = vol;
 
+    // generic napi-rs WASI worker hook — overrides Worker constructor to detect wasi-worker.mjs scripts and spawn them as real Web Workers with bundled deps, everything else falls back to the fork-based worker
+    // works for any napi-rs WASM package
+    {
+      const resolverForWorker = (id: string, fromDir: string): string => {
+        const r = buildResolver(vol, this.fsBridge, this.proc, fromDir, this.moduleRegistry, this.opts, this.transformCache);
+        return r.resolve(id);
+      };
+      const workerFactory = createNapiWorkerFactory(
+        vol,
+        resolverForWorker,
+        this.proc.env as Record<string, string>,
+        this.fsBridge,
+        (threadPoolPolyfill as any)._workerThreadForkFn ?? null,
+      );
+      threadPoolPolyfill.setWorkerConstructorOverride((self, script, opts) => {
+        workerFactory.call(self, script, opts);
+      });
+    }
+
     // Intercept fetch() for file:// URLs — serve from VFS instead of network.
     // napi-rs wasm32-wasi packages use fetch(new URL('file.wasm', import.meta.url))
     // which browsers block. This patches fetch to read from the in-memory filesystem.
@@ -3012,6 +2172,31 @@ export class ScriptEngine {
                 ),
               );
             } catch {
+              // .wasm files under node_modules that aren't in the VFS (big binaries that failed extraction) — fetch from CDN
+              if (vfsPath.endsWith(".wasm") && vfsPath.includes("/node_modules/")) {
+                const nmIdx = vfsPath.lastIndexOf("/node_modules/");
+                const afterNm = vfsPath.substring(nmIdx + "/node_modules/".length);
+                // afterNm looks like "lightningcss-wasm/lightningcss_node.wasm" or "@scope/pkg/file.wasm"
+                const parts = afterNm.split("/");
+                let pkgName: string;
+                let filePath: string;
+                if (parts[0].startsWith("@")) {
+                  pkgName = parts[0] + "/" + parts[1];
+                  filePath = parts.slice(2).join("/");
+                } else {
+                  pkgName = parts[0];
+                  filePath = parts.slice(1).join("/");
+                }
+                // grab version from package.json if present
+                let version = "latest";
+                try {
+                  const pkgJsonPath = vfsPath.substring(0, nmIdx + "/node_modules/".length) + pkgName + "/package.json";
+                  const pkgJson = JSON.parse(v.readFileSync(pkgJsonPath, "utf8"));
+                  if (pkgJson.version) version = pkgJson.version;
+                } catch { /* use latest */ }
+                const cdnUrl = `https://cdn.jsdelivr.net/npm/${pkgName}@${version}/${filePath}`;
+                return origFetch(cdnUrl);
+              }
               return Promise.resolve(
                 new Response("Not found", { status: 404 }),
               );
@@ -3023,6 +2208,34 @@ export class ScriptEngine {
       (globalThis as any).fetch = Object.assign(patchedFetch, {
         __nodepodPatched: true,
       });
+    }
+
+    // bundlers (rolldown, rollup, Vite) prefix virtual module paths with null bytes (\0module, %00module), but Chrome's URL constructor rejects those — sanitize while keeping the virtual semantics
+    if (!(globalThis.URL as any).__nodepodPatched) {
+      const OrigURL = globalThis.URL;
+      const PatchedURL = function URL(this: any, url: string, base?: string) {
+        try {
+          if (base !== undefined) return new OrigURL(url, base);
+          return new OrigURL(url);
+        } catch (e: any) {
+          if (typeof url === "string" && (url.includes("%00") || url.includes("\0"))) {
+            const sanitized = url
+              .replace(/%00/g, "__v_nul__")
+              .replace(/\0/g, "__v_nul__")
+              // file:// absolute paths need three slashes
+              .replace(/^file:\/\/([^/])/, "file:///$1");
+            if (base !== undefined) return new OrigURL(sanitized, base);
+            return new OrigURL(sanitized);
+          }
+          throw e;
+        }
+      } as any;
+      PatchedURL.prototype = OrigURL.prototype;
+      PatchedURL.createObjectURL = OrigURL.createObjectURL?.bind(OrigURL);
+      PatchedURL.revokeObjectURL = OrigURL.revokeObjectURL?.bind(OrigURL);
+      PatchedURL.canParse = (OrigURL as any).canParse?.bind(OrigURL);
+      (PatchedURL as any).__nodepodPatched = true;
+      (globalThis as any).URL = PatchedURL;
     }
 
     if (typeof globalThis.setImmediate === "undefined") {
@@ -3176,13 +2389,42 @@ export class ScriptEngine {
         }
       }
 
+      // make a BufferSource safe for native TextDecoder — it throws on SharedArrayBuffer-backed views, which threaded WASM modules (wasm32-wasip1-threads, emnapi, rayon, tokio) emit all the time
+      // copies into a regular ArrayBuffer when needed, transparent to callers
+      private static normalizeInput(input: BufferSource): BufferSource {
+        if (typeof SharedArrayBuffer === "undefined") return input;
+        if (input instanceof ArrayBuffer) return input;
+        if (input instanceof SharedArrayBuffer) {
+          const copy = new Uint8Array(input.byteLength);
+          copy.set(new Uint8Array(input));
+          return copy;
+        }
+        const view = input as ArrayBufferView;
+        if (view.buffer instanceof SharedArrayBuffer) {
+          const src = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+          const copy = new Uint8Array(view.byteLength);
+          copy.set(src);
+          return copy;
+        }
+        return input;
+      }
+
       decode(input?: BufferSource, options?: TextDecodeOptions): string {
-        if (this.inner) return this.inner.decode(input, options);
-        if (!input) return "";
+        if (!input) {
+          if (this.inner) return this.inner.decode(undefined, options);
+          return "";
+        }
+        const safe = ExtendedDecoder.normalizeInput(input);
+        if (this.inner) return this.inner.decode(safe, options);
+        const safeView = safe as ArrayBufferView | ArrayBuffer;
         const bytes =
-          input instanceof ArrayBuffer
-            ? new Uint8Array(input)
-            : new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
+          safeView instanceof ArrayBuffer
+            ? new Uint8Array(safeView)
+            : new Uint8Array(
+                (safeView as ArrayBufferView).buffer,
+                (safeView as ArrayBufferView).byteOffset,
+                (safeView as ArrayBufferView).byteLength,
+              );
 
         if (this.enc === "base64") return bytesToBase64(bytes);
         if (this.enc === "base64url")
@@ -3191,7 +2433,7 @@ export class ScriptEngine {
             .replace(/\//g, "_")
             .replace(/=/g, "");
         if (this.enc === "hex") return bytesToHex(bytes);
-        return new Original("utf-8").decode(input, options);
+        return new Original("utf-8").decode(safe, options);
       }
 
       get fatal(): boolean {

@@ -145,6 +145,10 @@ export function fileURLToPath(input: string | URL): string {
 }
 
 export function pathToFileURL(fsPath: string): URL {
+  // already a file:// URL, don't double-prefix
+  if (fsPath.startsWith("file://")) {
+    return new globalThis.URL(fsPath);
+  }
   const encoded = encodeURIComponent(fsPath).replace(/%2F/g, "/");
   return new globalThis.URL("file://" + encoded);
 }

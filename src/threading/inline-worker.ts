@@ -1,8 +1,6 @@
-// Inline Worker Factory — creates offload workers from embedded source.
-// Worker source is inlined as a string and spawned via Blob URL, so it works
-// in any environment (no separate file to serve). Implements Comlink's wire
-// protocol directly so the message listener is synchronous on boot — no race
-// with the first init() call. Heavy deps (esbuild, pako) load from CDN lazily.
+// creates offload workers from an embedded source string via Blob URL so no separate file needs serving
+// speaks Comlink's wire protocol directly so the message listener is synchronous on boot — avoids races with the first init() call
+// heavy deps (esbuild, pako) load from CDN lazily
 
 import { CDN_ESBUILD_ESM, CDN_ESBUILD_BINARY } from "../constants/cdn-urls";
 import { CDN_PAKO } from "../constants/config";
@@ -10,8 +8,7 @@ import { CDN_PAKO } from "../constants/config";
 const WORKER_SOURCE = /* js */ `
 "use strict";
 
-// CDN URLs (injected at build time)
-
+// CDN URLs injected at build time
 const ESBUILD_ESM_URL = "${CDN_ESBUILD_ESM}";
 const ESBUILD_WASM_URL = "${CDN_ESBUILD_BINARY}";
 const PAKO_URL = "${CDN_PAKO}";
@@ -22,9 +19,7 @@ let esbuildEngine = null;
 let pakoModule = null;
 let _initialized = false;
 
-// Minimal Comlink-compatible expose() — implements the wire protocol
-// that comlink.wrap() speaks on the main thread.
-
+// minimal Comlink-compatible expose() — implements the wire protocol that comlink.wrap() speaks on the main thread
 function miniExpose(obj) {
   self.addEventListener("message", function handler(ev) {
     if (!ev || !ev.data || !ev.data.id) return;
@@ -94,8 +89,6 @@ function miniExpose(obj) {
   });
 }
 
-// --- Base64 helper ---
-
 const SEGMENT_SIZE = 8192;
 
 function uint8ToBase64(data) {
@@ -111,13 +104,14 @@ function uint8ToBase64(data) {
   return btoa(segments.join(""));
 }
 
-// --- Tar parser ---
-
 function readNullTerminated(buf, start, len) {
-  const slice = buf.slice(start, start + len);
-  const zeroPos = slice.indexOf(0);
-  const trimmed = zeroPos >= 0 ? slice.slice(0, zeroPos) : slice;
-  return new TextDecoder().decode(trimmed);
+  // TextDecoder rejects SharedArrayBuffer-backed views, copy first
+  const section = buf.subarray(start, start + len);
+  const zeroPos = section.indexOf(0);
+  const effLen = zeroPos >= 0 ? zeroPos : section.byteLength;
+  const copy = new Uint8Array(effLen);
+  copy.set(section.subarray(0, effLen));
+  return new TextDecoder().decode(copy);
 }
 
 function readOctalField(buf, start, len) {
@@ -157,8 +151,6 @@ function* parseTar(raw) {
   }
 }
 
-// --- JSX detection ---
-
 function detectJsx(source) {
   if (/<[A-Z][a-zA-Z0-9.]*[\\s/>]/.test(source)) return true;
   if (/<\\/[a-zA-Z]/.test(source)) return true;
@@ -169,16 +161,12 @@ function detectJsx(source) {
   return false;
 }
 
-// --- Default define map ---
-
 const DEFAULT_DEFINE = {
   "import.meta.url": "import_meta.url",
   "import.meta.dirname": "import_meta.dirname",
   "import.meta.filename": "import_meta.filename",
   "import.meta": "import_meta",
 };
-
-// --- Worker endpoint ---
 
 const endpoint = {
   async init() {
@@ -269,7 +257,12 @@ const endpoint = {
         let data;
         let isBinary = false;
         try {
-          data = new TextDecoder("utf-8", { fatal: true }).decode(entry.payload);
+          // TextDecoder rejects SAB-backed views
+          const payload = entry.payload;
+          const decodable = (typeof SharedArrayBuffer !== "undefined" && payload.buffer instanceof SharedArrayBuffer)
+            ? (function () { const c = new Uint8Array(payload.byteLength); c.set(payload); return c; })()
+            : payload;
+          data = new TextDecoder("utf-8", { fatal: true }).decode(decodable);
         } catch (e) {
           data = uint8ToBase64(entry.payload);
           isBinary = true;
@@ -322,7 +315,15 @@ const endpoint = {
         type: "build",
         id: task.id,
         outputFiles: (result.outputFiles || []).map(function(f) {
-          return { path: f.path, text: f.text || new TextDecoder().decode(f.contents) };
+          let text = f.text;
+          if (!text && f.contents) {
+            const c = f.contents;
+            const decodable = (typeof SharedArrayBuffer !== "undefined" && c.buffer instanceof SharedArrayBuffer)
+              ? (function () { const copy = new Uint8Array(c.byteLength); copy.set(c); return copy; })()
+              : c;
+            text = new TextDecoder().decode(decodable);
+          }
+          return { path: f.path, text: text };
         }),
         errors: (result.errors || []).map(function(e) { return e.text || String(e); }),
         warnings: (result.warnings || []).map(function(w) { return w.text || String(w); }),
@@ -346,11 +347,9 @@ const endpoint = {
 miniExpose(endpoint);
 `;
 
-// --- Factory ---
-
 let cachedBlobUrl: string | null = null;
 
-// Creates a Worker from the inline source. Blob URL is cached and reused.
+// blob URL is cached and reused across workers
 export function createInlineWorker(): Worker | null {
   try {
     if (!cachedBlobUrl) {
@@ -363,7 +362,7 @@ export function createInlineWorker(): Worker | null {
   }
 }
 
-// Clean up the cached blob URL when the pool is permanently disposed.
+// call when the pool is permanently disposed
 export function revokeInlineWorkerUrl(): void {
   if (cachedBlobUrl) {
     URL.revokeObjectURL(cachedBlobUrl);

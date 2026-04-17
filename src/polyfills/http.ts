@@ -588,6 +588,11 @@ Server.prototype.dispatchUpgrade = function dispatchUpgrade(
 
   const self = this;
   queueMicrotask(() => {
+    const listeners = self.listenerCount("upgrade");
+    if (listeners === 0) {
+      // no 'upgrade' handler means WS handshake never writes, silently breaks HMR, surface it instead of hanging
+      console.warn(`[http.dispatchUpgrade] no 'upgrade' listener on server for ${target} — WS handshake will not complete`);
+    }
     self.emit("upgrade", req, socket, Buffer.alloc(0));
   });
 
@@ -604,7 +609,9 @@ Server.prototype.dispatchRequest = async function dispatchRequest(
   return new Promise((resolve, reject) => {
     const req = IncomingMessage.build(verb, target, hdrs, payload);
     const res = new ServerResponse(req);
-    res._onComplete(resolve);
+    res._onComplete((completed) => {
+      resolve(completed);
+    });
 
     const timeoutMs = self.timeout || TIMEOUTS.HTTP_DISPATCH_SAFETY;
     const timer = setTimeout(() => {

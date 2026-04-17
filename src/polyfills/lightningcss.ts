@@ -1,10 +1,9 @@
-// Lazy-loads lightningcss-wasm from CDN since native .node binaries can't run in browser.
-// Feature flags are inlined for synchronous access; actual transform/bundle delegates to WASM.
+// last-resort CDN polyfill via esm.sh, used when both the native .node binary and the lightningcss-wasm npm package fail to load
+// primary path is the npm package with VFS-to-CDN fallback for the large .wasm (see fetch patch in ScriptEngine)
 
 import { CDN_LIGHTNINGCSS_WASM, cdnImport } from "../constants/cdn-urls";
 
 // Bitfield constants -- must be available synchronously before WASM loads
-
 export const Features = {
   Nesting:                        1,
   NotSelectorList:                2,
@@ -58,21 +57,27 @@ async function ensureInit(): Promise<void> {
   return initPromise;
 }
 
-// start eagerly so WASM is ready by the time transform() is called
-ensureInit();
+// start eagerly in browsers so WASM is ready by the time transform() is called
+if (typeof window !== "undefined" || typeof (globalThis as any).importScripts === "function") {
+  ensureInit().catch(() => {}); // swallow, functions retry on call
+}
+
+function requireInit(): void {
+  if (!wasmMod) throw new Error("lightningcss: WASM not ready yet — call await init() first");
+}
 
 export function transform(opts: any): any {
-  if (!wasmMod) throw new Error("lightningcss: WASM not ready yet — call await init() first");
+  requireInit();
   return wasmMod.transform(opts);
 }
 
 export function transformStyleAttribute(opts: any): any {
-  if (!wasmMod) throw new Error("lightningcss: WASM not ready yet");
+  requireInit();
   return wasmMod.transformStyleAttribute(opts);
 }
 
 export function bundle(opts: any): any {
-  if (!wasmMod) throw new Error("lightningcss: WASM not ready yet");
+  requireInit();
   return wasmMod.bundle(opts);
 }
 
@@ -82,7 +87,7 @@ export async function bundleAsync(opts: any): Promise<any> {
 }
 
 export function composeVisitors(visitors: any[]): any {
-  if (!wasmMod) throw new Error("lightningcss: WASM not ready yet");
+  requireInit();
   return wasmMod.composeVisitors(visitors);
 }
 

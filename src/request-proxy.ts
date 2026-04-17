@@ -170,13 +170,12 @@ export class RequestProxy extends EventEmitter {
       const buf = body ? Buffer.from(new Uint8Array(body)) : undefined;
       return await entry.server.dispatchRequest(method, url, headers, buf);
     } catch (err) {
+      const msg = err instanceof Error ? err.message : "Internal Server Error";
       return {
         statusCode: 500,
         statusMessage: "Internal Server Error",
         headers: { "Content-Type": "text/plain" },
-        body: Buffer.from(
-          err instanceof Error ? err.message : "Internal Server Error",
-        ),
+        body: Buffer.from(msg),
       };
     }
   }

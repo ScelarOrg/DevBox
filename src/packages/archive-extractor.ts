@@ -211,9 +211,18 @@ export async function downloadAndExtract(
     vol.mkdirSync(parentDir, { recursive: true });
 
     if (file.isBinary) {
-      vol.writeFileSync(absolute, base64ToBytes(file.data));
+      // binary data arrives as raw Uint8Array (large files via structured clone)
+      // or base64 string (small files)
+      const bytes = file.data instanceof Uint8Array
+        ? file.data
+        : base64ToBytes(file.data as string);
+      vol.writeFileSync(absolute, bytes);
+      // pre-compile WASM so it's ready by the time code needs it
+      if (absolute.endsWith(".wasm")) {
+        precompileWasm(bytes);
+      }
     } else {
-      vol.writeFileSync(absolute, file.data);
+      vol.writeFileSync(absolute, file.data as string);
     }
     writtenPaths.push(absolute);
   }

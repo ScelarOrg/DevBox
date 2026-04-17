@@ -1,5 +1,5 @@
-// ProcessManager — main-thread process lifecycle manager.
-// Spawns Web Worker processes, routes I/O, handles VFS sync, tracks process tree.
+// main-thread process lifecycle manager
+// spawns Web Worker processes, routes I/O, syncs VFS, tracks process tree
 
 import { EventEmitter } from "../polyfills/events";
 import type { MemoryVolume } from "../memory-volume";
@@ -19,16 +19,8 @@ import type { VFSBridge } from "./vfs-bridge";
 import { PROCESS_WORKER_BUNDLE } from "virtual:process-worker-bundle";
 import { SLOT_SIZE } from "./sync-channel";
 
-/* ------------------------------------------------------------------ */
-/*  Constants                                                          */
-/* ------------------------------------------------------------------ */
-
 const MAX_PROCESS_DEPTH = 10;
 const MAX_PROCESSES = 50;
-
-/* ------------------------------------------------------------------ */
-/*  ProcessManager                                                     */
-/* ------------------------------------------------------------------ */
 
 export class ProcessManager extends EventEmitter {
   private _processes = new Map<number, ProcessHandle>();
@@ -38,11 +30,10 @@ export class ProcessManager extends EventEmitter {
   private _sharedBuffer: SharedArrayBuffer | null = null;
   private _syncBuffer: SharedArrayBuffer | null = null;
 
-  // port → owning PID
+  // port → owning pid
   private _serverPorts = new Map<number, number>();
-  // parent PID → child PIDs (for exit deferral)
+  // parent pid → child pids, used for exit deferral
   private _childPids = new Map<number, Set<number>>();
-  // pending HTTP request callbacks
   private _httpCallbacks = new Map<number, (resp: WorkerToMain_HttpResponse) => void>();
   private _nextHttpRequestId = 1;
 
@@ -145,7 +136,7 @@ export class ProcessManager extends EventEmitter {
     return result;
   }
 
-  // Kills process and ALL descendants recursively, cleans up server ports
+  // kills process and all descendants recursively, cleans up server ports
   kill(pid: number, signal: string = "SIGTERM"): boolean {
     const handle = this._processes.get(pid);
     if (!handle) return false;
@@ -177,7 +168,7 @@ export class ProcessManager extends EventEmitter {
       const childHandle = this._processes.get(childPid);
       if (childHandle && childHandle.state !== "exited") {
         childHandle.kill(signal);
-        // Prevent stale output from dying workers leaking into the terminal
+        // stop stale output from dying workers leaking into the terminal
         childHandle.removeAllListeners("stdout");
         childHandle.removeAllListeners("stderr");
       }
@@ -210,7 +201,7 @@ export class ProcessManager extends EventEmitter {
     return [...this._serverPorts.keys()];
   }
 
-  // Dispatch HTTP request to the worker owning the port
+  // send HTTP request to the worker that owns the port
   dispatchHttpRequest(
     port: number,
     method: string,
@@ -265,7 +256,7 @@ export class ProcessManager extends EventEmitter {
     });
   }
 
-  // Returns owning PID, or -1 if no server found
+  // returns owning pid, or -1 if no server found
   dispatchWsUpgrade(
     port: number,
     uid: string,
@@ -273,7 +264,9 @@ export class ProcessManager extends EventEmitter {
     headers: Record<string, string>,
   ): number {
     const pid = this._serverPorts.get(port);
-    if (pid === undefined) return -1;
+    if (pid === undefined) {
+      return -1;
+    }
 
     const handle = this._processes.get(pid);
     if (!handle || handle.state === "exited") {
@@ -297,12 +290,10 @@ export class ProcessManager extends EventEmitter {
     handle.postMessage({ type: "ws-close", uid, code });
   }
 
-  /* ---- Internal ---- */
-
   private static _workerBlobUrl: string | null = null;
 
   private _createWorker(): Worker {
-    // Blob URL from pre-bundled source — works in any environment
+    // blob URL from pre-bundled source works in any environment
     if (!ProcessManager._workerBlobUrl) {
       const blob = new Blob([PROCESS_WORKER_BUNDLE], { type: "application/javascript" });
       ProcessManager._workerBlobUrl = URL.createObjectURL(blob);
@@ -311,12 +302,12 @@ export class ProcessManager extends EventEmitter {
   }
 
   private _wireHandleEvents(handle: ProcessHandle): void {
-    // Forward signals to all descendants (handles both running and exited parent)
+    // forward signals to all descendants, works whether parent is running or exited
     handle.on("signal", (signal: string) => {
       this._killDescendants(handle.pid, signal);
     });
 
-    // Forward stdin to children (even if parent is blocked on Atomics.wait)
+    // forward stdin to children even when parent is blocked on Atomics.wait
     handle.on("stdin-forward", (data: string) => {
       const children = this._childPids.get(handle.pid);
       if (children) {
@@ -336,7 +327,7 @@ export class ProcessManager extends EventEmitter {
           this.emit("server-close", handle.pid, port);
         }
       }
-      // Clean up any pending HTTP callbacks for this worker to prevent leaks
+      // drain pending HTTP callbacks for this worker so they don't leak
       for (const [reqId, cb] of this._httpCallbacks) {
         cb({
           type: "http-response",
@@ -348,7 +339,7 @@ export class ProcessManager extends EventEmitter {
         } as WorkerToMain_HttpResponse);
       }
       this.emit("exit", handle.pid, exitCode);
-      // Delay removal so event handlers finish
+      // delayed so event handlers finish first
       setTimeout(() => {
         this._processes.delete(handle.pid);
       }, 100);
@@ -385,10 +376,9 @@ export class ProcessManager extends EventEmitter {
             });
           } else {
             const data = this._volume.readFileSync(path);
-            const buffer = (data.buffer as ArrayBuffer).slice(
-              data.byteOffset,
-              data.byteOffset + data.byteLength,
-            );
+            // must copy into a fresh ArrayBuffer — .buffer.slice() returns SAB when storage is shared, and SAB can't be transferred via postMessage (throws DataCloneError)
+            const buffer = new ArrayBuffer(data.byteLength);
+            new Uint8Array(buffer).set(data);
             handle.postMessage({
               type: "vfs-sync",
               path,
@@ -405,7 +395,7 @@ export class ProcessManager extends EventEmitter {
           });
         }
       } catch {
-        // Send null so worker doesn't hang
+        // send null so the worker doesn't hang
         try {
           handle.postMessage({
             type: "vfs-sync",
@@ -433,7 +423,7 @@ export class ProcessManager extends EventEmitter {
         }
         this._childPids.get(handle.pid)!.add(childHandle.pid);
 
-        // Defer parent exit/done until child finishes (e.g. create-vite -> vite dev)
+        // defer parent exit/done until child finishes (e.g. create-vite -> vite dev)
         handle.holdExit();
         handle.holdShellDone();
 
@@ -443,7 +433,7 @@ export class ProcessManager extends EventEmitter {
           pid: childHandle.pid,
         });
 
-        // Detect bare node commands and send as direct execution
+        // bare `node` invocations go through as direct execution
         const isNodeBin = /(?:^|\/)node$/.test(msg.command);
         const sendExec = () => {
           if (isNodeBin && msg.args.length > 0) {
@@ -474,7 +464,7 @@ export class ProcessManager extends EventEmitter {
           childHandle.on("ready", sendExec);
         }
 
-        // Relay child output: direct emit if parent done, postMessage if still running
+        // relay child output — direct emit if parent is done, postMessage otherwise
         childHandle.on("stdout", (data: string) => {
           if (handle.workerExited || handle.shellCommandDone) {
             handle.emit("stdout", data);
@@ -598,7 +588,7 @@ export class ProcessManager extends EventEmitter {
           }
         });
 
-        // IPC: child -> parent
+        // IPC child → parent
         childHandle.on("ipc-message", (ipcMsg: any) => {
           const payload = ipcMsg?.data ?? ipcMsg;
           if (!handle.workerExited) {
@@ -610,7 +600,7 @@ export class ProcessManager extends EventEmitter {
           }
         });
 
-        // IPC: parent -> child
+        // IPC parent → child
         handle.on("ipc-message", (ipcMsg: any) => {
           if (ipcMsg.targetRequestId === msg.requestId) {
             childHandle.postMessage({
@@ -651,7 +641,7 @@ export class ProcessManager extends EventEmitter {
     handle.on("workerthread-request", (msg: WorkerToMain_WorkerThreadRequest) => {
       try {
         let modulePath = msg.modulePath;
-        // eval mode: write code to temp VFS file
+        // eval mode — write code to a temp VFS file
         if (msg.isEval) {
           const evalPath = `/__wt_eval_${msg.threadId}__.js`;
           this._volume.writeFileSync(evalPath, msg.modulePath);
@@ -805,7 +795,7 @@ export class ProcessManager extends EventEmitter {
           Atomics.store(int32, slotBase, 2); // STATUS_ERROR
           Atomics.notify(int32, slotBase);
         } catch {
-          // Buffer unusable — worker will time out
+          // buffer unusable, worker will time out
         }
       };
 
@@ -818,7 +808,7 @@ export class ProcessManager extends EventEmitter {
           parentPid: handle.pid,
         });
 
-        // Must track for Ctrl+C signal propagation via _killDescendants
+        // must track for Ctrl+C signal propagation via _killDescendants
         if (!this._childPids.has(handle.pid)) {
           this._childPids.set(handle.pid, new Set());
         }
@@ -826,7 +816,7 @@ export class ProcessManager extends EventEmitter {
 
         handle.holdExit();
         handle.holdShellDone();
-        handle.holdSync(); // parent is blocked on Atomics.wait — stdin must bypass
+        handle.holdSync(); // parent is blocked on Atomics.wait — stdin has to bypass
 
         const sendExec = () => {
           childHandle.exec({
@@ -846,7 +836,7 @@ export class ProcessManager extends EventEmitter {
           childHandle.on("ready", sendExec);
         }
 
-        // Parent is blocked on Atomics.wait — can't process postMessage, emit directly
+        // parent is blocked on Atomics.wait, can't process postMessage — emit directly
         childHandle.on("stdout", (data: string) => {
           handle.emit("stdout", data);
         });
@@ -873,7 +863,7 @@ export class ProcessManager extends EventEmitter {
             const dataOffset = (slotBase + 3) * 4;
             uint8.set(stdoutBytes.subarray(0, truncatedLen), dataOffset);
 
-            // Must be last — wakes the waiting worker
+            // last store wakes the waiting worker
             Atomics.store(int32, slotBase, 1);
             Atomics.notify(int32, slotBase);
           } catch {
@@ -950,8 +940,13 @@ export class ProcessManager extends EventEmitter {
     for (const [pid, handle] of this._processes) {
       if (pid === excludePid || handle.state === "exited") continue;
       try {
-        // ArrayBuffer can only be transferred once, clone for each recipient
-        const clonedContent = content ? content.slice(0) : null;
+        // ArrayBuffer can only be transferred once, so clone per recipient
+        // explicit copy rather than .slice(0) — if `content` is actually SAB (TypeScript lets SAB satisfy ArrayBuffer), SAB.prototype.slice() returns SAB which can't be transferred
+        let clonedContent: ArrayBuffer | null = null;
+        if (content) {
+          clonedContent = new ArrayBuffer(content.byteLength);
+          new Uint8Array(clonedContent).set(new Uint8Array(content));
+        }
         handle.postMessage({
           type: "vfs-sync",
           path,

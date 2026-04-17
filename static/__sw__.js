@@ -13,7 +13,7 @@
  * through the virtual server.
  */
 
-const SW_VERSION = 4;
+const SW_VERSION = 6;
 
 let port = null;
 let nextId = 1;
@@ -163,12 +163,26 @@ function onPortMessage(event) {
 self.addEventListener("fetch", (event) => {
   const url = new URL(event.request.url);
 
-  // 1. Explicit /__virtual__/{port}/{path}
+  // 1. explicit /__virtual__/{port}/{path} — navigating an iframe here (the URL
+  //    request-proxy.serverUrl() returns) must also register the resulting
+  //    clientId, else absolute-path module imports from the HTML (e.g.
+  //    /@vite/client, /src/main.tsx) miss every branch below and hit the host
   const virtualMatch = url.pathname.match(/^\/__virtual__\/(\d+)(\/.*)?$/);
   if (virtualMatch) {
     const serverPort = parseInt(virtualMatch[1], 10);
     const path = (virtualMatch[2] || "/") + url.search;
-    event.respondWith(proxyToVirtualServer(event.request, serverPort, path));
+    if (event.request.mode === "navigate") {
+      event.respondWith(
+        (async () => {
+          if (event.resultingClientId) {
+            previewClients.set(event.resultingClientId, serverPort);
+          }
+          return proxyToVirtualServer(event.request, serverPort, path);
+        })(),
+      );
+    } else {
+      event.respondWith(proxyToVirtualServer(event.request, serverPort, path));
+    }
     return;
   }
 
@@ -204,11 +218,11 @@ self.addEventListener("fetch", (event) => {
     const host = url.hostname;
     if (host === "localhost" || host === "127.0.0.1" || host === "0.0.0.0" || host === self.location.hostname) {
       const serverPort = previewClients.get(clientId);
-      // Strip /__preview__/{port} prefix if the browser resolved a relative URL
-      // against the preview page's location (e.g. /__preview__/3001.rsc → /.rsc,
-      // /__preview__/3001/foo → /foo)
+      // strip /__preview__/{port} or /__virtual__/{port} prefix if the browser
+      // resolved a relative URL against the preview page's location
+      // (e.g. /__preview__/3001.rsc → /.rsc, /__virtual__/3001/foo → /foo)
       let path = url.pathname;
-      const ppMatch = path.match(/^\/__preview__\/\d+(.*)?$/);
+      const ppMatch = path.match(/^\/__(?:preview|virtual)__\/\d+(.*)?$/);
       if (ppMatch) {
         path = ppMatch[1] || "/";
         if (path[0] !== "/") path = "/" + path;
@@ -219,21 +233,23 @@ self.addEventListener("fetch", (event) => {
     }
   }
 
-  // 4. Fallback: check Referer header for /__preview__/ prefix.
-  //    Handles edge cases where clientId might not be set.
-  //    Only intercept same-origin requests (not cross-origin like Google Fonts).
+  // 4. fallback: check Referer header for /__preview__/ or /__virtual__/ prefix.
+  //    handles the Firefox race where the first subresource after a navigation
+  //    arrives with event.clientId === "" (before the new client is registered).
+  //    covers either URL style since both are valid entry points. only intercept
+  //    same-origin requests (not cross-origin like Google Fonts)
   const referer = event.request.referrer;
   if (referer) {
     try {
       const refUrl = new URL(referer);
-      const refMatch = refUrl.pathname.match(/^\/__preview__\/(\d+)/);
+      const refMatch = refUrl.pathname.match(/^\/__(?:preview|virtual)__\/(\d+)/);
       if (refMatch) {
         const host = url.hostname;
         if (host === "localhost" || host === "127.0.0.1" || host === "0.0.0.0" || host === self.location.hostname) {
           const serverPort = parseInt(refMatch[1], 10);
-          // Strip /__preview__/{port} prefix if present
+          // strip /__preview__/{port} or /__virtual__/{port} prefix if present
           let path = url.pathname;
-          const ppMatch2 = path.match(/^\/__preview__\/\d+(.*)?$/);
+          const ppMatch2 = path.match(/^\/__(?:preview|virtual)__\/\d+(.*)?$/);
           if (ppMatch2) {
             path = ppMatch2[1] || "/";
             if (path[0] !== "/") path = "/" + path;
@@ -276,12 +292,13 @@ function getWsShimScript() {
   var nextId = 0;
   var active = {};
 
-  // Detect the virtual server port from the page URL.
-  // When loaded via /__preview__/{port}/, use that port for WS connections
-  // instead of the literal port from the WS URL (which is the host page's port).
+  // detect the virtual server port from the page URL.
+  // when loaded via /__preview__/{port}/ or /__virtual__/{port}/, use that port
+  // for WS connections instead of the literal port from the WS URL (which may
+  // be the host page's port, not the virtual server's port)
   var _previewPort = 0;
   try {
-    var _m = location.pathname.match(/^\\/__preview__\\/(\\d+)/);
+    var _m = location.pathname.match(/^\\/__(?:preview|virtual)__\\/(\\d+)/);
     if (_m) _previewPort = parseInt(_m[1], 10);
   } catch(e) {}
 

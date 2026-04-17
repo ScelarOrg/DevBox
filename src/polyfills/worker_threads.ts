@@ -1,4 +1,5 @@
 // worker_threads polyfill using fork infrastructure for real Web Workers
+// enhanced with generic napi-rs WASI worker support
 
 
 import { EventEmitter } from "./events";
@@ -36,6 +37,13 @@ let _workerThreadForkFn: WorkerThreadForkFn | null = null;
 
 export function setWorkerThreadForkCallback(fn: WorkerThreadForkFn): void {
   _workerThreadForkFn = fn;
+}
+
+// script-engine injects a PatchedWorker factory here for napi-rs WASI worker support, factory gets (script, opts) like the constructor
+let _workerConstructorOverride: ((self: any, script: string | URL, opts?: any) => void) | null = null;
+
+export function setWorkerConstructorOverride(fn: ((self: any, script: string | URL, opts?: any) => void) | null): void {
+  _workerConstructorOverride = fn;
 }
 
 let _nextThreadId = 1;
@@ -151,6 +159,12 @@ export const Worker = function Worker(
   this._terminated = false;
   this._isReffed = false;
 
+  // if override is installed (napi-rs WASI worker factory), delegate — it handles both WASI workers and fork-based fallback
+  if (_workerConstructorOverride) {
+    _workerConstructorOverride(this, script, opts);
+    return;
+  }
+
   const scriptStr = typeof script === "string" ? script : script.href;
   const self = this;
 
@@ -256,6 +270,46 @@ Worker.prototype.getHeapSnapshot = function getHeapSnapshot(): Promise<unknown> 
   return Promise.resolve({});
 };
 
+// direct onmessage/onerror/onexit setters, napi-rs .wasi.cjs loaders use worker.onmessage = ... instead of .on('message', ...)
+//
+// CRITICAL: the onmessage setter must NOT add an EventEmitter listener
+// emnapi (ENVIRONMENT_IS_NODE=true) already calls worker.on('message', data => worker.onmessage?.({data}))
+// if this setter ALSO added a listener, each message would fire twice — for 'spawn-thread' that means
+// duplicate workers calling wasi_thread_start with the same startArg → TLS corruption / "current thread handle already set"
+// fix: setter just stores the handler, emnapi's explicit on('message') dispatches exactly once
+{
+  const _onmessageSym = Symbol("onmessage");
+  Object.defineProperty(Worker.prototype, "onmessage", {
+    get() { return this[_onmessageSym] ?? null; },
+    set(fn: Function | null) {
+      this[_onmessageSym] = fn;
+      // do NOT add as EventEmitter listener, emnapi's worker.on('message') already calls worker.onmessage()
+    },
+    configurable: true,
+  });
+
+  const _onerrorSym = Symbol("onerror");
+  Object.defineProperty(Worker.prototype, "onerror", {
+    get() { return this[_onerrorSym] ?? null; },
+    set(fn: Function | null) {
+      this[_onerrorSym] = fn;
+      // same as onmessage, do NOT add as EventEmitter listener
+    },
+    configurable: true,
+  });
+
+  const _onexitSym = Symbol("onexit");
+  Object.defineProperty(Worker.prototype, "onexit", {
+    get() { return this[_onexitSym] ?? null; },
+    set(fn: Function | null) {
+      if (this[_onexitSym]) this.off("exit", this[_onexitSym]);
+      this[_onexitSym] = fn;
+      if (fn) this.on("exit", fn);
+    },
+    configurable: true,
+  });
+}
+
 
 export interface BroadcastChannel extends EventEmitter {
   name: string;
@@ -323,4 +377,5 @@ export default {
   getEnvironmentData,
   setEnvironmentData,
   setWorkerThreadForkCallback,
+  setWorkerConstructorOverride,
 };

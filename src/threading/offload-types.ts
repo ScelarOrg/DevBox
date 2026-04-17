@@ -1,15 +1,10 @@
-// Type definitions for the worker offloading system.
-// All types must be structured-clone compatible (postMessage-safe).
-
-// --- Task priority ---
+// types for the worker offloading system — all must be structured-clone safe (postMessage)
 
 export enum TaskPriority {
   HIGH = 0,    // runtime transforms (user waiting)
   NORMAL = 1,  // install-time bulk transforms
   LOW = 2,     // background pre-bundling
 }
-
-// --- Transform task ---
 
 export interface TransformTask {
   type: "transform";
@@ -33,8 +28,6 @@ export interface TransformResult {
   warnings: string[];
 }
 
-// --- Extract task ---
-
 export interface ExtractTask {
   type: "extract";
   id: string;
@@ -46,8 +39,8 @@ export interface ExtractTask {
 
 export interface ExtractedFile {
   path: string;
-  // UTF-8 text, or base64-encoded binary
-  data: string;
+  // UTF-8 text, base64-encoded binary, or raw Uint8Array for large binaries
+  data: string | Uint8Array;
   isBinary: boolean;
 }
 
@@ -56,8 +49,6 @@ export interface ExtractResult {
   id: string;
   files: ExtractedFile[];
 }
-
-// --- Build task ---
 
 export interface BuildTask {
   type: "build";
@@ -88,13 +79,10 @@ export interface BuildResult {
   warnings: string[];
 }
 
-// --- Union types ---
-
 export type OffloadTask = TransformTask | ExtractTask | BuildTask;
 export type OffloadResult = TransformResult | ExtractResult | BuildResult;
 
-// --- Worker endpoint (exposed via Comlink) ---
-
+// exposed via Comlink
 export interface OffloadWorkerEndpoint {
   init(): Promise<void>;
   transform(task: TransformTask): Promise<TransformResult>;
@@ -102,8 +90,6 @@ export interface OffloadWorkerEndpoint {
   build(task: BuildTask): Promise<BuildResult>;
   ping(): boolean;
 }
-
-// --- Pool config ---
 
 export interface PoolConfig {
   minWorkers?: number;

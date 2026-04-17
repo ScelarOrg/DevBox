@@ -1,6 +1,5 @@
-// Per-process Web Worker entry point.
-// Each worker gets its own MemoryVolume, ScriptEngine, and NodepodShell.
-// I/O flows via postMessage using the protocol in worker-protocol.ts.
+// per-process Web Worker entry — each worker gets its own MemoryVolume, ScriptEngine, and NodepodShell
+// I/O flows through postMessage using the protocol in worker-protocol.ts
 
 import { MemoryVolume } from "../memory-volume";
 import { ScriptEngine, setChildProcessPolyfill } from "../script-engine";
@@ -12,8 +11,6 @@ import type {
   WorkerToMainMessage,
 } from "./worker-protocol";
 
-// --- Worker state ---
-
 let _pid = 0;
 let _cwd = "/";
 let _env: Record<string, string> = {};
@@ -21,7 +18,7 @@ let _volume: MemoryVolume | null = null;
 let _initialized = false;
 let _abortController: AbortController | null = null;
 
-// Prevents echo loops: suppress vfs-write/delete while applying inbound vfs-sync
+// prevents echo loops — suppress vfs-write/delete while applying inbound vfs-sync
 let _suppressVFSWatch = false;
 
 let _shellInitialized = false;
@@ -36,8 +33,6 @@ const _childOutputCallbacks = new Map<number, (stream: string, data: string) => 
 const _childExitCallbacks = new Map<number, (exitCode: number, stdout: string, stderr: string) => void>();
 const _ipcCallbacks = new Map<number, (data: unknown) => void>();
 let _nextRequestId = 1;
-
-// --- Post to main thread ---
 
 function post(msg: WorkerToMainMessage, transfer?: Transferable[]): void {
   (self as unknown as Worker).postMessage(msg, transfer ?? []);
@@ -66,8 +61,6 @@ function postCwdChange(cwd: string): void {
 function postStdinRawStatus(isRaw: boolean): void {
   post({ type: "stdin-raw-status", isRaw });
 }
-
-// --- Message handler ---
 
 self.addEventListener("message", (ev: MessageEvent) => {
   if (!ev?.data?.type) return;
@@ -117,11 +110,11 @@ self.addEventListener("message", (ev: MessageEvent) => {
     case "ipc-message": {
       const ipcMsg = msg as any;
       if (ipcMsg.targetRequestId !== undefined) {
-        // This worker is a PARENT — route to the fork callback for a child
+        // we're the parent — route to the fork callback for a child
         const ipcCb = _ipcCallbacks.get(ipcMsg.targetRequestId);
         if (ipcCb) ipcCb(ipcMsg.data);
       } else {
-        // This worker IS a forked child — emit on process object
+        // we're the forked child — emit on the process object
         handleIPCMessage(ipcMsg.data);
       }
       break;
@@ -143,8 +136,6 @@ self.addEventListener("message", (ev: MessageEvent) => {
   }
 });
 
-// --- Init ---
-
 function handleInit(msg: MainToWorker_Init): void {
   _pid = msg.pid;
   _cwd = msg.cwd || "/";
@@ -152,7 +143,7 @@ function handleInit(msg: MainToWorker_Init): void {
 
   _volume = MemoryVolume.fromBinarySnapshot(msg.snapshot);
 
-  // Watch local writes → forward to main. Suppressed during inbound vfs-sync to prevent echo.
+  // watch local writes and forward to main — suppressed during inbound vfs-sync to prevent echo
   _volume.watch("/", { recursive: true }, (event, filename) => {
     if (!filename || _suppressVFSWatch) return;
     try {
@@ -167,10 +158,10 @@ function handleInit(msg: MainToWorker_Init): void {
           });
         } else {
           const data = _volume!.readFileSync(filename);
-          const buffer = (data.buffer as ArrayBuffer).slice(
-            data.byteOffset,
-            data.byteOffset + data.byteLength,
-          );
+          // must copy into a fresh ArrayBuffer — if the Uint8Array is backed by SAB (e.g. esbuild-wasm or any napi-rs wasm32-wasip1-threads module writing from shared memory), both .buffer.slice() and .slice() return SAB, which isn't transferable
+          // postMessage would throw DataCloneError, the catch swallows it, main-thread VFS never learns about the write — this was what caused Vite dep-optimizer 504s (.vite/deps/*.js missing) and downstream 404s
+          const buffer = new ArrayBuffer(data.byteLength);
+          new Uint8Array(buffer).set(data);
           post({ type: "vfs-write", path: filename, content: buffer, isDirectory: false }, [buffer]);
         }
       } else {
@@ -189,12 +180,10 @@ function handleInit(msg: MainToWorker_Init): void {
   post({ type: "ready", pid: _pid });
 }
 
-// --- Shell init (lazy) ---
-
 async function ensureShell(): Promise<typeof import("../polyfills/child_process")> {
   if (!_shellMod) {
     _shellMod = await import("../polyfills/child_process");
-    // Must be eager — sync require('child_process') needs this before any microtask fires
+    // must be eager — sync require('child_process') needs this before any microtask fires
     setChildProcessPolyfill(_shellMod);
   }
   if (!_shellInitialized && _volume) {
@@ -218,8 +207,6 @@ async function ensureShell(): Promise<typeof import("../polyfills/child_process"
   return _shellMod;
 }
 
-// --- Exec ---
-
 async function handleExec(msg: MainToWorker_Exec): Promise<void> {
   if (!_volume) {
     postStderr("Error: VFS not initialized\n");
@@ -231,7 +218,7 @@ async function handleExec(msg: MainToWorker_Exec): Promise<void> {
 
   if (msg.cwd) {
     _cwd = msg.cwd;
-    // Must sync shell cwd too, otherwise it keeps its old cwd
+    // sync shell cwd too, otherwise it keeps its old one
     if (_shellMod) _shellMod.setShellCwd(msg.cwd);
   }
   if (msg.env) Object.assign(_env, msg.env);
@@ -242,8 +229,6 @@ async function handleExec(msg: MainToWorker_Exec): Promise<void> {
     await handleFileExec(msg);
   }
 }
-
-// --- Shell command execution ---
 
 async function handleShellExec(msg: MainToWorker_Exec): Promise<void> {
   const shellCmd = msg.shellCommand || "";
@@ -261,10 +246,9 @@ async function handleShellExec(msg: MainToWorker_Exec): Promise<void> {
       onRawModeChange: postStdinRawStatus,
     });
 
-    // shellExec() NOT child_process.exec() — the latter spawns a new worker, causing recursion
+    // shellExec(), NOT child_process.exec() — the latter spawns a new worker and recurses
     shell.shellExec(shellCmd, {}, (error, stdout, stderr) => {
-      // Don't clearStreamingCallbacks — background children (e.g. vite dev)
-      // may still need the output sinks. Cleaned up on worker termination.
+      // don't clearStreamingCallbacks here — background children (e.g. vite dev) still need the sinks, cleaned up on worker termination
 
       const newCwd = shell.getShellCwd();
       if (newCwd !== _cwd) {
@@ -294,8 +278,6 @@ async function handleShellExec(msg: MainToWorker_Exec): Promise<void> {
   }
 }
 
-// --- IPC message handler ---
-
 function handleIPCMessage(data: unknown): void {
   if (_shellMod) {
     _shellMod.handleIPCFromParent(data);
@@ -304,8 +286,7 @@ function handleIPCMessage(data: unknown): void {
   }
 }
 
-// --- File execution (node script.js) ---
-
+// file execution (node script.js)
 async function handleFileExec(msg: MainToWorker_Exec): Promise<void> {
   const filePath = msg.filePath;
   const args = msg.args || [];
@@ -313,7 +294,7 @@ async function handleFileExec(msg: MainToWorker_Exec): Promise<void> {
   try {
     const shell = await ensureShell();
 
-    // Enable IPC for forks: process.send() → postMessage to main
+    // enable IPC for forks — process.send() goes out as postMessage to main
     if (msg.isFork) {
       shell.setIPCSend((data: unknown) => {
         post({ type: "ipc-message", data });
@@ -360,7 +341,7 @@ async function handleFileExec(msg: MainToWorker_Exec): Promise<void> {
       env: _env,
       volume: _volume!,
       exec: async (cmd: string, opts?: { cwd?: string; env?: Record<string, string> }) => {
-        // Needed for ShellContext type compat
+        // needed for ShellContext type compat
         return new Promise<{ stdout: string; stderr: string; exitCode: number }>((resolve) => {
           shell.exec(cmd, opts ?? {}, (error: any, stdout: any, stderr: any) => {
             resolve({
@@ -381,14 +362,12 @@ async function handleFileExec(msg: MainToWorker_Exec): Promise<void> {
     shell.clearStreamingCallbacks();
     postExit(result.exitCode, result.stdout, result.stderr);
   } catch (e: any) {
-    // Safety net — executeNodeBinary handles its own errors, but just in case:
+    // safety net — executeNodeBinary handles its own errors, but just in case
     const errMsg = e?.message || String(e);
     postStderr(`Error: ${errMsg}\n`);
     postExit(1, "", errMsg);
   }
 }
-
-// --- Stdin ---
 
 function handleStdin(data: string): void {
   if (!_shellMod) return;
@@ -399,8 +378,6 @@ function handleStdin(data: string): void {
   }
 }
 
-// --- Signal ---
-
 function handleSignal(msg: { signal: string }): void {
   if (msg.signal === "SIGINT" || msg.signal === "SIGTERM") {
     if (_abortController) {
@@ -409,11 +386,9 @@ function handleSignal(msg: { signal: string }): void {
   }
 }
 
-// --- VFS sync ---
-
 function handleVFSSync(msg: { path: string; content: ArrayBuffer | null; isDirectory: boolean }): void {
   if (!_volume) return;
-  // Suppress watcher — these came from another worker, don't echo back
+  // suppress watcher — these came from another worker, don't echo back
   _suppressVFSWatch = true;
   try {
     if (msg.content === null) {
@@ -449,7 +424,7 @@ function handleVFSChunk(msg: { chunkIndex: number; totalChunks: number; data: Ar
   _vfsChunks[msg.chunkIndex] = { data: msg.data, manifest: msg.manifest };
   const received = _vfsChunks.filter(Boolean).length;
   if (received === msg.totalChunks) {
-    // All chunks received — apply to volume
+    // all chunks received, apply to volume
     _suppressVFSWatch = true;
     try {
       if (_volume) {
@@ -477,8 +452,6 @@ function handleVFSChunk(msg: { chunkIndex: number; totalChunks: number; data: Ar
     _vfsChunks = [];
   }
 }
-
-// --- HTTP request dispatch ---
 
 async function handleHttpRequest(msg: {
   requestId: number;
@@ -511,7 +484,10 @@ async function handleHttpRequest(msg: {
       msg.headers,
       bodyBuf,
     );
-    // Transfer body as ArrayBuffer to avoid UTF-8 corruption of binary data
+    // transfer body as ArrayBuffer so UTF-8 doesn't corrupt binary data
+    // the copy below is load-bearing: if result.body is a Uint8Array over SAB (e.g. bytes from rolldown-WASM transforms or any napi-rs wasm32-wasip1-threads module), bytes.buffer.slice() returns a new SAB, not a regular ArrayBuffer
+    // SAB isn't transferable per the structured-clone spec, so postMessage throws DataCloneError, the catch returns 500 text/plain, and the browser rejects it as JS module with NS_ERROR_CORRUPTED_CONTENT
+    // fresh ArrayBuffer + Uint8Array.set guarantees a plain ArrayBuffer regardless of source backing
     let bodyVal: string | ArrayBuffer = "";
     const transferList: Transferable[] = [];
     if (result.body) {
@@ -519,7 +495,8 @@ async function handleHttpRequest(msg: {
         bodyVal = result.body;
       } else if (result.body instanceof Uint8Array || Buffer.isBuffer(result.body)) {
         const bytes = result.body instanceof Uint8Array ? result.body : new Uint8Array(result.body);
-        const ab = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+        const ab = new ArrayBuffer(bytes.byteLength);
+        new Uint8Array(ab).set(bytes);
         bodyVal = ab;
         transferList.push(ab);
       } else {
@@ -548,9 +525,7 @@ async function handleHttpRequest(msg: {
   }
 }
 
-// --- WebSocket upgrade handling ---
-
-// Active WS connections: uid → socket (TcpSocket in the worker)
+// active WS connections: uid → socket (TcpSocket in the worker)
 const _wsConnections = new Map<string, any>();
 
 async function handleWsUpgrade(msg: {
@@ -575,7 +550,7 @@ async function handleWsUpgrade(msg: {
     let outboundBuf = new Uint8Array(0);
     let handshakeDone = false;
 
-    // Intercept socket.write to decode WS frames and relay to main thread
+    // intercept socket.write, decode WS frames, relay to main thread
     socket.write = ((
       chunk: Uint8Array | string,
       encOrCb?: string | ((err?: Error | null) => void),
@@ -619,7 +594,7 @@ async function handleWsUpgrade(msg: {
             _wsConnections.delete(msg.uid);
             break;
           }
-          case 0x09: // PING — send pong back
+          case 0x09: // ping, send pong back
             socket._feedData(Buffer.from(encodeFrame(0x0A, frame.data, true)));
             break;
         }
@@ -659,10 +634,7 @@ function handleWsClose(msg: { uid: string; code: number }): void {
   _wsConnections.delete(msg.uid);
 }
 
-// --- Child process spawning ---
-
-// Forks a child process via main thread. Returns IPC handles immediately;
-// output and exit arrive via callbacks.
+// forks a child process via main thread — returns IPC handles immediately, output and exit arrive via callbacks
 export function forkChild(
   modulePath: string,
   args: string[],
@@ -729,7 +701,7 @@ export function forkChild(
   };
 }
 
-// Same as forkChild but for worker_threads — posts "workerthread-request" with workerData/threadId
+// like forkChild but for worker_threads — posts "workerthread-request" with workerData/threadId
 function workerThreadFork(
   modulePath: string,
   opts: {
@@ -801,8 +773,7 @@ function workerThreadFork(
   };
 }
 
-// Spawns a child process via main thread. Resolves when child exits.
-// onStdout/onStderr fire in real-time as child-output messages arrive.
+// spawns a child via main thread, resolves when child exits — onStdout/onStderr fire in real time as child-output messages arrive
 export function spawnChild(
   command: string,
   args: string[],

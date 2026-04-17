@@ -1,5 +1,5 @@
-// Offload Worker entry point — runs transform/extract/build tasks in a dedicated thread.
-// Tar parser and base64 helpers are duplicated here since workers can't share module state.
+// offload worker entry — runs transform/extract/build tasks on a dedicated thread
+// tar parser and base64 helpers are duplicated since workers can't share module state
 
 import { expose } from "comlink";
 import type {
@@ -25,11 +25,29 @@ const ESBUILD_ESM_URL = CDN_ESBUILD_ESM;
 const ESBUILD_WASM_URL = CDN_ESBUILD_BINARY;
 const PAKO_URL = CDN_PAKO;
 
-// --- Base64 helpers (duplicated from helpers/byte-encoding.ts) ---
+// base64 helpers duplicated from helpers/byte-encoding.ts
 
 const SEGMENT_SIZE = 8192;
 
 function uint8ToBase64(data: Uint8Array): string {
+  // chunked btoa for >4MB to stay under browser limits
+  if (data.length > 4 * 1024 * 1024) {
+    const CHUNK = 3 * 1024 * 1024; // must be a multiple of 3 so base64 boundaries align
+    const parts: string[] = [];
+    for (let i = 0; i < data.length; i += CHUNK) {
+      const slice = data.subarray(i, Math.min(i + CHUNK, data.length));
+      let binary = "";
+      for (let j = 0; j < slice.length; j += SEGMENT_SIZE) {
+        binary += String.fromCharCode.apply(
+          null,
+          Array.from(slice.subarray(j, Math.min(j + SEGMENT_SIZE, slice.length))),
+        );
+      }
+      parts.push(btoa(binary));
+    }
+    // strip intermediate padding when joining — only the last chunk keeps it
+    return parts.map((p, i) => i < parts.length - 1 ? p.replace(/=+$/, "") : p).join("");
+  }
   const segments: string[] = [];
   for (let offset = 0; offset < data.length; offset += SEGMENT_SIZE) {
     segments.push(
@@ -42,17 +60,20 @@ function uint8ToBase64(data: Uint8Array): string {
   return btoa(segments.join(""));
 }
 
-// --- Tar parser (duplicated from packages/archive-extractor.ts) ---
+// tar parser duplicated from packages/archive-extractor.ts
 
 function readNullTerminated(
   buf: Uint8Array,
   start: number,
   len: number,
 ): string {
-  const slice = buf.slice(start, start + len);
-  const zeroPos = slice.indexOf(0);
-  const trimmed = zeroPos >= 0 ? slice.slice(0, zeroPos) : slice;
-  return new TextDecoder().decode(trimmed);
+  // TextDecoder rejects SAB-backed views, copy into a non-shared buffer first
+  const section = buf.subarray(start, start + len);
+  const zeroPos = section.indexOf(0);
+  const effLen = zeroPos >= 0 ? zeroPos : section.byteLength;
+  const copy = new Uint8Array(effLen);
+  copy.set(section.subarray(0, effLen));
+  return new TextDecoder().decode(copy);
 }
 
 function readOctalField(
@@ -125,8 +146,7 @@ function* parseTar(raw: Uint8Array): Generator<TarEntry> {
   }
 }
 
-// --- JSX detection (duplicated from module-transformer.ts) ---
-
+// JSX detection duplicated from module-transformer.ts
 function detectJsx(source: string): boolean {
   if (/<[A-Z][a-zA-Z0-9.]*[\s/>]/.test(source)) return true;
   if (/<\/[a-zA-Z]/.test(source)) return true;
@@ -137,16 +157,12 @@ function detectJsx(source: string): boolean {
   return false;
 }
 
-// --- Default define map for esbuild transforms ---
-
 const DEFAULT_DEFINE: Record<string, string> = {
   "import.meta.url": "import_meta.url",
   "import.meta.dirname": "import_meta.dirname",
   "import.meta.filename": "import_meta.filename",
   "import.meta": "import_meta",
 };
-
-// --- Worker endpoint ---
 
 const workerEndpoint: OffloadWorkerEndpoint = {
   async init(): Promise<void> {
@@ -203,7 +219,7 @@ const workerEndpoint: OffloadWorkerEndpoint = {
         ),
       };
     } catch (err: any) {
-      // Retry with fallback loaders
+      // retry with fallback loaders
       const fallbacks: string[] =
         loader === "js"
           ? ["jsx", "tsx", "ts"]
@@ -228,7 +244,7 @@ const workerEndpoint: OffloadWorkerEndpoint = {
         }
       }
 
-      // TLA: fall back to ESM format
+      // top-level await — retry as ESM
       if (err?.message?.includes("Top-level await")) {
         try {
           const output = await esbuildEngine.transform(task.source, {
@@ -246,7 +262,7 @@ const workerEndpoint: OffloadWorkerEndpoint = {
         }
       }
 
-      // All retries exhausted — return original source
+      // retries exhausted — return original source
       return {
         type: "transform" as const,
         id: task.id,
@@ -268,7 +284,7 @@ const workerEndpoint: OffloadWorkerEndpoint = {
 
     const compressed = new Uint8Array(await response.arrayBuffer());
 
-    // check sha1 against what the registry told us
+    // verify sha1 matches what the registry reported
     if (task.expectedShasum) {
       const hashBuffer = await crypto.subtle.digest("SHA-1", compressed);
       const hashHex = Array.from(new Uint8Array(hashBuffer))
@@ -296,17 +312,31 @@ const workerEndpoint: OffloadWorkerEndpoint = {
       }
 
       if (entry.kind === "file" && entry.payload) {
-        let data: string;
-        let isBinary = false;
         try {
-          data = new TextDecoder("utf-8", { fatal: true }).decode(
-            entry.payload,
-          );
-        } catch {
-          data = uint8ToBase64(entry.payload);
-          isBinary = true;
+          let data: string | Uint8Array;
+          let isBinary = false;
+          try {
+            // copy into a non-shared buffer before decoding, TextDecoder rejects SAB-backed views
+            const payload = entry.payload;
+            const decodable = (typeof SharedArrayBuffer !== "undefined" && payload.buffer instanceof SharedArrayBuffer)
+              ? (() => { const c = new Uint8Array(payload.byteLength); c.set(payload); return c; })()
+              : payload;
+            data = new TextDecoder("utf-8", { fatal: true }).decode(decodable);
+          } catch {
+            // >1MB binaries go over as raw Uint8Array via structured clone — base64 bloats memory and sometimes fails
+            if (entry.payload.length > 1024 * 1024) {
+              data = new Uint8Array(entry.payload);
+              isBinary = true;
+            } else {
+              data = uint8ToBase64(entry.payload);
+              isBinary = true;
+            }
+          }
+          files.push({ path: relative, data, isBinary });
+        } catch (fileErr) {
+          // don't fail the whole extraction for one bad file
+          console.warn(`[offload] Failed to encode ${relative} (${entry.payload.length} bytes):`, fileErr);
         }
-        files.push({ path: relative, data, isBinary });
       }
     }
 
@@ -362,10 +392,18 @@ const workerEndpoint: OffloadWorkerEndpoint = {
       });
 
       const outputFiles: BuildOutputFile[] = (result.outputFiles || []).map(
-        (f: any) => ({
-          path: f.path,
-          text: f.text || new TextDecoder().decode(f.contents),
-        }),
+        (f: any) => {
+          let text: string = f.text;
+          if (!text && f.contents) {
+            // handle SAB-backed Uint8Array defensively
+            const c: Uint8Array = f.contents;
+            const decodable = (typeof SharedArrayBuffer !== "undefined" && c.buffer instanceof SharedArrayBuffer)
+              ? (() => { const copy = new Uint8Array(c.byteLength); copy.set(c); return copy; })()
+              : c;
+            text = new TextDecoder().decode(decodable);
+          }
+          return { path: f.path, text };
+        },
       );
 
       return {

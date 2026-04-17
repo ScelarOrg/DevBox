@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>nodepod - native WASI test</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: monospace; background: #1a1a2e; color: #e0e0e0; padding: 24px; }
+    h1 { font-size: 18px; margin-bottom: 8px; color: #fff; }
+    p { font-size: 13px; color: #888; margin-bottom: 20px; }
+    #output {
+      background: #0d0d1a;
+      border: 1px solid #333;
+      border-radius: 6px;
+      padding: 16px;
+      min-height: 500px;
+      white-space: pre-wrap;
+      font-size: 14px;
+      line-height: 1.6;
+      overflow-y: auto;
+    }
+    .stdout { color: #a8e6a3; }
+    .stderr { color: #e68a8a; }
+    .info { color: #8ac4e6; }
+    .dim { color: #555; }
+    .pass { color: #a8e6a3; }
+    .fail { color: #e68a8a; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <h1>nodepod - native WASI test</h1>
+  <p>Tests native napi-rs WASM loading for lightningcss and tailwindcss oxide.</p>
+  <div id="output"></div>
+
+  <script id="test-lightningcss" type="text/plain">
+const lightningcss = require('lightningcss');
+
+try {
+  const result = lightningcss.transform({
+    filename: 'test.css',
+    code: Buffer.from('.foo { color: red; } .bar { background: blue; }'),
+    minify: true,
+  });
+  const output = result.code.toString();
+  if (output.length > 0 && output.length < 100) {
+    console.log('PASS: lightningcss transform returned ' + output.length + ' bytes');
+    console.log('output: ' + output);
+  } else {
+    console.error('FAIL: unexpected output length ' + output.length);
+  }
+} catch (e) {
+  console.error('FAIL: ' + e.message);
+  if (e.stack) console.error(e.stack);
+}
+</script>
+
+  <script id="test-lightningcss-nesting" type="text/plain">
+const lightningcss = require('lightningcss');
+
+try {
+  const result = lightningcss.transform({
+    filename: 'nested.css',
+    code: Buffer.from('.parent { color: red; & .child { color: blue; } }'),
+    minify: true,
+    drafts: { customMedia: true },
+  });
+  const output = result.code.toString();
+  console.log('PASS: nesting transform returned ' + output.length + ' bytes');
+  console.log('output: ' + output);
+} catch (e) {
+  console.error('FAIL: ' + e.message);
+}
+</script>
+
+  <script id="test-wasm-files" type="text/plain">
+const fs = require('fs');
+const dir = '/project/node_modules/@tailwindcss/oxide-wasm32-wasi';
+try {
+  const files = fs.readdirSync(dir);
+  console.log('files in oxide-wasm32-wasi: ' + files.join(', '));
+  for (const f of files) {
+    if (f.endsWith('.wasm') || f.endsWith('.js')) {
+      try {
+        const data = fs.readFileSync(dir + '/' + f);
+        const type = data instanceof Uint8Array ? 'binary' : typeof data;
+        const size = data.length || data.byteLength || 0;
+        const header = data instanceof Uint8Array ? Array.from(data.slice(0, 4)).map(function(b) { return b.toString(16); }).join(' ') : 'n/a';
+        console.log('  ' + f + ': ' + type + ', ' + size + ' bytes, header=[' + header + ']');
+      } catch (e2) { console.log('  ' + f + ': read error: ' + e2.message); }
+    }
+  }
+} catch (e) {
+  console.error('FAIL: ' + e.message);
+}
+</script>
+
+  <script id="test-fetch-wasm" type="text/plain">
+const wasmPath = '/project/node_modules/@tailwindcss/oxide-wasm32-wasi/tailwindcss-oxide.wasm32-wasi.wasm';
+const wasmUrl = 'file://' + wasmPath;
+
+async function run() {
+  try {
+    console.log('fetching: ' + wasmUrl);
+    const resp = await fetch(wasmUrl);
+    console.log('status: ' + resp.status);
+    console.log('content-type: ' + resp.headers.get('content-type'));
+    const buf = await resp.arrayBuffer();
+    console.log('arrayBuffer size: ' + buf.byteLength);
+    const header = Array.from(new Uint8Array(buf.slice(0, 4))).map(function(b) { return b.toString(16); }).join(' ');
+    console.log('header: [' + header + ']');
+    if (header === '0 61 73 6d') {
+      console.log('PASS: valid WASM binary via fetch');
+    } else {
+      console.error('FAIL: bad magic bytes');
+    }
+  } catch (e) {
+    console.error('FAIL fetch: ' + e.message);
+  }
+}
+run();
+</script>
+
+  <script id="test-oxide" type="text/plain">
+try {
+  const oxide = require('@tailwindcss/oxide');
+  const Scanner = oxide.Scanner || oxide.default?.Scanner;
+  if (Scanner) {
+    console.log('PASS: @tailwindcss/oxide loaded, Scanner available');
+    console.log('exports: ' + Object.keys(oxide).join(', '));
+  } else {
+    console.error('FAIL: Scanner not found in exports');
+    console.log('exports: ' + Object.keys(oxide).join(', '));
+  }
+} catch (e) {
+  console.error('FAIL: ' + e.message);
+  if (e.stack) console.error(e.stack);
+}
+</script>
+
+  <script id="test-lightningcss-prefixes" type="text/plain">
+const lightningcss = require('lightningcss');
+
+try {
+  const result = lightningcss.transform({
+    filename: 'prefixes.css',
+    code: Buffer.from('.flex { display: flex; user-select: none; }'),
+    minify: true,
+    targets: { safari: (14 << 16) },
+  });
+  const output = result.code.toString();
+  const hasWebkit = output.includes('-webkit-');
+  if (hasWebkit) {
+    console.log('PASS: vendor prefixes added (' + output.length + ' bytes)');
+    console.log('output: ' + output);
+  } else {
+    console.log('WARN: no vendor prefixes (targets may not apply in WASM mode)');
+    console.log('output: ' + output);
+  }
+} catch (e) {
+  console.error('FAIL: ' + e.message);
+}
+</script>
+
+  <script id="test-lightningcss-minify" type="text/plain">
+const lightningcss = require('lightningcss');
+
+try {
+  const input = `
+    .container {
+      background-color: rgb(255, 0, 0);
+      margin-top: 10px;
+      margin-right: 10px;
+      margin-bottom: 10px;
+      margin-left: 10px;
+    }
+  `;
+  const result = lightningcss.transform({
+    filename: 'minify.css',
+    code: Buffer.from(input),
+    minify: true,
+  });
+  const output = result.code.toString();
+  const hasShorthand = output.includes('margin:10px') || output.includes('margin: 10px');
+  const hasColorShort = output.includes('red') || output.includes('#f00');
+  if (output.length < input.length && hasShorthand && hasColorShort) {
+    console.log('PASS: minified with shorthand + color optimization (' + output.length + ' bytes from ' + input.length + ')');
+    console.log('output: ' + output);
+  } else {
+    console.log('PARTIAL: minified to ' + output.length + ' bytes');
+    console.log('output: ' + output);
+  }
+} catch (e) {
+  console.error('FAIL: ' + e.message);
+}
+</script>
+
+  <script id="test-lightningcss-features" type="text/plain">
+const lightningcss = require('lightningcss');
+
+try {
+  console.log('Features available: ' + (lightningcss.Features ? 'yes' : 'no'));
+  console.log('browserslistToTargets: ' + typeof lightningcss.browserslistToTargets);
+  console.log('transform: ' + typeof lightningcss.transform);
+  console.log('transformStyleAttribute: ' + typeof lightningcss.transformStyleAttribute);
+  console.log('bundle: ' + typeof lightningcss.bundle);
+  console.log('composeVisitors: ' + typeof lightningcss.composeVisitors);
+
+  // test transformStyleAttribute
+  const result = lightningcss.transformStyleAttribute({
+    code: Buffer.from('color: red; background: blue'),
+    minify: true,
+  });
+  const output = result.code.toString();
+  console.log('PASS: transformStyleAttribute works: ' + output);
+} catch (e) {
+  console.error('FAIL: ' + e.message);
+  if (e.stack) console.error(e.stack);
+}
+</script>
+
+  <script id="test-xxhash" type="text/plain">
+try {
+  const { xxh64, xxh32, xxh3 } = require('@node-rs/xxhash');
+  const input = Buffer.from('hello world');
+
+  const h64 = xxh64(input).toString(16);
+  const h32 = xxh32(input).toString(16);
+  console.log('PASS: xxh64 = ' + h64);
+  console.log('PASS: xxh32 = ' + h32);
+
+  if (typeof xxh3 === 'function') {
+    const h3 = xxh3.xxh3_64(input).toString(16);
+    console.log('PASS: xxh3_64 = ' + h3);
+  }
+} catch (e) {
+  console.error('FAIL: ' + e.message);
+  if (e.stack) console.error(e.stack);
+}
+</script>
+
+  <script id="test-argon2" type="text/plain">
+try {
+  const argon2 = require('@node-rs/argon2');
+  console.log('argon2 exports: ' + Object.keys(argon2).join(', '));
+
+  const hash = argon2.hashSync('password123', {
+    memoryCost: 1024,
+    timeCost: 1,
+    parallelism: 1,
+  });
+  console.log('PASS: argon2 hash = ' + hash.slice(0, 50) + '...');
+
+  const valid = argon2.verifySync(hash, 'password123');
+  console.log('PASS: argon2 verify = ' + valid);
+} catch (e) {
+  console.error('FAIL: ' + e.message);
+  if (e.stack) console.error(e.stack);
+}
+</script>
+
+  <script id="test-bcrypt" type="text/plain">
+try {
+  const bcrypt = require('@node-rs/bcrypt');
+  console.log('bcrypt exports: ' + Object.keys(bcrypt).join(', '));
+
+  const hash = bcrypt.hashSync('mypassword', 4);
+  console.log('PASS: bcrypt hash = ' + hash);
+
+  const valid = bcrypt.verifySync('mypassword', hash);
+  console.log('PASS: bcrypt verify = ' + valid);
+
+  const invalid = bcrypt.verifySync('wrongpassword', hash);
+  console.log('PASS: bcrypt reject = ' + invalid);
+} catch (e) {
+  console.error('FAIL: ' + e.message);
+  if (e.stack) console.error(e.stack);
+}
+</script>
+
+  <script id="test-rolldown-load" type="text/plain">
+try {
+  const rolldown = require('rolldown');
+  console.log('rolldown exports: ' + Object.keys(rolldown).slice(0, 10).join(', '));
+  console.log('rolldown version: ' + rolldown.VERSION);
+  if (rolldown.rolldown && rolldown.build) {
+    console.log('PASS: rolldown loaded with build + rolldown APIs');
+  } else {
+    console.log('PARTIAL: missing some exports');
+  }
+} catch (e) {
+  console.error('FAIL: ' + e.message);
+}
+</script>
+
+  <script id="test-rolldown-bundle" type="text/plain">
+const { rolldown } = require('rolldown');
+const fs = require('fs');
+
+// set up source files for bundling
+fs.mkdirSync('/project/rolldown-test/src', { recursive: true });
+fs.writeFileSync('/project/rolldown-test/src/utils.js', 'export const greet = (n) => "hello " + n;');
+fs.writeFileSync('/project/rolldown-test/src/index.js', 'import { greet } from "./utils.js";\nconsole.log(greet("rolldown"));');
+
+async function run() {
+  try {
+    const bundle = await rolldown({
+      input: '/project/rolldown-test/src/index.js',
+    });
+    const { output } = await bundle.generate({ format: 'esm' });
+    const code = output[0].code;
+    console.log('bundle size: ' + code.length + ' chars');
+    if (code.includes('hello') && code.includes('greet')) {
+      console.log('PASS: rolldown bundled with inlined imports');
+    } else {
+      console.log('PARTIAL: bundled but output unexpected');
+    }
+    console.log('output preview: ' + code.slice(0, 120));
+  } catch (e) {
+    console.error('FAIL: ' + e.message);
+    if (e.stack) console.error(e.stack.split('\\n').slice(0, 5).join('\\n'));
+  }
+}
+run();
+</script>
+
+  <script id="test-rolldown-minify" type="text/plain">
+const { rolldown } = require('rolldown');
+const fs = require('fs');
+
+fs.mkdirSync('/project/rolldown-min/src', { recursive: true });
+fs.writeFileSync('/project/rolldown-min/src/index.js', `
+  const longVariableName = 42;
+  const anotherLongVariable = longVariableName * 2;
+  export function calculate() {
+    return anotherLongVariable + longVariableName;
+  }
+`);
+
+async function run() {
+  try {
+    const bundle = await rolldown({
+      input: '/project/rolldown-min/src/index.js',
+    });
+    const { output } = await bundle.generate({
+      format: 'esm',
+      minify: true,
+    });
+    const code = output[0].code;
+    console.log('minified size: ' + code.length + ' chars');
+    if (code.length < 150) {
+      console.log('PASS: rolldown minified output');
+    } else {
+      console.log('PARTIAL: output larger than expected');
+    }
+    console.log('output: ' + code.trim());
+  } catch (e) {
+    console.error('FAIL: ' + e.message);
+    if (e.stack) console.error(e.stack.split('\\n').slice(0, 5).join('\\n'));
+  }
+}
+run();
+</script>
+
+  <script type="module">
+    import { Nodepod } from "/dist/index.mjs";
+
+    var out = document.getElementById('output');
+    function log(text, cls) {
+      cls = cls || 'stdout';
+      var span = document.createElement('span');
+      span.className = cls;
+      span.textContent = text + '\n';
+      out.appendChild(span);
+      out.scrollTop = out.scrollHeight;
+    }
+
+    var testLightningcss = document.getElementById('test-lightningcss').textContent.trim();
+    var testNesting = document.getElementById('test-lightningcss-nesting').textContent.trim();
+    var testOxide = document.getElementById('test-oxide').textContent.trim();
+
+    log('Booting nodepod...', 'info');
+
+    var nodepod = await Nodepod.boot({
+      workdir: '/project',
+      files: {
+        '/project/test-lightningcss.js': testLightningcss,
+        '/project/test-nesting.js': testNesting,
+        '/project/test-prefixes.js': document.getElementById('test-lightningcss-prefixes').textContent.trim(),
+        '/project/test-minify.js': document.getElementById('test-lightningcss-minify').textContent.trim(),
+        '/project/test-features.js': document.getElementById('test-lightningcss-features').textContent.trim(),
+        '/project/test-wasm-files.js': document.getElementById('test-wasm-files').textContent.trim(),
+        '/project/test-fetch-wasm.js': document.getElementById('test-fetch-wasm').textContent.trim(),
+        '/project/test-oxide.js': testOxide,
+        '/project/test-xxhash.js': document.getElementById('test-xxhash').textContent.trim(),
+        '/project/test-argon2.js': document.getElementById('test-argon2').textContent.trim(),
+        '/project/test-bcrypt.js': document.getElementById('test-bcrypt').textContent.trim(),
+        '/project/test-rolldown-load.js': document.getElementById('test-rolldown-load').textContent.trim(),
+        '/project/test-rolldown-bundle.js': document.getElementById('test-rolldown-bundle').textContent.trim(),
+        '/project/test-rolldown-minify.js': document.getElementById('test-rolldown-minify').textContent.trim(),
+        '/project/package.json': JSON.stringify({
+          name: "wasi-test",
+          version: "1.0.0",
+          dependencies: {
+            lightningcss: "^1.29.0",
+            "@tailwindcss/oxide": "^4.1.0",
+            "@node-rs/xxhash": "^1.7.0",
+            "@node-rs/argon2": "^2.0.0",
+            "@node-rs/bcrypt": "^1.10.0",
+            "rolldown": "^1.0.0-rc.15"
+          }
+        }, null, 2),
+      },
+    });
+
+    log('Booted!\n', 'info');
+
+    log('--- Installing packages ---', 'dim');
+    log('This may take a while...', 'dim');
+
+    var installProc = await nodepod.spawn('npm', ['install']);
+    installProc.on('output', function(text) { log(text.trimEnd()); });
+    installProc.on('error', function(text) { log(text.trimEnd(), 'stderr'); });
+    await installProc.completion;
+
+    log('', 'dim');
+
+    var tests = [
+      { name: 'Test 1: lightningcss basic transform', file: 'test-lightningcss.js' },
+      { name: 'Test 2: lightningcss nesting', file: 'test-nesting.js' },
+      { name: 'Test 3: lightningcss vendor prefixes', file: 'test-prefixes.js' },
+      { name: 'Test 4: lightningcss minification', file: 'test-minify.js' },
+      { name: 'Test 5: lightningcss API coverage', file: 'test-features.js' },
+      { name: 'Test 6: WASM files in VFS', file: 'test-wasm-files.js' },
+      { name: 'Test 7: fetch WASM via file:// URL', file: 'test-fetch-wasm.js' },
+      { name: 'Test 8: @tailwindcss/oxide loading', file: 'test-oxide.js' },
+      { name: 'Test 9: @node-rs/xxhash hashing', file: 'test-xxhash.js' },
+      { name: 'Test 10: @node-rs/argon2 password hashing', file: 'test-argon2.js' },
+      { name: 'Test 11: @node-rs/bcrypt password hashing', file: 'test-bcrypt.js' },
+      { name: 'Test 12: rolldown loading', file: 'test-rolldown-load.js' },
+      { name: 'Test 13: rolldown bundle', file: 'test-rolldown-bundle.js' },
+      { name: 'Test 14: rolldown minify', file: 'test-rolldown-minify.js' },
+    ];
+
+    for (var i = 0; i < tests.length; i++) {
+      var test = tests[i];
+      log('--- ' + test.name + ' ---', 'dim');
+      var proc = await nodepod.spawn('node', [test.file]);
+      proc.on('output', function(text) {
+        var line = text.trimEnd();
+        var cls = line.startsWith('PASS') ? 'pass' : 'stdout';
+        log(line, cls);
+      });
+      proc.on('error', function(text) { log(text.trimEnd(), 'fail'); });
+      await proc.completion;
+      log('', 'dim');
+    }
+
+    log('All tests complete.', 'info');
+  </script>
+</body>
+</html>

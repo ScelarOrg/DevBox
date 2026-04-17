@@ -171,6 +171,61 @@ export class MemoryVolume {
   private tree: VolumeNode;
   private textEncoder = new TextEncoder();
   private textDecoder = new TextDecoder();
+
+  // decode arbitrary input to UTF-8. handles Uint8Array (including SAB-backed
+  // which TextDecoder rejects directly), ArrayBuffer, other TypedArray views,
+  // and plain arrays from postMessage(Array.from(u8)). must never throw —
+  // broadcast calls this and a throw would hide writes from watchers
+  private decodeText(data: unknown): string {
+    try {
+      if (data == null) return "";
+      if (data instanceof Uint8Array) {
+        if (typeof SharedArrayBuffer !== "undefined" && data.buffer instanceof SharedArrayBuffer) {
+          const copy = new Uint8Array(data.byteLength);
+          copy.set(data);
+          return this.textDecoder.decode(copy);
+        }
+        return this.textDecoder.decode(data);
+      }
+      if (data instanceof ArrayBuffer) {
+        return this.textDecoder.decode(data);
+      }
+      if (ArrayBuffer.isView(data as any)) {
+        const view = data as ArrayBufferView;
+        const u8 = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+        if (typeof SharedArrayBuffer !== "undefined" && u8.buffer instanceof SharedArrayBuffer) {
+          const copy = new Uint8Array(u8.byteLength);
+          copy.set(u8);
+          return this.textDecoder.decode(copy);
+        }
+        return this.textDecoder.decode(u8);
+      }
+      if (Array.isArray(data) || (typeof (data as any).length === "number")) {
+        const u8 = Uint8Array.from(data as ArrayLike<number>);
+        return this.textDecoder.decode(u8);
+      }
+      return String(data);
+    } catch {
+      return "";
+    }
+  }
+
+  // normalize any input shape that can reach writeFileSync (string, Uint8Array,
+  // ArrayBuffer, TypedArray view, plain array) into a proper Uint8Array
+  private toBytes(data: unknown): Uint8Array {
+    if (typeof data === "string") return this.textEncoder.encode(data);
+    if (data == null) return new Uint8Array(0);
+    if (data instanceof Uint8Array) return data;
+    if (data instanceof ArrayBuffer) return new Uint8Array(data);
+    if (ArrayBuffer.isView(data as any)) {
+      const view = data as ArrayBufferView;
+      return new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+    }
+    if (Array.isArray(data) || typeof (data as any).length === "number") {
+      return Uint8Array.from(data as ArrayLike<number>);
+    }
+    return this.textEncoder.encode(String(data));
+  }
   private activeWatchers = new Map<string, Set<ActiveWatcher>>();
   private subscribers = new Map<string, Set<VolumeEventHandler>>();
   private _handler: MemoryHandler | null;
@@ -450,7 +505,7 @@ export class MemoryVolume {
   // ---- Internal write ----
 
   // expects pre-normalized path
-  private writeInternal(norm: string, data: string | Uint8Array, notify: boolean): void {
+  private writeInternal(norm: string, data: string | Uint8Array | unknown, notify: boolean): void {
     const lastSlash = norm.lastIndexOf('/');
     const parentPath = lastSlash <= 0 ? '/' : norm.slice(0, lastSlash);
     const name = norm.slice(lastSlash + 1);
@@ -461,7 +516,10 @@ export class MemoryVolume {
 
     const parent = this.ensureDir(parentPath);
     const existed = parent.children!.has(name);
-    const bytes = typeof data === 'string' ? this.textEncoder.encode(data) : data;
+    // callers may pass any buffer-ish shape (ArrayBuffer, TypedArray view, plain
+    // array from postMessage, Node Buffer). storing anything but a Uint8Array
+    // would break every downstream read
+    const bytes = this.toBytes(data);
 
     parent.children!.set(name, {
       kind: 'file',
@@ -473,7 +531,9 @@ export class MemoryVolume {
 
     if (notify) {
       this.triggerWatchers(norm, existed ? 'change' : 'rename');
-      this.broadcast('change', norm, typeof data === 'string' ? data : this.textDecoder.decode(data));
+      // pass the normalized Uint8Array so decodeText gets a real BufferSource —
+      // raw `data` would throw for plain arrays
+      this.broadcast('change', norm, typeof data === 'string' ? data : this.decodeText(bytes));
       this.notifyGlobalListeners(norm, existed ? 'change' : 'add');
     }
   }
@@ -586,12 +646,12 @@ export class MemoryVolume {
 
     const bytes = node.content || new Uint8Array(0);
     if (encoding === 'utf8' || encoding === 'utf-8') {
-      return this.textDecoder.decode(bytes);
+      return this.decodeText(bytes);
     }
     return bytes;
   }
 
-  writeFileSync(p: string, data: string | Uint8Array): void {
+  writeFileSync(p: string, data: string | Uint8Array | ArrayBuffer | ArrayBufferView | unknown): void {
     const norm = this.normalize(p);
     this.writeInternal(norm, data, true);
   }
@@ -664,6 +724,14 @@ export class MemoryVolume {
 
     parent.children!.delete(name);
     if (this._handler) this._handler.invalidateStat(norm);
+
+    // fire watchers so recursive `/`-watchers learn the directory is gone.
+    // without this, a worker's fs.rmSync() silently drops rmdir events — main
+    // thread's VFSBridge never sees the empty subdir and later renames into
+    // that location fail with ENOTEMPTY
+    this.triggerWatchers(norm, 'rename');
+    this.broadcast('delete', norm);
+    this.notifyGlobalListeners(norm, 'unlink');
   }
 
   renameSync(from: string, to: string): void {
@@ -680,13 +748,61 @@ export class MemoryVolume {
     const toParent = this.ensureDir(this.parentOf(normTo));
     const toName = this.nameOf(normTo);
 
+    // collect all descendant paths BEFORE the move so we can fire events for
+    // each child after. needed for directory renames (e.g. Vite's atomic move
+    // of `/.vite/deps_temp_XXX` → `/.vite/deps`) — otherwise watchers and
+    // cross-thread VFS sync never see that files moved
+    const descendantPairs: Array<{ oldPath: string; newPath: string; isDir: boolean }> = [];
+    if (node.kind === 'directory') {
+      const walk = (n: VolumeNode, oldBase: string, newBase: string) => {
+        if (n.kind !== 'directory' || !n.children) return;
+        for (const [childName, childNode] of n.children) {
+          const childOld = oldBase === '/' ? '/' + childName : oldBase + '/' + childName;
+          const childNew = newBase === '/' ? '/' + childName : newBase + '/' + childName;
+          descendantPairs.push({
+            oldPath: childOld,
+            newPath: childNew,
+            isDir: childNode.kind === 'directory',
+          });
+          if (childNode.kind === 'directory') walk(childNode, childOld, childNew);
+        }
+      };
+      walk(node, normFrom, normTo);
+    }
+
+    // if the target already exists, remove it first — matches POSIX rename
+    // semantics that Vite relies on for the deps_temp → deps commit
+    if (toParent.children!.has(toName)) {
+      toParent.children!.delete(toName);
+    }
     fromParent.children!.delete(fromName);
     toParent.children!.set(toName, node);
 
+    if (this._handler) {
+      this._handler.invalidateStat(normFrom);
+      this._handler.invalidateStat(normTo);
+      for (const pair of descendantPairs) {
+        this._handler.invalidateStat(pair.oldPath);
+        this._handler.invalidateStat(pair.newPath);
+      }
+    }
+
+    // fire watcher + global-listener events for the top-level move
     this.triggerWatchers(normFrom, 'rename');
     this.triggerWatchers(normTo, 'rename');
     this.notifyGlobalListeners(normFrom, 'unlink');
     this.notifyGlobalListeners(normTo, 'add');
+
+    // fire events for every descendant so recursive watchers (the worker→main
+    // vfs-sync handler, HMR watchers, etc.) see every moved path. without this,
+    // Vite's atomic commit `deps_temp_XXX` → `deps` is invisible to the main
+    // thread's VFS and all bundled dep files stay at the old path
+    for (const pair of descendantPairs) {
+      this.triggerWatchers(pair.oldPath, 'rename');
+      this.triggerWatchers(pair.newPath, 'rename');
+      this.notifyGlobalListeners(pair.oldPath, 'unlink');
+      this.notifyGlobalListeners(pair.newPath, 'add');
+    }
   }
 
   accessSync(p: string, _mode?: number): void {
@@ -766,14 +882,14 @@ export class MemoryVolume {
     if (!this.locate(norm)) throw makeSystemError('ENOENT', 'chown', _p);
   }
 
-  appendFileSync(p: string, data: string | Uint8Array): void {
+  appendFileSync(p: string, data: string | Uint8Array | unknown): void {
     const norm = this.normalize(p);
     let existing: Uint8Array = new Uint8Array(0);
     const node = this.locate(norm);
     if (node && node.kind === 'file') {
       existing = node.content || new Uint8Array(0);
     }
-    const bytes = typeof data === 'string' ? this.textEncoder.encode(data) : data;
+    const bytes = this.toBytes(data);
     const combined = new Uint8Array(existing.length + bytes.length);
     combined.set(existing);
     combined.set(bytes, existing.length);

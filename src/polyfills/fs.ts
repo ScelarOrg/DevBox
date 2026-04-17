@@ -1330,12 +1330,74 @@ export function buildFileSystemBridge(
       if (enc === "utf8" || enc === "utf-8") {
         return volume.readFileSync(p, "utf8");
       }
-      const raw = volume.readFileSync(p);
-      if (p.endsWith(".wasm")) precompileWasm(raw);
-      return wrapAsBuffer(raw);
+      try {
+        const raw = volume.readFileSync(p);
+        if (p.endsWith(".wasm")) precompileWasm(raw);
+        return wrapAsBuffer(raw);
+      } catch (err: any) {
+        // fall back to CDN for .wasm in node_modules that failed to extract (e.g. >15MB), script engine handles >4MB async compile
+        if (
+          err?.code === "ENOENT" &&
+          p.endsWith(".wasm") &&
+          p.includes("/node_modules/") &&
+          typeof XMLHttpRequest !== "undefined"
+        ) {
+          const nmIdx = p.lastIndexOf("/node_modules/");
+          const afterNm = p.substring(nmIdx + "/node_modules/".length);
+          const parts = afterNm.split("/");
+          let pkgName: string;
+          let filePath: string;
+          if (parts[0].startsWith("@")) {
+            pkgName = parts[0] + "/" + parts[1];
+            filePath = parts.slice(2).join("/");
+          } else {
+            pkgName = parts[0];
+            filePath = parts.slice(1).join("/");
+          }
+          let version = "latest";
+          try {
+            const pkgJsonPath = p.substring(0, nmIdx + "/node_modules/".length) + pkgName + "/package.json";
+            const pkgJson = JSON.parse(volume.readFileSync(pkgJsonPath, "utf8"));
+            if (pkgJson.version) version = pkgJson.version;
+          } catch { /* use latest */ }
+          const cdnUrl = `https://cdn.jsdelivr.net/npm/${pkgName}@${version}/${filePath}`;
+          try {
+            const xhr = new XMLHttpRequest();
+            xhr.open("GET", cdnUrl, false); // synchronous
+            xhr.responseType = "arraybuffer";
+            xhr.send();
+            if (xhr.status === 200 && xhr.response) {
+              const bytes = new Uint8Array(xhr.response as ArrayBuffer);
+              // cache in VFS so subsequent reads hit it
+              volume.writeFileSync(p, bytes);
+              precompileWasm(bytes);
+              return wrapAsBuffer(bytes);
+            }
+          } catch { /* CDN fallback failed, rethrow original */ }
+        }
+        throw err;
+      }
     },
 
-    writeFileSync(target: unknown, data: string | Uint8Array): void {
+    writeFileSync(target: unknown, data: string | Uint8Array | ArrayBuffer | ArrayBufferView | unknown): void {
+      // normalize binary once, napi-rs WASM packages pass ArrayBuffer/TypedArray/Buffer/plain arrays (postMessage via Array.from)
+      // otherwise precompileWasm throws and the volume stores non-Uint8Array content
+      let normalized: string | Uint8Array;
+      if (typeof data === "string") {
+        normalized = data;
+      } else if (data instanceof Uint8Array) {
+        normalized = data;
+      } else if (data instanceof ArrayBuffer) {
+        normalized = new Uint8Array(data);
+      } else if (data && ArrayBuffer.isView(data as any)) {
+        const view = data as ArrayBufferView;
+        normalized = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+      } else if (Array.isArray(data) || (data && typeof (data as any).length === "number")) {
+        normalized = Uint8Array.from(data as ArrayLike<number>);
+      } else {
+        normalized = new Uint8Array(0);
+      }
+
       if (typeof target === "number") {
         const entry = openFiles.get(target);
         if (!entry) {
@@ -1346,15 +1408,15 @@ export function buildFileSystemBridge(
           err.errno = -9;
           throw err;
         }
-        const bytes = typeof data === "string" ? encoder.encode(data) : data;
+        const bytes = typeof normalized === "string" ? encoder.encode(normalized) : normalized;
         entry.data = new Uint8Array(bytes);
         entry.cursor = bytes.length;
         return;
       }
       const wp = abs(target);
-      volume.writeFileSync(wp, data);
-      if (wp.endsWith(".wasm") && typeof data !== "string") {
-        precompileWasm(data);
+      volume.writeFileSync(wp, normalized);
+      if (wp.endsWith(".wasm") && typeof normalized !== "string") {
+        precompileWasm(normalized);
       }
     },
 

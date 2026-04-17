@@ -155,12 +155,19 @@ export class ExitStatus extends Error {
 /* ------------------------------------------------------------------ */
 /*  syscall wrapper                                                    */
 /* ---------------------------------------------------------------- */
+let _wasiSyscallErrorLogged = false;
 function syscall(target: Function): Function {
   return function (this: unknown, ...args: unknown[]): number {
     try {
       return target.apply(this, args);
     } catch (err: any) {
       if (err instanceof ExitStatus) throw err;
+      // log the first syscall error to help debug WASM trap issues
+      if (!_wasiSyscallErrorLogged && err?.message?.includes("Memory not available")) {
+        _wasiSyscallErrorLogged = true;
+        console.error("[WASI] Syscall failed — memory not available:", err.message);
+        throw err; // don't swallow memory errors, they cause unreachable traps
+      }
       // map common fs errors to WASI errno
       const code = err?.code;
       if (code === "ENOENT") return ERRNO_NOENT;
@@ -169,6 +176,10 @@ function syscall(target: Function): Function {
       if (code === "ENOTDIR") return ERRNO_NOTDIR;
       if (code === "ENOTEMPTY") return ERRNO_NOTEMPTY;
       if (code === "EACCES" || code === "EPERM") return ERRNO_ACCES;
+      if (!_wasiSyscallErrorLogged) {
+        _wasiSyscallErrorLogged = true;
+        console.error("[WASI] First syscall error:", err?.message || err, "code:", code);
+      }
       return ERRNO_IO;
     }
   };
@@ -199,6 +210,24 @@ function normalizePath(p: string): string {
 /*  Text encoder / decoder (cached)*/
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
+
+// TextDecoder.decode() rejects SharedArrayBuffer views ("The provided ArrayBufferView value must not be shared.")
+// threaded WASM (wasm32-wasip1-threads, emnapi) uses SharedArrayBuffer memory, so copy before decoding
+const decodeFromMemory = (
+  buffer: ArrayBufferLike,
+  ptr: number,
+  len: number,
+): string => {
+  if (len === 0) return "";
+  const src = new Uint8Array(buffer, ptr, len);
+  if (typeof SharedArrayBuffer !== "undefined" && buffer instanceof SharedArrayBuffer) {
+    // copy into regular ArrayBuffer, TextDecoder accepts that
+    const copy = new Uint8Array(len);
+    copy.set(src);
+    return decoder.decode(copy);
+  }
+  return decoder.decode(src);
+};
 
 /*  WASI class (matches Nodejs `wasi` module API) */
 
@@ -276,10 +305,12 @@ export const WASI = function WASI(this: any, options?: WASIOptions) {
   const getMemory = (): WebAssembly.Memory => {
     if (memory) return memory;
     if (instance) {
-      memory = instance.exports.memory as WebAssembly.Memory;
+      memory = (instance as any).exports?.memory as WebAssembly.Memory;
       if (memory) return memory;
     }
-    throw new Error("WASI: WebAssembly.Memory not available");
+    // napi-rs imports memory instead of exporting it, must be set via initialize() or setMemory() before any syscall
+    console.error("[WASI] Memory not available — initialize() may not have been called yet");
+    throw new Error("WASI: WebAssembly.Memory not available — call initialize() or setMemory() first");
   };
 
   const view = () => new DataView(getMemory().buffer);
@@ -302,7 +333,7 @@ export const WASI = function WASI(this: any, options?: WASIOptions) {
   /* helpers */
 
   const readString = (ptr: number, len: number): string => {
-    return decoder.decode(new Uint8Array(getMemory().buffer, ptr, len));
+    return decodeFromMemory(getMemory().buffer, ptr, len);
   };
 
   const writeString = (ptr: number, str: string): number => {
@@ -873,8 +904,7 @@ export const WASI = function WASI(this: any, options?: WASIOptions) {
           for (let i = 0; i < iovs_len; i++) {
             const bufPtr = dv.getUint32(iovs_ptr + i * 8, true);
             const bufLen = dv.getUint32(iovs_ptr + i * 8 + 4, true);
-            const data = new Uint8Array(getMemory().buffer, bufPtr, bufLen);
-            const text = decoder.decode(data);
+            const text = decodeFromMemory(getMemory().buffer, bufPtr, bufLen);
             if (entry.kind === FdKind.Stdout) {
               stdoutBuf += text;
               stdoutBuf = flushLine(1, stdoutBuf);
@@ -1235,8 +1265,16 @@ export const WASI = function WASI(this: any, options?: WASIOptions) {
     }),
 
     random_get: syscall((buf_ptr: number, buf_len: number): number => {
-      const slice = new Uint8Array(getMemory().buffer, buf_ptr, buf_len);
-      crypto.getRandomValues(slice);
+      const mem = getMemory();
+      if (mem.buffer instanceof SharedArrayBuffer) {
+        // crypto.getRandomValues() rejects SharedArrayBuffer views (Web Crypto spec), generate into tmp then copy
+        const tmp = new Uint8Array(buf_len);
+        crypto.getRandomValues(tmp);
+        new Uint8Array(mem.buffer).set(tmp, buf_ptr);
+      } else {
+        const slice = new Uint8Array(mem.buffer, buf_ptr, buf_len);
+        crypto.getRandomValues(slice);
+      }
       return ERRNO_SUCCESS;
     }),
 
@@ -1253,7 +1291,8 @@ export const WASI = function WASI(this: any, options?: WASIOptions) {
 
   self.start = function start(wasmInstance: any): number {
     instance = wasmInstance;
-    memory = wasmInstance.exports.memory as WebAssembly.Memory;
+    // memory can come from exports or be pre-set via imports (napi-rs --import-memory)
+    memory = wasmInstance.exports.memory as WebAssembly.Memory ?? memory;
 
     const _start = wasmInstance.exports._start;
     if (typeof _start !== "function") {
@@ -1284,12 +1323,26 @@ export const WASI = function WASI(this: any, options?: WASIOptions) {
 
   self.initialize = function initialize(wasmInstance: any): void {
     instance = wasmInstance;
-    memory = wasmInstance.exports.memory as WebAssembly.Memory;
-
-    const _initialize = wasmInstance.exports._initialize;
-    if (typeof _initialize === "function") {
-      _initialize();
+    // memory can come from exports (normal) or imports (napi-rs --import-memory), emnapi may add it to exports even for imported memory
+    const exportedMemory = wasmInstance?.exports?.memory as WebAssembly.Memory | undefined;
+    if (exportedMemory) {
+      memory = exportedMemory;
     }
+
+    const _initialize = wasmInstance?.exports?._initialize;
+    if (typeof _initialize === "function") {
+      try {
+        _initialize();
+      } catch (err: any) {
+        console.error("[WASI] _initialize() failed:", err?.message || err);
+        throw err;
+      }
+    }
+  };
+
+  // lets emnapi set memory before instantiation, the .wasi.cjs loader creates SharedArrayBuffer memory and passes it via importObject.env.memory
+  self.setMemory = function setMemory(mem: WebAssembly.Memory): void {
+    memory = mem;
   };
 
   self.getImportObject = function getImportObject(): Record<

@@ -1,5 +1,5 @@
-// WorkerVFS — worker-side filesystem proxy.
-// Reads are instant (local Map). Writes go to both local store + main thread.
+// worker-side filesystem proxy
+// reads are instant from a local Map, writes go to both the local store and main thread
 
 import type { VFSBinarySnapshot, VFSSnapshotEntry } from "./worker-protocol";
 
@@ -45,6 +45,12 @@ export class WorkerVFS {
       throw err;
     }
     if (encoding === "utf8" || encoding === "utf-8") {
+      // defensive copy — TextDecoder rejects SAB-backed views, snapshots usually come via postMessage (non-shared) but worker VFS can be initialized from shared memory in some paths
+      if (typeof SharedArrayBuffer !== "undefined" && data.buffer instanceof SharedArrayBuffer) {
+        const copy = new Uint8Array(data.byteLength);
+        copy.set(data);
+        return this._decoder.decode(copy);
+      }
       return this._decoder.decode(data);
     }
     return new Uint8Array(data);

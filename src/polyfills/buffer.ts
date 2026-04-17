@@ -17,14 +17,9 @@ class BufferPolyfill extends Uint8Array {
   static readonly BYTES_PER_ELEMENT = 1;
 
   // Overloads matching Node.js Buffer.from
-  static from(source: ArrayLike<number>): BufferPolyfill;
-  static from<T>(source: ArrayLike<T>, mapper: (v: T, i: number) => number, ctx?: unknown): BufferPolyfill;
-  static from(source: string, enc?: string): BufferPolyfill;
-  static from(source: ArrayBuffer | Uint8Array): BufferPolyfill;
-  static from(source: Iterable<number>): BufferPolyfill;
   static from(
-    source: string | ArrayBuffer | Uint8Array | number[] | ArrayLike<number> | Iterable<number>,
-    encOrMapper?: string | ((v: unknown, i: number) => number),
+    source: string | ArrayBuffer | SharedArrayBuffer | Uint8Array | number[] | ArrayLike<number> | Iterable<number>,
+    encOrMapper?: string | number | ((v: unknown, i: number) => number),
     ctx?: unknown
   ): BufferPolyfill {
     // Handle typed-array style mapper
@@ -71,8 +66,14 @@ class BufferPolyfill extends Uint8Array {
       return new BufferPolyfill(textEnc.encode(source));
     }
 
-    if (source instanceof ArrayBuffer) {
-      return new BufferPolyfill(source);
+    if (source instanceof ArrayBuffer || (typeof SharedArrayBuffer !== 'undefined' && source instanceof SharedArrayBuffer)) {
+      // napi-rs uses Buffer.from(arrayBuffer, byteOffset, length) to view WebAssembly.Memory.buffer
+      if (typeof encOrMapper === 'number') {
+        const offset = encOrMapper;
+        const length = ctx as number | undefined;
+        return new BufferPolyfill(source as ArrayBuffer, offset, length);
+      }
+      return new BufferPolyfill(source as ArrayBuffer);
     }
 
     return new BufferPolyfill(source as Uint8Array);
@@ -142,6 +143,12 @@ class BufferPolyfill extends Uint8Array {
 
     if (lower === 'latin1' || lower === 'binary') return bytesToLatin1(this);
 
+    // copy into fresh buffer, TextDecoder.decode() rejects SharedArrayBuffer views (napi-rs/WASI over shared memory)
+    if (typeof SharedArrayBuffer !== "undefined" && this.buffer instanceof SharedArrayBuffer) {
+      const copy = new Uint8Array(this.byteLength);
+      copy.set(this);
+      return textDec.decode(copy);
+    }
     return textDec.decode(this);
   }
 

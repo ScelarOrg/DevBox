@@ -1,25 +1,17 @@
-// VFSBridge — syncs the canonical MemoryVolume with worker VFS clones.
-// Creates snapshots for initialization, applies worker writes, broadcasts changes.
+// syncs the canonical MemoryVolume with worker VFS clones
+// creates snapshots for init, applies worker writes, broadcasts changes
 
 import type { MemoryVolume } from "../memory-volume";
 import type { VFSBinarySnapshot, VFSSnapshotEntry } from "./worker-protocol";
 import type { SharedVFSController } from "./shared-vfs";
 
-/* ------------------------------------------------------------------ */
-/*  Constants                                                          */
-/* ------------------------------------------------------------------ */
-
 const VFS_CHUNK_SIZE = 4 * 1024 * 1024; // 4MB
-
-/* ------------------------------------------------------------------ */
-/*  VFSBridge                                                          */
-/* ------------------------------------------------------------------ */
 
 export class VFSBridge {
   private _volume: MemoryVolume;
   private _broadcaster: ((path: string, content: ArrayBuffer | null, excludePid: number) => void) | null = null;
   private _sharedVFS: SharedVFSController | null = null;
-  // Suppressed during handleWorkerWrite/Mkdir/Delete to prevent double-broadcasting
+  // suppressed during handleWorkerWrite/Mkdir/Delete to prevent double-broadcasting
   private _suppressWatch = false;
 
   constructor(volume: MemoryVolume) {
@@ -34,7 +26,7 @@ export class VFSBridge {
     this._sharedVFS = controller;
   }
 
-  // Packs all files into a single ArrayBuffer with a manifest
+  // packs all files into one ArrayBuffer plus a manifest
   createSnapshot(): VFSBinarySnapshot {
     const manifest: VFSSnapshotEntry[] = [];
     const chunks: Uint8Array[] = [];
@@ -71,7 +63,7 @@ export class VFSBridge {
     return { manifest, data };
   }
 
-  // Split into chunks for large transfers
+  // split into chunks for large transfers
   createChunkedSnapshots(): { chunkIndex: number; totalChunks: number; data: ArrayBuffer; manifest: VFSSnapshotEntry[] }[] {
     const fullSnapshot = this.createSnapshot();
     const totalSize = fullSnapshot.data.byteLength;
@@ -102,10 +94,14 @@ export class VFSBridge {
         offset: entry.isDirectory ? 0 : entry.offset - currentOffset,
       }));
 
+      // defensive copy — fullSnapshot.data is a plain ArrayBuffer today, but this keeps chunks transferable if the source ever becomes SAB-backed
+      const chunkBuffer = new ArrayBuffer(chunkData.byteLength);
+      new Uint8Array(chunkBuffer).set(chunkData);
+
       chunks.push({
         chunkIndex: i,
         totalChunks,
-        data: chunkData.buffer.slice(chunkData.byteOffset, chunkData.byteOffset + chunkData.byteLength),
+        data: chunkBuffer,
         manifest: chunkManifest,
       });
 
@@ -152,7 +148,9 @@ export class VFSBridge {
         if (this._volume.existsSync(path)) {
           const stat = this._volume.statSync(path);
           if (stat.isDirectory()) {
-            this._volume.rmdirSync(path);
+            // recursive delete matching Node's fs.rmSync({ recursive: true })
+            // workers may emit vfs-delete out of order (a rename's "from" fires before descendants are cleaned) or skip intermediate subdirs entirely — if the dir is still on main when a delete arrives, nuke it and everything under it
+            this._rmTree(path);
           } else {
             this._volume.unlinkSync(path);
           }
@@ -168,13 +166,42 @@ export class VFSBridge {
     }
   }
 
+  // recursively remove a directory tree, mirroring fs.rmSync({ recursive: true })
+  private _rmTree(path: string): void {
+    let entries: string[] = [];
+    try {
+      entries = this._volume.readdirSync(path);
+    } catch {
+      // path already gone, or not a directory
+    }
+    for (const name of entries) {
+      const child = path.endsWith("/") ? path + name : path + "/" + name;
+      try {
+        const childStat = this._volume.statSync(child);
+        if (childStat.isDirectory()) {
+          this._rmTree(child);
+        } else {
+          this._volume.unlinkSync(child);
+        }
+      } catch {
+        // ignore per-entry errors, still try to remove the parent
+      }
+    }
+    try {
+      this._volume.rmdirSync(path);
+    } catch (e) {
+      // only re-throw if the directory is still there, otherwise it's a benign race
+      if (this._volume.existsSync(path)) throw e;
+    }
+  }
+
   broadcastChange(path: string, content: ArrayBuffer | null, excludePid: number): void {
     if (this._broadcaster) {
       this._broadcaster(path, content, excludePid);
     }
   }
 
-  // Watches canonical volume for changes and pushes to workers. Returns unsubscribe fn.
+  // watch the canonical volume and push changes to workers, returns unsubscribe fn
   watch(): () => void {
     const handle = this._volume.watch("/", { recursive: true }, (event, filename) => {
       if (!filename || this._suppressWatch) return;
@@ -187,7 +214,9 @@ export class VFSBridge {
             if (this._sharedVFS) this._sharedVFS.writeDirectory(filename);
           } else {
             const data = this._volume.readFileSync(filename);
-            const buffer = (data.buffer as ArrayBuffer).slice(data.byteOffset, data.byteOffset + data.byteLength);
+            // fresh ArrayBuffer copy — VFS nodes may store SAB-backed Uint8Arrays when written from WASM threads, and SAB isn't transferable via postMessage
+            const buffer = new ArrayBuffer(data.byteLength);
+            new Uint8Array(buffer).set(data);
             this.broadcastChange(filename, buffer, -1);
             if (this._sharedVFS) this._sharedVFS.writeFile(filename, data);
           }

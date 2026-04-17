@@ -383,9 +383,28 @@ async function walkDependency(
       } else {
         // Always include wasm32-wasi optional deps — they're WASM alternatives
         // to native bindings and are the only variant that can run in-browser
+        const optNames = Object.keys(versionInfo.optionalDependencies);
+        let hasWasmVariant = false;
         for (const [optName, optRange] of Object.entries(versionInfo.optionalDependencies)) {
-          if (optName.includes("wasm32-wasi")) {
+          if (optName.includes("wasm32-wasi") || optName.includes("wasm")) {
             edges[optName] = optRange as string;
+            hasWasmVariant = true;
+          }
+        }
+
+        // generic napi-rs detection: if ALL optional deps are platform-specific
+        // native bindings (contain OS/arch tags) but no WASM variant exists, try
+        // {pkg}-wasm32-wasi and {pkg}-wasm as alternatives. covers packages like
+        // lightningcss that ship a separate -wasm package. errors are swallowed
+        // since these may not exist on the registry
+        if (!hasWasmVariant && optNames.length >= 2) {
+          const platformRe = /-(darwin|linux|win32|freebsd|android|sunos)-(x64|x86|arm64|arm|ia32|s390x|ppc64|mips|riscv)/;
+          const allPlatform = optNames.every(n => platformRe.test(n));
+          if (allPlatform) {
+            const wasmAltsToTry = [installName + "-wasm32-wasi", installName + "-wasm"];
+            await Promise.all(wasmAltsToTry.map(async (alt) => {
+              try { await walkDependency(alt, "*", state); } catch { /* package may not exist */ }
+            }));
           }
         }
       }

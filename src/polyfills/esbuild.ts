@@ -408,7 +408,18 @@ function locateModule(
     }
   }
   searchRoots.push("/node_modules/" + pkgName);
-  searchRoots.push("/project/node_modules/" + pkgName);
+  // also walk from cwd, handles projects outside /project/ (e.g. /home/test/)
+  const cwd = typeof process !== 'undefined' && process.cwd ? process.cwd() : '/';
+  if (cwd !== '/' && cwd !== fromDir) {
+    let d = cwd;
+    while (d !== '/' && d) {
+      const c = d + '/node_modules/' + pkgName;
+      if (!searchRoots.includes(c)) searchRoots.push(c);
+      const p = d.substring(0, d.lastIndexOf('/')) || '/';
+      if (p === d) break;
+      d = p;
+    }
+  }
 
   let base: string | null = null;
   for (const candidate of searchRoots) {
@@ -687,7 +698,18 @@ function createVolumePlugin(externals?: string[], platform?: string, conditions?
               }
             }
             candidates.push("/node_modules/" + pkgName);
-            candidates.push("/project/node_modules/" + pkgName);
+            // also walk from cwd, for projects outside /project/
+            const cwd2 = typeof process !== 'undefined' && process.cwd ? process.cwd() : '/';
+            if (cwd2 !== '/') {
+              let d2 = cwd2;
+              while (d2 !== '/' && d2) {
+                const c2 = d2 + '/node_modules/' + pkgName;
+                if (!candidates.includes(c2)) candidates.push(c2);
+                const p2 = d2.substring(0, d2.lastIndexOf('/')) || '/';
+                if (p2 === d2) break;
+                d2 = p2;
+              }
+            }
             let isNative = false;
             for (const candidate of candidates) {
               if (!vol.existsSync(candidate)) continue;

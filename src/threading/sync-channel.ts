@@ -1,19 +1,17 @@
-// SyncChannel — true blocking execSync/spawnSync via SharedArrayBuffer + Atomics.
-// Worker allocates a slot, posts spawn-sync, blocks on Atomics.wait().
-// Main thread runs the child, writes result to the slot, calls Atomics.notify().
+// real blocking execSync/spawnSync via SharedArrayBuffer + Atomics
+// worker allocates a slot, posts spawn-sync, blocks on Atomics.wait()
+// main thread runs the child, writes result to the slot, calls Atomics.notify()
 
 import { isSharedArrayBufferAvailable } from "./shared-vfs";
 
-// --- Shared memory layout ---
-//
-// Per-slot (16KB = 4096 Int32s):
+// shared memory layout
+// per-slot (16KB = 4096 Int32s):
 //   [0] status (0=pending, 1=complete, 2=error)
 //   [1] exit code
 //   [2] stdout byte length
 //   [3..4095] stdout data
-//
-// Last Int32 at MAX_SLOTS * SLOT_SIZE is the atomic allocation counter.
-export const SLOT_SIZE = 4096; // 4096 Int32 values = 16KB per slot
+// last Int32 at MAX_SLOTS * SLOT_SIZE is the atomic allocation counter
+export const SLOT_SIZE = 4096; // 4096 Int32s = 16KB per slot
 export const MAX_SLOTS = 64;
 const STATUS_PENDING = 0;
 const STATUS_COMPLETE = 1;
@@ -22,7 +20,7 @@ const STATUS_ERROR = 2;
 const DEFAULT_SYNC_BUFFER_SIZE = MAX_SLOTS * SLOT_SIZE * 4 + 4; // ~1MB
 const COUNTER_INDEX = MAX_SLOTS * SLOT_SIZE;
 
-// --- SyncChannelController (main thread) ---
+// main thread side
 export class SyncChannelController {
   private _buffer: SharedArrayBuffer;
   private _int32: Int32Array;
@@ -62,7 +60,7 @@ export class SyncChannelController {
     const dataOffset = (base + 3) * 4;
     this._uint8.set(stdoutBytes.subarray(0, truncatedLen), dataOffset);
 
-    // Must be last — wakes the waiting worker
+    // last store wakes the waiting worker
     Atomics.store(this._int32, base, STATUS_COMPLETE);
     Atomics.notify(this._int32, base);
   }
@@ -86,7 +84,7 @@ export class SyncChannelController {
   }
 }
 
-// --- SyncChannelWorker (worker thread) ---
+// worker thread side
 export class SyncChannelWorker {
   private _int32: Int32Array;
   private _uint8: Uint8Array;
@@ -96,7 +94,7 @@ export class SyncChannelWorker {
     this._uint8 = new Uint8Array(buffer);
   }
 
-  // Atomic counter prevents slot collisions across workers
+  // atomic counter stops slot collisions across workers
   allocateSlot(): number {
     const raw = Atomics.add(this._int32, COUNTER_INDEX, 1);
     const slot = raw % MAX_SLOTS;
@@ -104,7 +102,7 @@ export class SyncChannelWorker {
     return slot;
   }
 
-  // Blocks the worker thread until main writes the result
+  // blocks the worker until main writes the result
   waitForResult(syncSlot: number, timeoutMs: number = 120_000): { exitCode: number; stdout: string } {
     const base = syncSlot * SLOT_SIZE;
 
@@ -118,10 +116,13 @@ export class SyncChannelWorker {
     const exitCode = Atomics.load(this._int32, base + 1);
     const stdoutLen = Atomics.load(this._int32, base + 2);
 
+    // TextDecoder rejects SAB-backed views — copy the slice into a non-shared buffer first
+    // Uint8Array.slice should do this per spec but engines have had bugs, be explicit
     const decoder = new TextDecoder();
     const dataOffset = (base + 3) * 4;
-    const stdoutBytes = this._uint8.slice(dataOffset, dataOffset + stdoutLen);
-    const stdout = decoder.decode(stdoutBytes);
+    const stdoutCopy = new Uint8Array(stdoutLen);
+    stdoutCopy.set(this._uint8.subarray(dataOffset, dataOffset + stdoutLen));
+    const stdout = decoder.decode(stdoutCopy);
 
     if (status === STATUS_ERROR) {
       const err = new Error(`Command failed with exit code ${exitCode}\n${stdout}`);
