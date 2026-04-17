@@ -15,6 +15,12 @@ const peerDeps = Object.keys(pkg.peerDependencies || {});
 const allExternal = [
   ...peerDeps,
   /^node:/,
+  // Framework integrations: keep these external so users' own copies are
+  // used and rollup doesn't choke on `next/server` when `next` isn't
+  // installed locally.
+  "vite",
+  "next",
+  "next/server",
 ];
 
 /**
@@ -67,6 +73,15 @@ export default defineConfig({
     lib: {
       entry: {
         index: resolve(__dirname, "src/index.ts"),
+        // Each framework integration is its own subpath export (see
+        // package.json `exports`). Slashes in the key push the output
+        // under dist/integrations/*.
+        "integrations/server": resolve(
+          __dirname,
+          "src/integrations/server.ts",
+        ),
+        "integrations/vite": resolve(__dirname, "src/integrations/vite.ts"),
+        "integrations/next": resolve(__dirname, "src/integrations/next.ts"),
       },
       formats: ["es", "cjs"],
       fileName: (format, entryName) => {

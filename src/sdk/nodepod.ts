@@ -3,6 +3,7 @@ import { DependencyInstaller } from "../packages/installer";
 import {
   RequestProxy,
   getProxyInstance,
+  NodepodSWSetupError,
   type IVirtualServer,
 } from "../request-proxy";
 import type { VolumeSnapshot } from "../engine-types";
@@ -206,19 +207,36 @@ export class Nodepod {
       }
     }
 
-    if (
-      opts.swUrl &&
+    // SW is default-on as of 1.2. Pass `serviceWorker: false` to opt out
+    // (SSR, Node tests). Pre-1.2 required `swUrl` to enable it, which
+    // silently broke preview iframes for anyone who installed from npm.
+    const swEnabled =
+      opts.serviceWorker !== false &&
       typeof navigator !== "undefined" &&
-      "serviceWorker" in navigator
-    ) {
+      "serviceWorker" in navigator;
+
+    if (swEnabled) {
       try {
-        await proxy.initServiceWorker({ swUrl: opts.swUrl });
-        // Watermark is on by default — only disable if explicitly set to false
+        await proxy.initServiceWorker({
+          swUrl: opts.swUrl,
+          skipPreflight: opts.skipSWPreflight,
+        });
+        // Watermark is on by default, only disable if explicitly set to false
         if (opts.watermark === false) {
           proxy.setWatermark(false);
         }
       } catch (e) {
-        // SW registration failed, non-fatal
+        // Setup errors have an actionable hint attached, rethrow them.
+        // Anything else (weird host envs, navigator vanishing mid-boot)
+        // is non-fatal; warn and let boot() return so spawn/VFS still work.
+        if (e instanceof NodepodSWSetupError) throw e;
+        if (typeof console !== "undefined" && console.warn) {
+          console.warn(
+            "[nodepod] service worker registration failed " +
+              "(preview iframes and virtual HTTP servers won't work):",
+            e,
+          );
+        }
       }
     }
 

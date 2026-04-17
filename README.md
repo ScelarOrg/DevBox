@@ -9,6 +9,68 @@ Run Node.js in the browser. Filesystem, shell, npm packages, HTTP servers, no ba
 npm install @scelar/nodepod
 ```
 
+## Getting started
+
+Nodepod uses a service worker to route preview iframes and virtual HTTP
+servers. It has to be served from your own origin at `/__sw__.js`,
+browsers won't register a SW from `node_modules`.
+
+Pick the one-liner for your framework:
+
+### Vite
+
+```typescript
+// vite.config.ts
+import { defineConfig } from 'vite';
+import nodepod from '@scelar/nodepod/vite';
+
+export default defineConfig({
+  plugins: [nodepod()],
+});
+```
+
+### Next.js (App Router, works Next 13 through 16)
+
+```typescript
+// app/__sw__.js/route.ts
+export { GET } from '@scelar/nodepod/next';
+```
+
+If you already have a `proxy.ts` (Next 16+) or `middleware.ts` (Next <=15),
+compose `nodepodProxy` / `nodepodMiddleware` alongside your own handler
+instead. See [docs/sw-setup.md](./docs/sw-setup.md).
+
+### Any framework with a Fetch-style handler (Hono, Bun, Cloudflare, Elysia, etc.)
+
+```typescript
+import { serveSW } from '@scelar/nodepod/server';
+
+app.get('/__sw__.js', () => serveSW());
+```
+
+### Express / Fastify / bare `http`
+
+```typescript
+import { serveSWNode } from '@scelar/nodepod/server';
+
+app.get('/__sw__.js', async (_req, res) => {
+  const { body, headers } = await serveSWNode();
+  for (const [k, v] of Object.entries(headers)) res.setHeader(k, v);
+  res.status(200).send(body);
+});
+```
+
+### Static host (copy the file)
+
+No server code? Copy the file once into your public directory:
+
+```bash
+cp node_modules/@scelar/nodepod/dist/__sw__.js public/__sw__.js
+```
+
+See [docs/sw-setup.md](./docs/sw-setup.md) for the full story and how to
+customise the URL.
+
 ## Usage
 
 ```typescript
@@ -24,6 +86,10 @@ const proc = await nodepod.spawn('node', ['index.js']);
 proc.on('output', (text) => console.log(text));
 await proc.completion;
 ```
+
+If the service worker isn't reachable at `/__sw__.js`, `boot()` throws a
+`NodepodSWSetupError` with the one-liner for your framework. Pass
+`{ serviceWorker: false }` to skip SW setup entirely (SSR, Node tests).
 
 ### Terminal
 

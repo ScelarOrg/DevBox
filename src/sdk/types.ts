@@ -7,7 +7,19 @@ export interface NodepodOptions {
   files?: Record<string, string | Uint8Array>;
   env?: Record<string, string>;
   workdir?: string;
+  /** URL of the nodepod service worker. Defaults to `/__sw__.js`. */
   swUrl?: string;
+  /**
+   * Set to `false` to skip SW registration (SSR, Node tests, or hosts
+   * that don't need preview iframes / virtual HTTP servers). Defaults to
+   * `true` when `navigator.serviceWorker` is available.
+   */
+  serviceWorker?: boolean;
+  /**
+   * Skip the HEAD preflight on the SW URL. Use if your host blocks HEAD,
+   * requires auth on assets, or otherwise trips the check.
+   */
+  skipSWPreflight?: boolean;
   onServerReady?: (port: number, url: string) => void;
   /** Show a small "nodepod" watermark link in preview iframes. Defaults to true. */
   watermark?: boolean;
