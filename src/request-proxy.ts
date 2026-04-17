@@ -15,6 +15,13 @@ import { Buffer } from "./polyfills/buffer";
 import { bytesToBase64 } from "./helpers/byte-encoding";
 import { TIMEOUTS, WS_OPCODE } from "./constants/config";
 import { createHash } from "./polyfills/crypto";
+import {
+  NodepodSWSetupError,
+  detectFrameworkHint,
+} from "./integrations/shared/errors";
+
+export { NodepodSWSetupError };
+export type { NodepodSWFrameworkHint } from "./integrations/shared/errors";
 
 const _enc = new TextEncoder();
 
@@ -42,6 +49,11 @@ export interface ProxyOptions {
 
 export interface ServiceWorkerConfig {
   swUrl?: string;
+  /**
+   * Skip the HEAD preflight that checks /__sw__.js is served as JS.
+   * Opt in if your host blocks HEAD, needs auth, or otherwise trips the probe.
+   */
+  skipPreflight?: boolean;
 }
 
 export { CompletedResponse };
@@ -180,11 +192,57 @@ export class RequestProxy extends EventEmitter {
     }
   }
 
+  // HEAD /__sw__.js so a broken setup fails loud with a useful message
+  // instead of whatever opaque thing register() would throw. Four failure
+  // modes: unreachable, non-2xx, missing Content-Type, or served as HTML
+  // (the SPA fallback trap).
+  private async _preflightServiceWorker(swPath: string): Promise<void> {
+    const framework = detectFrameworkHint();
+    let res: Response;
+    try {
+      res = await fetch(swPath, {
+        method: "HEAD",
+        cache: "no-store",
+        // 3s covers a local file; don't let boot() hang behind a dead proxy.
+        signal: AbortSignal.timeout(3000),
+      });
+    } catch (cause) {
+      throw new NodepodSWSetupError(
+        `service worker at ${swPath} could not be reached`,
+        { swUrl: swPath, cause, framework },
+      );
+    }
+
+    if (!res.ok) {
+      throw new NodepodSWSetupError(
+        `service worker at ${swPath} returned HTTP ${res.status}`,
+        { swUrl: swPath, status: res.status, framework },
+      );
+    }
+
+    const contentType = res.headers.get("content-type") ?? "";
+    // Match /javascript/ so application/javascript, text/javascript and
+    // application/x-javascript all pass. 200 OK + text/html is the SPA
+    // fallback trap we're here to catch.
+    if (!/javascript/i.test(contentType)) {
+      throw new NodepodSWSetupError(
+        `service worker at ${swPath} served with wrong Content-Type ` +
+          `(${contentType || "<empty>"}); expected application/javascript`,
+        { swUrl: swPath, status: res.status, contentType, framework },
+      );
+    }
+  }
+
   async initServiceWorker(config?: ServiceWorkerConfig): Promise<void> {
     if (!("serviceWorker" in navigator))
       throw new Error("Service Workers not supported");
 
     const swPath = config?.swUrl ?? "/__sw__.js";
+
+    if (!config?.skipPreflight) {
+      await this._preflightServiceWorker(swPath);
+    }
+
     // unregister old SWs and re-register with cache-busting to ensure latest __sw__.js
     const existingRegs = await navigator.serviceWorker.getRegistrations();
     for (const r of existingRegs) {

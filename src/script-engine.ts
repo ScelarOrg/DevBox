@@ -94,7 +94,6 @@ import * as seaPolyfill from "./polyfills/sea";
 import * as sqlitePolyfill from "./polyfills/sqlite";
 import * as quicPolyfill from "./polyfills/quic";
 import * as lightningcssPolyfill from "./polyfills/lightningcss";
-import * as tailwindOxidePolyfill from "./polyfills/tailwindcss-oxide";
 import { createNapiWorkerFactory, isNapiWasiWorkerScript } from "./helpers/napi-wasm-worker";
 import {
   promises as streamPromises,

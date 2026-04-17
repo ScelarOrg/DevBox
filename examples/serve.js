@@ -49,4 +49,5 @@ createServer((req, res) => {
   console.log(`  Child process test:   http://localhost:${port}/examples/child-process-test/`);
   console.log(`  Vite build test:      http://localhost:${port}/examples/vite-build-test/`);
   console.log(`  Native WASI test:     http://localhost:${port}/examples/native-wasi-test/`);
+  console.log(`  SW setup DX:          http://localhost:${port}/examples/sw-setup/`);
 });
