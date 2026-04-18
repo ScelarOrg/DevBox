@@ -56,6 +56,19 @@ function normalizeBinField(
   return bin;
 }
 
+// Walk up from a package directory to the enclosing `node_modules` folder.
+// Handles scoped packages (whose direct parent is the scope dir, not
+// node_modules) and nested placements like `.../foo/node_modules/bar`.
+function enclosingNodeModules(pkgDir: string): string {
+  let dir = path.dirname(pkgDir);
+  while (dir !== "/" && dir !== "" && path.basename(dir) !== "node_modules") {
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return dir;
+}
+
 // Split "express@4.18.2" or "@types/node@20" into name + version
 function splitSpecifier(spec: string): { name: string; version?: string } {
   if (spec.startsWith("@")) {
@@ -355,7 +368,7 @@ export class DependencyInstaller {
   }
 
   private createBinStubs(
-    nmRoot: string,
+    _nmRoot: string,
     depName: string,
     pkgDir: string,
   ): void {
@@ -365,7 +378,11 @@ export class DependencyInstaller {
 
       const data = JSON.parse(this.vol.readFileSync(manifestPath, "utf8"));
       const bins = normalizeBinField(depName, data.bin);
-      const binDir = path.join(nmRoot, ".bin");
+      // Bin stubs live alongside the enclosing node_modules so nested
+      // deps (e.g. ember-cli/node_modules/foo) get their bins in the
+      // parent's .bin, not the top-level one where they'd collide with a
+      // hoisted version.
+      const binDir = path.join(enclosingNodeModules(pkgDir), ".bin");
 
       for (const [cmd, relPath] of Object.entries(bins)) {
         this.vol.mkdirSync(binDir, { recursive: true });

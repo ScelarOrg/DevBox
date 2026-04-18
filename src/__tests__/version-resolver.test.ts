@@ -4,7 +4,14 @@ import {
   compareSemver,
   satisfiesRange,
   pickBestMatch,
+  resolveDependencyTree,
+  resolveFromManifest,
 } from "../packages/version-resolver";
+import {
+  RegistryClient,
+  type PackageMetadata,
+  type VersionDetail,
+} from "../packages/registry-client";
 
 describe("parseSemver", () => {
   it("parses a simple version", () => {
@@ -180,5 +187,192 @@ describe("pickBestMatch", () => {
   it("picks exact version when range is exact", () => {
     const versions = ["1.0.0", "1.1.0", "1.2.0"];
     expect(pickBestMatch(versions, "1.1.0")).toBe("1.1.0");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Dependency tree resolution — placement / nested deps
+// ---------------------------------------------------------------------------
+
+// Minimal registry fixture: each entry is "name@version" with its dependencies.
+function makeMockRegistry(
+  packages: Record<string, { version: string; dependencies?: Record<string, string> }[]>,
+): RegistryClient {
+  const cache = new Map<string, PackageMetadata>();
+  for (const [name, releases] of Object.entries(packages)) {
+    const versions: Record<string, VersionDetail> = {};
+    for (const rel of releases) {
+      versions[rel.version] = {
+        name,
+        version: rel.version,
+        dependencies: rel.dependencies ?? {},
+        dist: {
+          tarball: `https://registry.example/${name}/-/${name}-${rel.version}.tgz`,
+          shasum: `sha-${name}-${rel.version}`,
+        },
+      } as VersionDetail;
+    }
+    const sorted = releases.map((r) => r.version).sort((a, b) => compareSemver(b, a));
+    cache.set(name, {
+      name,
+      "dist-tags": { latest: sorted[0] },
+      versions,
+    });
+  }
+  return new RegistryClient({ metadataCache: cache });
+}
+
+describe("resolveDependencyTree — nested placement", () => {
+  it("hoists a single package to root", async () => {
+    const registry = makeMockRegistry({
+      foo: [{ version: "1.0.0" }],
+    });
+    const tree = await resolveDependencyTree("foo", "^1.0.0", { registry });
+
+    expect(Array.from(tree.keys())).toEqual(["foo"]);
+    expect(tree.get("foo")?.version).toBe("1.0.0");
+  });
+
+  it("reuses the hoisted version when compatible", async () => {
+    const registry = makeMockRegistry({
+      parent: [
+        {
+          version: "1.0.0",
+          dependencies: { shared: "^1.0.0", other: "^1.0.0" },
+        },
+      ],
+      shared: [{ version: "1.2.3" }],
+      other: [
+        { version: "1.0.0", dependencies: { shared: "^1.0.0" } },
+      ],
+    });
+    const tree = await resolveDependencyTree("parent", "^1.0.0", { registry });
+
+    // `shared` is only installed once, at the root
+    const keys = Array.from(tree.keys()).sort();
+    expect(keys).toEqual(["other", "parent", "shared"]);
+    expect(tree.get("shared")?.version).toBe("1.2.3");
+  });
+
+  it("nests a conflicting version under the requiring package", async () => {
+    // Reproduces the ember-cli / find-up bug: one dep wants v5 (CJS),
+    // another wants v8 (ESM). Both must end up installed so each consumer
+    // resolves the correct one at runtime.
+    const registry = makeMockRegistry({
+      "ember-cli": [
+        {
+          version: "6.12.0",
+          dependencies: {
+            "@pnpm/find-workspace-dir": "^1000.0.0",
+            "find-up": "^8.0.0",
+          },
+        },
+      ],
+      "@pnpm/find-workspace-dir": [
+        { version: "1000.1.3", dependencies: { "find-up": "^5.0.0" } },
+      ],
+      "find-up": [{ version: "5.0.0" }, { version: "8.0.0" }],
+    });
+
+    const tree = await resolveDependencyTree("ember-cli", "^6.12.0", {
+      registry,
+    });
+
+    // Both find-up versions must be present, at different placements.
+    const keys = Array.from(tree.keys()).sort();
+    const findUpKeys = keys.filter((k) => k.endsWith("find-up"));
+    expect(findUpKeys.length).toBe(2);
+
+    // One placement is the hoisted root; the other is nested under the
+    // package that caused the conflict.
+    const rootFindUp = tree.get("find-up");
+    expect(rootFindUp).toBeDefined();
+
+    const nestedEntries = Array.from(tree.entries()).filter(
+      ([k]) => k !== "find-up" && k.endsWith("/find-up"),
+    );
+    expect(nestedEntries.length).toBe(1);
+
+    // The root and nested versions must be the two different majors (5 and 8).
+    const versions = [
+      rootFindUp!.version,
+      nestedEntries[0][1].version,
+    ].sort();
+    expect(versions).toEqual(["5.0.0", "8.0.0"]);
+
+    // Whichever got nested must live under the package that requested it.
+    const [nestedKey, nestedDep] = nestedEntries[0];
+    if (nestedDep.version === "8.0.0") {
+      expect(nestedKey).toBe("ember-cli/node_modules/find-up");
+    } else {
+      expect(nestedKey).toBe(
+        "@pnpm/find-workspace-dir/node_modules/find-up",
+      );
+    }
+  });
+
+  it("nests transitive deps of a nested package when they also conflict", async () => {
+    // find-up@8 pulls locate-path@8; find-up@5 pulls locate-path@5. Both
+    // must coexist with the nested find-up@8 getting its own nested
+    // locate-path@8.
+    const registry = makeMockRegistry({
+      "ember-cli": [
+        {
+          version: "6.0.0",
+          dependencies: {
+            "@pnpm/find-workspace-dir": "^1.0.0",
+            "find-up": "^8.0.0",
+          },
+        },
+      ],
+      "@pnpm/find-workspace-dir": [
+        { version: "1.0.0", dependencies: { "find-up": "^5.0.0" } },
+      ],
+      "find-up": [
+        { version: "5.0.0", dependencies: { "locate-path": "^5.0.0" } },
+        { version: "8.0.0", dependencies: { "locate-path": "^8.0.0" } },
+      ],
+      "locate-path": [{ version: "5.0.0" }, { version: "8.0.0" }],
+    });
+
+    const tree = await resolveDependencyTree("ember-cli", "^6.0.0", {
+      registry,
+    });
+
+    // Two find-up placements and two locate-path placements
+    const locatePathEntries = Array.from(tree.entries()).filter(([k]) =>
+      k.endsWith("locate-path"),
+    );
+    expect(locatePathEntries.length).toBe(2);
+
+    // The nested locate-path must live under the nested find-up
+    const nestedLocatePath = locatePathEntries.find(
+      ([k]) => k !== "locate-path",
+    );
+    expect(nestedLocatePath).toBeDefined();
+    expect(nestedLocatePath![0]).toMatch(
+      /\/find-up\/node_modules\/locate-path$/,
+    );
+  });
+
+  it("handles a package with no conflicts via resolveFromManifest", async () => {
+    const registry = makeMockRegistry({
+      a: [{ version: "1.0.0", dependencies: { b: "^1.0.0" } }],
+      b: [{ version: "1.2.3" }],
+    });
+    const tree = await resolveFromManifest(
+      { dependencies: { a: "^1.0.0" } },
+      { registry },
+    );
+    expect(Array.from(tree.keys()).sort()).toEqual(["a", "b"]);
+  });
+
+  it("breaks cycles without hanging", async () => {
+    const registry = makeMockRegistry({
+      a: [{ version: "1.0.0", dependencies: { b: "^1.0.0" } }],
+      b: [{ version: "1.0.0", dependencies: { a: "^1.0.0" } }],
+    });
+    const tree = await resolveDependencyTree("a", "^1.0.0", { registry });
+    expect(tree.size).toBe(2);
   });
 });
