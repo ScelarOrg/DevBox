@@ -197,6 +197,11 @@ function fabricateStream(
     if (writeFn) writeFn(text);
   };
 
+  // columns/rows live behind accessors so assigning them fires a 'resize' event,
+  // which is what TUI libs like blessed, ink, prompts etc. listen for
+  let _cols: number = DEFAULT_TERMINAL.COLUMNS;
+  let _rows: number = DEFAULT_TERMINAL.ROWS;
+
   const stream: OutputStreamBridge & InputStreamBridge = {
     isTTY: false,
     columns: DEFAULT_TERMINAL.COLUMNS,
@@ -386,7 +391,63 @@ function fabricateStream(
     };
   }
 
+  // swap the plain columns/rows properties for accessors that emit 'resize'
+  // if someone assigns the same value we don't emit, otherwise watchers get
+  // spammed on every fit() call even when the size didn't actually change
+  let _silent = false;
+  Object.defineProperty(stream, "columns", {
+    get() { return _cols; },
+    set(v: number) {
+      const n = typeof v === "number" ? v : Number(v);
+      if (!Number.isFinite(n) || n === _cols) return;
+      _cols = n;
+      if (!_silent) bus.emit("resize");
+    },
+    enumerable: true,
+    configurable: true,
+  });
+  Object.defineProperty(stream, "rows", {
+    get() { return _rows; },
+    set(v: number) {
+      const n = typeof v === "number" ? v : Number(v);
+      if (!Number.isFinite(n) || n === _rows) return;
+      _rows = n;
+      if (!_silent) bus.emit("resize");
+    },
+    enumerable: true,
+    configurable: true,
+  });
+
+  // update both at once, emit 'resize' once. individual setter assignments
+  // still emit as usual, this is just for the common "new size came in" case.
+  (stream as any)._setSize = (cols: number, rows: number): boolean => {
+    const colsChanged = Number.isFinite(cols) && cols !== _cols;
+    const rowsChanged = Number.isFinite(rows) && rows !== _rows;
+    if (!colsChanged && !rowsChanged) return false;
+    _silent = true;
+    try {
+      if (colsChanged) (stream as any).columns = cols;
+      if (rowsChanged) (stream as any).rows = rows;
+    } finally {
+      _silent = false;
+    }
+    bus.emit("resize");
+    return true;
+  };
+
   return stream;
+}
+
+// batched size update with a single 'resize' event. used by the worker when
+// a resize message arrives from main, and by any code that wants to push a
+// new size to a TUI without firing two events.
+export function setStreamDimensions(
+  stream: { _setSize?: (c: number, r: number) => boolean } | null | undefined,
+  cols: number,
+  rows: number,
+): boolean {
+  if (!stream || typeof stream._setSize !== "function") return false;
+  return stream._setSize(cols, rows);
 }
 
 export function buildProcessEnv(config?: {

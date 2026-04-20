@@ -82,6 +82,15 @@ self.addEventListener("message", (ev: MessageEvent) => {
     case "resize":
       _cols = msg.cols;
       _rows = msg.rows;
+      // push to the currently running script's process.stdout/stderr/stdin
+      // so TUI libraries (blessed, ink etc.) get a 'resize' event mid-run
+      if (_shellMod) {
+        try {
+          _shellMod.notifyTerminalResize?.(msg.cols, msg.rows);
+        } catch {
+          // swallow, size sync isn't critical enough to crash the worker
+        }
+      }
       break;
     case "vfs-sync":
       handleVFSSync(msg);

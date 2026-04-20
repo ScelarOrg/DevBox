@@ -61,13 +61,20 @@ export interface TerminalWiring {
     tokenStart: number;
     matches: string[];
   };
+  /** called after xterm reflows so the worker side (and any TUI running
+   * inside it) can update process.stdout.columns/rows and fire 'resize'. */
+  onResize?: (cols: number, rows: number) => void;
 }
 
 export class NodepodTerminal {
   private _term: any = null;
   private _fitAddon: any = null;
   private _dataDisposable: any = null;
+  private _xtermResizeDisposable: any = null;
   private _resizeHandler: (() => void) | null = null;
+  private _resizeDebounce: ReturnType<typeof setTimeout> | null = null;
+  private _lastNotifiedCols = -1;
+  private _lastNotifiedRows = -1;
 
   private _lineBuffer = "";
   private _history: string[] = [];
@@ -160,11 +167,23 @@ export class NodepodTerminal {
       const addon = this._fitAddon;
       requestAnimationFrame(() => {
         addon.fit();
-        setTimeout(() => addon.fit(), 100);
+        // second fit covers the case where the container was still
+        // laying out when the first fit ran
+        setTimeout(() => {
+          addon.fit();
+          this._notifyResize();
+        }, 100);
       });
       this._resizeHandler = () => this._fitAddon?.fit();
       window.addEventListener("resize", this._resizeHandler);
     }
+
+    // xterm fires onResize after any fit(), container size change, or
+    // manual term.resize(). debounced so dragging the window doesn't spam
+    // the worker channel.
+    this._xtermResizeDisposable = this._term.onResize?.(() => {
+      this._scheduleResizeNotify();
+    });
 
     this._dataDisposable = this._term.onData((data: string) =>
       this._handleInput(data),
@@ -173,10 +192,41 @@ export class NodepodTerminal {
     this._term.focus();
   }
 
+  private _scheduleResizeNotify(): void {
+    if (this._resizeDebounce) clearTimeout(this._resizeDebounce);
+    this._resizeDebounce = setTimeout(() => {
+      this._resizeDebounce = null;
+      this._notifyResize();
+    }, 80);
+  }
+
+  private _notifyResize(): void {
+    if (!this._term || !this._wiring?.onResize) return;
+    const cols = this._term.cols;
+    const rows = this._term.rows;
+    if (!cols || !rows) return;
+    if (cols === this._lastNotifiedCols && rows === this._lastNotifiedRows) return;
+    this._lastNotifiedCols = cols;
+    this._lastNotifiedRows = rows;
+    try {
+      this._wiring.onResize(cols, rows);
+    } catch {
+      // wiring threw, nothing we can do from the terminal side
+    }
+  }
+
   detach(): void {
     if (this._dataDisposable) {
       this._dataDisposable.dispose();
       this._dataDisposable = null;
+    }
+    if (this._xtermResizeDisposable) {
+      this._xtermResizeDisposable.dispose?.();
+      this._xtermResizeDisposable = null;
+    }
+    if (this._resizeDebounce) {
+      clearTimeout(this._resizeDebounce);
+      this._resizeDebounce = null;
     }
     if (this._resizeHandler) {
       window.removeEventListener("resize", this._resizeHandler);

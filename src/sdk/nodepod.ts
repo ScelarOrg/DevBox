@@ -371,10 +371,21 @@ export class Nodepod {
         env: this._env,
       });
       shellReady = new Promise<void>((resolve) => {
+        const seedSize = () => {
+          // seed size before the first exec so interactive CLIs see real
+          // dimensions instead of the 80x24 worker defaults
+          if (lastCols && lastRows && shellHandle) {
+            shellHandle.resize(lastCols, lastRows);
+          }
+        };
         if (shellHandle!.state === "running") {
+          seedSize();
           resolve();
         } else {
-          shellHandle!.on("ready", () => resolve());
+          shellHandle!.on("ready", () => {
+            seedSize();
+            resolve();
+          });
         }
       });
 
@@ -394,6 +405,21 @@ export class Nodepod {
       });
 
       return shellReady;
+    };
+
+    // last known size, sent to the shell worker as soon as it boots so the
+    // first command sees the real dimensions instead of 80x24 defaults
+    let lastCols = 0;
+    let lastRows = 0;
+
+    const forwardResize = (cols: number, rows: number) => {
+      lastCols = cols;
+      lastRows = rows;
+      // fire and forget. if no shell exists yet, the size is seeded via
+      // the "ready" handler below so the first exec picks it up.
+      if (shellHandle && shellHandle.state !== "exited") {
+        shellHandle.resize(cols, rows);
+      }
     };
 
     terminal._wireExecution({
@@ -527,6 +553,7 @@ export class Nodepod {
       },
       getCompletions: (line: string, cursorPos: number, cwd: string) =>
         getCompletions(line, cursorPos, cwd, this._volume, shellBuiltins.keys()),
+      onResize: forwardResize,
     });
 
     return terminal;

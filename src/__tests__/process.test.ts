@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { buildProcessEnv } from "../polyfills/process";
+import { buildProcessEnv, setStreamDimensions } from "../polyfills/process";
 
 describe("process polyfill", () => {
   describe("basic properties", () => {
@@ -124,6 +124,57 @@ describe("process polyfill", () => {
       proc.on("SIGTERM", fn);
       proc.kill(proc.pid, "SIGTERM");
       expect(fn).toHaveBeenCalled();
+    });
+  });
+
+  describe("stdout resize", () => {
+    it("emits 'resize' when columns or rows change via assignment", () => {
+      const proc = buildProcessEnv();
+      const fn = vi.fn();
+      proc.stdout.on("resize", fn);
+      proc.stdout.columns = 120;
+      expect(proc.stdout.columns).toBe(120);
+      expect(fn).toHaveBeenCalledTimes(1);
+      proc.stdout.rows = 40;
+      expect(proc.stdout.rows).toBe(40);
+      expect(fn).toHaveBeenCalledTimes(2);
+    });
+
+    it("does not emit 'resize' when assigning the same value", () => {
+      const proc = buildProcessEnv();
+      const fn = vi.fn();
+      proc.stdout.on("resize", fn);
+      const c = proc.stdout.columns;
+      proc.stdout.columns = c;
+      expect(fn).not.toHaveBeenCalled();
+    });
+
+    it("setStreamDimensions fires a single 'resize' event for both dims", () => {
+      const proc = buildProcessEnv();
+      const fn = vi.fn();
+      proc.stdout.on("resize", fn);
+      const changed = setStreamDimensions(proc.stdout as any, 150, 50);
+      expect(changed).toBe(true);
+      expect(proc.stdout.columns).toBe(150);
+      expect(proc.stdout.rows).toBe(50);
+      expect(fn).toHaveBeenCalledTimes(1);
+    });
+
+    it("setStreamDimensions is a no-op when nothing changed", () => {
+      const proc = buildProcessEnv();
+      setStreamDimensions(proc.stdout as any, 150, 50);
+      const fn = vi.fn();
+      proc.stdout.on("resize", fn);
+      const changed = setStreamDimensions(proc.stdout as any, 150, 50);
+      expect(changed).toBe(false);
+      expect(fn).not.toHaveBeenCalled();
+    });
+
+    it("ignores non-finite writes to columns/rows", () => {
+      const proc = buildProcessEnv();
+      proc.stdout.columns = 100;
+      proc.stdout.columns = Number.NaN;
+      expect(proc.stdout.columns).toBe(100);
     });
   });
 });

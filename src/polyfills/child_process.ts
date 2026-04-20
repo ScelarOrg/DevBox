@@ -39,6 +39,24 @@ let _termRows: (() => number) | null = null;
 
 let _rawModeChangeCb: ((isRaw: boolean) => void) | null = null;
 
+// every executeNodeBinary adds its proc here so terminal resizes can be
+// pushed to the currently-running script. cleared on exit.
+const _activeProcs = new Set<{
+  stdout: { _setSize?: (c: number, r: number) => boolean };
+  stderr: { _setSize?: (c: number, r: number) => boolean };
+  stdin: { _setSize?: (c: number, r: number) => boolean };
+}>();
+
+// called by the worker when it gets a "resize" from the main thread.
+// updates every live proc's stdout/stderr/stdin and emits 'resize' on each.
+export function notifyTerminalResize(cols: number, rows: number): void {
+  for (const p of _activeProcs) {
+    p.stdout?._setSize?.(cols, rows);
+    p.stderr?._setSize?.(cols, rows);
+    p.stdin?._setSize?.(cols, rows);
+  }
+}
+
 // context-aware state accessors: check ProcessContext first, fall back to module globals
 
 function getStdoutSink(): ((text: string) => void) | null {
@@ -1148,6 +1166,8 @@ export async function executeNodeBinary(
     proc.stdout.rows = rows;
     proc.stderr.columns = cols;
     proc.stderr.rows = rows;
+    proc.stdin.columns = cols;
+    proc.stdin.rows = rows;
     proc.stdin.setRawMode = (flag: boolean) => {
       proc.stdin.isRaw = flag;
       // notify terminal so it switches echo mode
@@ -1158,6 +1178,10 @@ export async function executeNodeBinary(
     // also update context's liveStdin
     const ctx = getActiveContext();
     if (ctx) ctx.liveStdin = proc.stdin;
+
+    // register with the resize broadcaster so live SIGWINCH-style updates
+    // reach the running script's process.stdout / stderr / stdin
+    _activeProcs.add(proc as any);
   }
 
   // for forked children: ref() to simulate the IPC channel handle.
@@ -1394,6 +1418,7 @@ export async function executeNodeBinary(
     _liveStdin = prevLiveStdin;
     const ctxRestore = getActiveContext();
     if (ctxRestore) ctxRestore.liveStdin = prevLiveStdin;
+    _activeProcs.delete(proc as any);
     // full reset
     closeAllServers();
     resetRefCount();
@@ -2309,4 +2334,5 @@ export default {
   setIPCReceiveHandler,
   handleIPCFromParent,
   executeNodeBinary,
+  notifyTerminalResize,
 };

@@ -50,4 +50,5 @@ createServer((req, res) => {
   console.log(`  Vite build test:      http://localhost:${port}/examples/vite-build-test/`);
   console.log(`  Native WASI test:     http://localhost:${port}/examples/native-wasi-test/`);
   console.log(`  SW setup DX:          http://localhost:${port}/examples/sw-setup/`);
+  console.log(`  Terminal resize:      http://localhost:${port}/examples/terminal-resize/`);
 });
