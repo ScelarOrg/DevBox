@@ -10,6 +10,11 @@ import {
   DEFAULT_ENV,
   DEFAULT_TERMINAL,
 } from "../constants/config";
+import {
+  getRegistry,
+  ProcessExitSentinel,
+  type Handle,
+} from "./../helpers/event-loop";
 
 // capture before engine wrapper overrides globalThis.console
 const _nativeConsole = console;
@@ -90,6 +95,12 @@ export interface ProcessObject {
   execArgv: string[];
   pid: number;
   ppid: number;
+  /**
+   * undefined by default. user code can set this to seed an exit code for
+   * process.exit() (no arg) or natural drain. process.exit(N) overrides
+   * and writes N back here.
+   */
+  exitCode?: number;
   exit: (code?: number) => never;
   nextTick: (fn: (...args: unknown[]) => void, ...args: unknown[]) => void;
   stdout: OutputStreamBridge;
@@ -171,6 +182,7 @@ export interface ProcessObject {
   reallyExit?: (code?: number) => void;
   _getActiveRequests?: () => unknown[];
   _getActiveHandles?: () => unknown[];
+  getActiveResourcesInfo?: () => string[];
   emitWarning?: (
     warning: string | Error,
     typeOrOptions?: string | { type?: string; code?: string; detail?: string },
@@ -202,6 +214,61 @@ function fabricateStream(
   let _cols: number = DEFAULT_TERMINAL.COLUMNS;
   let _rows: number = DEFAULT_TERMINAL.ROWS;
 
+  // stdin ref tracking. node refs the loop while stdin's read side is in
+  // flowing mode. .on('data') auto-resumes, .pause() unrefs. removing a
+  // data listener does NOT auto-pause in node, callers must call .pause()
+  // explicitly (readline.Interface.close() does that for you). output
+  // streams never hold the loop alive.
+  //
+  // 'readable' listeners do NOT ref the loop in node: the stream stays
+  // paused until the user calls .read(). only flowing-mode listeners
+  // ('data') and explicit .resume() keep us alive.
+  //
+  // refcount rather than a boolean so two independent subsystems (e.g. a
+  // readline.Interface and a direct process.stdin.on('data') consumer)
+  // don't stomp each other: a single .pause() won't release the handle
+  // while another consumer still expects data.
+  let _stdinHandle: Handle | null = null;
+  let _stdinRefCount = 0;
+  const _stdinRef = () => {
+    if (isOutput) return;
+    _stdinRefCount++;
+    if (!_stdinHandle) _stdinHandle = getRegistry().register("TTYWrap");
+  };
+  const _stdinUnref = () => {
+    if (isOutput) return;
+    if (_stdinRefCount === 0) return;
+    _stdinRefCount--;
+    if (_stdinRefCount === 0 && _stdinHandle) {
+      _stdinHandle.close();
+      _stdinHandle = null;
+    }
+  };
+
+  // buffer 'data' emits that arrive before any 'data' listener is attached.
+  // real node's stdin is a Readable in paused mode, so it holds bytes in
+  // its internal buffer until a consumer attaches and then flushes on
+  // attach/resume. our stream is backed by a bare EventEmitter so without
+  // this any pre-listener emit is silently dropped. showed up as vite's
+  // ~3s gap between "ready" and bindCLIShortcuts attaching readline
+  // eating every keystroke typed during the gap.
+  const _pendingData: unknown[][] = [];
+
+  const _flushPendingData = () => {
+    if (isOutput || _pendingData.length === 0) return;
+    // snapshot and clear sync so a handler that schedules another sendStdin
+    // during replay doesn't get re-replayed here
+    const pending = _pendingData.splice(0);
+    // queueMicrotask so the just-added listener is definitely registered
+    // (sync call sites expect .on('data', fn).something() chains to finish
+    // before data fires), and it matches node's flush-on-next-tick feel
+    queueMicrotask(() => {
+      for (const args of pending) {
+        bus.emit("data", ...(args as unknown[]));
+      }
+    });
+  };
+
   const stream: OutputStreamBridge & InputStreamBridge = {
     isTTY: false,
     columns: DEFAULT_TERMINAL.COLUMNS,
@@ -209,10 +276,21 @@ function fabricateStream(
     isRaw: false,
     on(evt, fn) {
       bus.on(evt, fn);
+      // node auto-resumes stdin (refs loop) only for flowing mode, i.e.
+      // 'data' listeners. 'readable' keeps the stream paused until the
+      // user calls .read(), so we must NOT ref here.
+      if (!isOutput && evt === "data") {
+        _stdinRef();
+        _flushPendingData();
+      }
       return stream;
     },
     once(evt, fn) {
       bus.once(evt, fn);
+      if (!isOutput && evt === "data") {
+        _stdinRef();
+        _flushPendingData();
+      }
       return stream;
     },
     off(evt, fn) {
@@ -220,10 +298,21 @@ function fabricateStream(
       return stream;
     },
     emit(evt, ...args) {
+      // stdin 'data' arriving with no listener: queue instead of dropping,
+      // replay when a listener attaches (see _flushPendingData above)
+      if (!isOutput && evt === "data" && bus.listenerCount("data") === 0) {
+        _pendingData.push(args);
+        // EventEmitter.emit returns true iff a listener was called, none here
+        return false;
+      }
       return bus.emit(evt, ...args);
     },
     addListener(evt, fn) {
       bus.addListener(evt, fn);
+      if (!isOutput && evt === "data") {
+        _stdinRef();
+        _flushPendingData();
+      }
       return stream;
     },
     removeListener(evt, fn) {
@@ -252,19 +341,29 @@ function fabricateStream(
     },
     prependListener(evt, fn) {
       bus.prependListener(evt, fn);
+      if (!isOutput && evt === "data") {
+        _stdinRef();
+        _flushPendingData();
+      }
       return stream;
     },
     prependOnceListener(evt, fn) {
       bus.prependOnceListener(evt, fn);
+      if (!isOutput && evt === "data") {
+        _stdinRef();
+        _flushPendingData();
+      }
       return stream;
     },
     eventNames() {
       return bus.eventNames();
     },
     pause() {
+      _stdinUnref();
       return stream;
     },
     resume() {
+      _stdinRef();
       return stream;
     },
     setEncoding(_enc) {
@@ -296,6 +395,10 @@ function fabricateStream(
         if (dest.write) dest.write(chunk);
       };
       bus.on("data", onData);
+      // pipe attaches straight to the bus, bypassing stream.on(), so we
+      // still need to flush any pre-pipe buffered input. otherwise data
+      // typed before the consumer attached gets dropped.
+      if (!isOutput) _flushPendingData();
       if (!(stream as any)._pipeDests) (stream as any)._pipeDests = [];
       (stream as any)._pipeDests.push({ dest, onData });
       return dest;
@@ -546,10 +649,19 @@ export function buildProcessEnv(config?: {
     pid: config?.pid ?? MOCK_PROCESS.PID,
     ppid: config?.ppid ?? MOCK_PROCESS.PPID,
 
-    exit(code = 0) {
-      bus.emit("exit", code);
-      if (config?.onExit) config.onExit(code);
-      throw new Error(`Process exited with code ${code}`);
+    // process.exit() with no argument uses process.exitCode, process.exit(N)
+    // overrides exitCode and uses N. matches node.
+    exit(code?: number) {
+      const resolved =
+        typeof code === "number"
+          ? code
+          : typeof proc.exitCode === "number"
+            ? proc.exitCode
+            : 0;
+      proc.exitCode = resolved;
+      bus.emit("exit", resolved);
+      if (config?.onExit) config.onExit(resolved);
+      throw new ProcessExitSentinel(resolved);
     },
 
     nextTick(fn, ...args) {
@@ -689,11 +801,34 @@ export function buildProcessEnv(config?: {
       throw new Error("process.dlopen is not supported in browser environment");
     },
     reallyExit(_code?: number): void {},
+    // libuv splits handles (long-lived: timers, sockets, servers) from
+    // requests (short-lived: fs ops, fetches, imports). we map our
+    // HandleType enum onto that split for introspection parity.
     _getActiveRequests(): unknown[] {
-      return [];
+      const reqTypes = new Set<string>([
+        "FSReqCallback", "FetchRequest", "DynamicImport", "WASMWork",
+      ]);
+      return getRegistry()
+        .list()
+        .filter((h) => h.refed && reqTypes.has(h.type))
+        .map((h) => ({ type: h.type }));
     },
     _getActiveHandles(): unknown[] {
-      return [];
+      const reqTypes = new Set<string>([
+        "FSReqCallback", "FetchRequest", "DynamicImport", "WASMWork",
+      ]);
+      return getRegistry()
+        .list()
+        .filter((h) => h.refed && !reqTypes.has(h.type))
+        .map((h) => ({ type: h.type }));
+    },
+    // node 17.3+: plain string[] of active resource types.
+    // see lib/internal/process/per_thread.js.
+    getActiveResourcesInfo(): string[] {
+      return getRegistry()
+        .list()
+        .filter((h) => h.refed)
+        .map((h) => h.type);
     },
     emitWarning(
       warning: string | Error,

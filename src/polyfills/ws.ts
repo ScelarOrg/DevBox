@@ -5,6 +5,7 @@ import { encodeFrame, decodeFrame } from "./http";
 import { Buffer } from "./buffer";
 import { createHash } from "./crypto";
 import type { TcpSocket } from "./net";
+import { getRegistry, type Handle } from "../helpers/event-loop";
 
 // polyfill for environments missing CloseEvent / MessageEvent
 const SafeCloseEvent: typeof CloseEvent =
@@ -102,6 +103,7 @@ export interface WebSocket extends TinyEmitter {
   _native: globalThis.WebSocket | null;
   _tcpSocket: TcpSocket | null;
   _tcpInboundBuf: Uint8Array;
+  _elHandle: Handle | null;
   onopen: ((ev: Event) => void) | null;
   onclose: ((ev: CloseEvent) => void) | null;
   onerror: ((ev: Event) => void) | null;
@@ -113,6 +115,8 @@ export interface WebSocket extends TinyEmitter {
   ping(): void;
   pong(): void;
   terminate(): void;
+  ref(): this;
+  unref(): this;
   _bindServer(srv: WebSocketServer): void;
   _deliverMessage(data: unknown): void;
 }
@@ -149,6 +153,8 @@ export const WebSocket = function WebSocket(this: any, address: string, protocol
   this.onclose = null;
   this.onerror = null;
   this.onmessage = null;
+  // keeps the loop alive while the socket is open. released in close/terminate.
+  this._elHandle = getRegistry().register("WebSocket");
   if (protocols) this.protocol = Array.isArray(protocols) ? protocols[0] : protocols;
   const self = this;
   setTimeout(() => self._open(), 0);
@@ -208,6 +214,8 @@ WebSocket.prototype._open = function _open(this: any): void {
       const ce = new SafeCloseEvent('close', { code: d.code || 1000, reason: d.reason || '', wasClean: true });
       self.emit('close', ce);
       self.onclose?.(ce);
+      (self._elHandle as Handle | null)?.close();
+      self._elHandle = null;
       chan.removeEventListener('message', onMsg);
     } else if (d.kind === 'fault') {
       const ee = new Event('error');
@@ -273,6 +281,8 @@ WebSocket.prototype._openNative = function _openNative(this: any): void {
     const ce = new SafeCloseEvent('close', { code: raw.code, reason: raw.reason, wasClean: raw.wasClean });
     self.emit('close', ce);
     self.onclose?.(ce);
+    (self._elHandle as Handle | null)?.close();
+    self._elHandle = null;
   };
 
   this._native.onerror = () => {
@@ -318,7 +328,12 @@ WebSocket.prototype.close = function close(this: any, code?: number, reason?: st
   if (this.readyState === CLOSED || this.readyState === CLOSING) return;
   this.readyState = CLOSING;
 
-  if (this._native) { this._native.close(code, reason); return; }
+  const releaseHandle = () => {
+    (this._elHandle as Handle | null)?.close();
+    this._elHandle = null;
+  };
+
+  if (this._native) { this._native.close(code, reason); releaseHandle(); return; }
 
   // TcpSocket-backed — send close frame
   if (this._tcpSocket) {
@@ -335,6 +350,7 @@ WebSocket.prototype.close = function close(this: any, code?: number, reason?: st
       self.emit('close', ce);
       self.onclose?.(ce);
       self._tcpSocket = null;
+      releaseHandle();
     }, 0);
     return;
   }
@@ -349,6 +365,7 @@ WebSocket.prototype.close = function close(this: any, code?: number, reason?: st
     const ce = new SafeCloseEvent('close', { code: code || 1000, reason: reason || '', wasClean: true });
     self.emit('close', ce);
     self.onclose?.(ce);
+    releaseHandle();
   }, 0);
 };
 
@@ -359,9 +376,21 @@ WebSocket.prototype.terminate = function terminate(this: any): void {
   if (this._native) { this._native.close(); this._native = null; }
   if (this._tcpSocket) { try { this._tcpSocket.destroy(); } catch { /* */ } this._tcpSocket = null; }
   this.readyState = CLOSED;
+  (this._elHandle as Handle | null)?.close();
+  this._elHandle = null;
   const ce = new SafeCloseEvent('close', { code: 1006, reason: 'Terminated', wasClean: false });
   this.emit('close', ce);
   this.onclose?.(ce);
+};
+
+WebSocket.prototype.ref = function ref(this: any): any {
+  (this._elHandle as Handle | null)?.ref();
+  return this;
+};
+
+WebSocket.prototype.unref = function unref(this: any): any {
+  (this._elHandle as Handle | null)?.unref();
+  return this;
 };
 
 WebSocket.prototype._bindServer = function _bindServer(this: any, srv: WebSocketServer): void { this._boundServer = srv; };
@@ -570,7 +599,7 @@ WebSocketServer.prototype.handleUpgrade = function handleUpgrade(
   }, 0);
 };
 
-WebSocketServer.prototype.close = function close(this: any, done?: () => void): void {
+WebSocketServer.prototype.close = function close(this: any, done?: (err?: Error) => void): void {
   for (const c of this.clients) c.close(1001, 'Server closing');
   this.clients.clear();
   activeServers.delete(this._route);

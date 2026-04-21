@@ -127,6 +127,7 @@ import {
   precompileWasm,
   compileWasmInWorker,
 } from "./helpers/wasm-cache";
+import { getRegistry } from "./helpers/event-loop";
 import * as acorn from "acorn";
 
 // ── TypeScript type stripper ──
@@ -2126,83 +2127,89 @@ export class ScriptEngine {
     // Intercept fetch() for file:// URLs — serve from VFS instead of network.
     // napi-rs wasm32-wasi packages use fetch(new URL('file.wasm', import.meta.url))
     // which browsers block. This patches fetch to read from the in-memory filesystem.
+    // every fetch also registers a FetchRequest Handle so the loop stays
+    // alive until the request settles. matches node's undici.
     if (!(globalThis.fetch as any).__nodepodPatched) {
       const origFetch = globalThis.fetch.bind(globalThis);
       const patchedFetch = (
         input: RequestInfo | URL,
         init?: RequestInit,
       ): Promise<Response> => {
-        let url: string | undefined;
-        if (typeof input === "string") url = input;
-        else if (input instanceof URL) url = input.href;
-        else if (input instanceof Request) url = input.url;
+        const handle = getRegistry().register("FetchRequest");
+        const doFetch = (): Promise<Response> => {
+          let url: string | undefined;
+          if (typeof input === "string") url = input;
+          else if (input instanceof URL) url = input.href;
+          else if (input instanceof Request) url = input.url;
 
-        if (url?.startsWith("file://")) {
-          // Convert file:// URL to VFS path
-          let vfsPath: string;
-          try {
-            vfsPath = decodeURIComponent(new URL(url).pathname);
-          } catch {
-            vfsPath = decodeURIComponent(url.slice(7));
-          }
-          const v = (globalThis as any).__nodepodVolume as
-            | MemoryVolume
-            | undefined;
-          if (v) {
+          if (url?.startsWith("file://")) {
+            // Convert file:// URL to VFS path
+            let vfsPath: string;
             try {
-              const data = v.readFileSync(vfsPath);
-              const bytes =
-                data instanceof Uint8Array
-                  ? data
-                  : new TextEncoder().encode(String(data));
-              const contentType = vfsPath.endsWith(".wasm")
-                ? "application/wasm"
-                : "application/octet-stream";
-              return Promise.resolve(
-                new Response(
-                  bytes.buffer.slice(
-                    bytes.byteOffset,
-                    bytes.byteOffset + bytes.byteLength,
-                  ) as ArrayBuffer,
-                  {
-                    status: 200,
-                    headers: { "Content-Type": contentType },
-                  },
-                ),
-              );
+              vfsPath = decodeURIComponent(new URL(url).pathname);
             } catch {
-              // .wasm files under node_modules that aren't in the VFS (big binaries that failed extraction) — fetch from CDN
-              if (vfsPath.endsWith(".wasm") && vfsPath.includes("/node_modules/")) {
-                const nmIdx = vfsPath.lastIndexOf("/node_modules/");
-                const afterNm = vfsPath.substring(nmIdx + "/node_modules/".length);
-                // afterNm looks like "lightningcss-wasm/lightningcss_node.wasm" or "@scope/pkg/file.wasm"
-                const parts = afterNm.split("/");
-                let pkgName: string;
-                let filePath: string;
-                if (parts[0].startsWith("@")) {
-                  pkgName = parts[0] + "/" + parts[1];
-                  filePath = parts.slice(2).join("/");
-                } else {
-                  pkgName = parts[0];
-                  filePath = parts.slice(1).join("/");
+              vfsPath = decodeURIComponent(url.slice(7));
+            }
+            const v = (globalThis as any).__nodepodVolume as
+              | MemoryVolume
+              | undefined;
+            if (v) {
+              try {
+                const data = v.readFileSync(vfsPath);
+                const bytes =
+                  data instanceof Uint8Array
+                    ? data
+                    : new TextEncoder().encode(String(data));
+                const contentType = vfsPath.endsWith(".wasm")
+                  ? "application/wasm"
+                  : "application/octet-stream";
+                return Promise.resolve(
+                  new Response(
+                    bytes.buffer.slice(
+                      bytes.byteOffset,
+                      bytes.byteOffset + bytes.byteLength,
+                    ) as ArrayBuffer,
+                    {
+                      status: 200,
+                      headers: { "Content-Type": contentType },
+                    },
+                  ),
+                );
+              } catch {
+                // .wasm under node_modules that aren't in the VFS (big binaries that didn't extract), pull from CDN
+                if (vfsPath.endsWith(".wasm") && vfsPath.includes("/node_modules/")) {
+                  const nmIdx = vfsPath.lastIndexOf("/node_modules/");
+                  const afterNm = vfsPath.substring(nmIdx + "/node_modules/".length);
+                  // afterNm looks like "lightningcss-wasm/lightningcss_node.wasm" or "@scope/pkg/file.wasm"
+                  const parts = afterNm.split("/");
+                  let pkgName: string;
+                  let filePath: string;
+                  if (parts[0].startsWith("@")) {
+                    pkgName = parts[0] + "/" + parts[1];
+                    filePath = parts.slice(2).join("/");
+                  } else {
+                    pkgName = parts[0];
+                    filePath = parts.slice(1).join("/");
+                  }
+                  // grab version from package.json if present
+                  let version = "latest";
+                  try {
+                    const pkgJsonPath = vfsPath.substring(0, nmIdx + "/node_modules/".length) + pkgName + "/package.json";
+                    const pkgJson = JSON.parse(v.readFileSync(pkgJsonPath, "utf8"));
+                    if (pkgJson.version) version = pkgJson.version;
+                  } catch { /* use latest */ }
+                  const cdnUrl = `https://cdn.jsdelivr.net/npm/${pkgName}@${version}/${filePath}`;
+                  return origFetch(cdnUrl);
                 }
-                // grab version from package.json if present
-                let version = "latest";
-                try {
-                  const pkgJsonPath = vfsPath.substring(0, nmIdx + "/node_modules/".length) + pkgName + "/package.json";
-                  const pkgJson = JSON.parse(v.readFileSync(pkgJsonPath, "utf8"));
-                  if (pkgJson.version) version = pkgJson.version;
-                } catch { /* use latest */ }
-                const cdnUrl = `https://cdn.jsdelivr.net/npm/${pkgName}@${version}/${filePath}`;
-                return origFetch(cdnUrl);
+                return Promise.resolve(
+                  new Response("Not found", { status: 404 }),
+                );
               }
-              return Promise.resolve(
-                new Response("Not found", { status: 404 }),
-              );
             }
           }
-        }
-        return origFetch(input, init);
+          return origFetch(input, init);
+        };
+        return doFetch().finally(() => handle.close());
       };
       (globalThis as any).fetch = Object.assign(patchedFetch, {
         __nodepodPatched: true,
@@ -2286,73 +2293,19 @@ export class ScriptEngine {
       (globalThis as any).WebAssembly.Module = PatchedModule;
     }
 
-    // Timers need .ref()/.unref() to match Node.js API
+    // timers need .ref/.unref to match node's API and have to register
+    // Handles so the loop knows about pending work. delegate to the
+    // node:timers polyfill, it wires everything through getRegistry().
     if (!(globalThis.setTimeout as any).__nodepodPatched) {
-      const origST = globalThis.setTimeout.bind(globalThis);
-      const origSI = globalThis.setInterval.bind(globalThis);
-      const origCT = globalThis.clearTimeout.bind(globalThis);
-      const origCI = globalThis.clearInterval.bind(globalThis);
-
-      const wrapTimeout = (id: ReturnType<typeof origST>) => {
-        const obj = {
-          _id: id,
-          _ref: true,
-          ref() {
-            obj._ref = true;
-            return obj;
-          },
-          unref() {
-            obj._ref = false;
-            return obj;
-          },
-          hasRef() {
-            return obj._ref;
-          },
-          refresh() {
-            return obj;
-          },
-          [Symbol.toPrimitive]() {
-            return id;
-          },
-        };
-        return obj;
-      };
-
-      const wrapInterval = (id: ReturnType<typeof origSI>) => {
-        const obj = {
-          _id: id,
-          _ref: true,
-          ref() {
-            obj._ref = true;
-            return obj;
-          },
-          unref() {
-            obj._ref = false;
-            return obj;
-          },
-          hasRef() {
-            return obj._ref;
-          },
-          refresh() {
-            return obj;
-          },
-          [Symbol.toPrimitive]() {
-            return id;
-          },
-        };
-        return obj;
-      };
-
-      (globalThis as any).setTimeout = Object.assign(
-        (...a: Parameters<typeof origST>) => wrapTimeout(origST(...a)),
-        { __nodepodPatched: true },
-      );
+      (globalThis as any).setTimeout = Object.assign(timersPolyfill.setTimeout, {
+        __nodepodPatched: true,
+      });
       (globalThis as any).setInterval = Object.assign(
-        (...a: Parameters<typeof origSI>) => wrapInterval(origSI(...a)),
+        timersPolyfill.setInterval,
         { __nodepodPatched: true },
       );
-      (globalThis as any).clearTimeout = (t: any) => origCT(t?._id ?? t);
-      (globalThis as any).clearInterval = (t: any) => origCI(t?._id ?? t);
+      (globalThis as any).clearTimeout = timersPolyfill.clearTimeout;
+      (globalThis as any).clearInterval = timersPolyfill.clearInterval;
     }
 
     this.patchStackTraceApi();

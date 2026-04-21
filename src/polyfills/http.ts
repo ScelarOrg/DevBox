@@ -7,7 +7,7 @@ import { Readable, Writable } from "./stream";
 import { Buffer } from "./buffer";
 import { TcpSocket, TcpServer, type NetAddress } from "./net";
 import { createHash } from "./crypto";
-import { ref as _elRef, unref as _elUnref } from "../helpers/event-loop";
+// no event-loop import, the net.Server under us already registers TCPServerWrap
 import { TIMEOUTS } from "../constants/config";
 
 // capture real browser WebSocket before any bundled lib can overwrite it
@@ -1213,14 +1213,14 @@ let _onBind: RegistryHook | null = null;
 let _onUnbind: ((port: number) => void) | null = null;
 
 function _addServer(port: number, srv: Server, ownerPid?: number): void {
+  // loop liveness is held by the inner net.TcpServer's TCPServerWrap handle.
+  // this registry is just the port -> Server map for internal routing.
   _registry.set(port, srv);
   if (ownerPid !== undefined) _serverOwnership.set(port, ownerPid);
-  _elRef(); // server keeps the process alive
   if (_onBind) _onBind(port, srv);
 }
 
 function _removeServer(port: number): void {
-  if (_registry.has(port)) _elUnref(); // server no longer keeps process alive
   _registry.delete(port);
   _serverOwnership.delete(port);
   if (_onUnbind) _onUnbind(port);

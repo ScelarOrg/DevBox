@@ -789,7 +789,7 @@ export function spawnChild(
   opts?: {
     cwd?: string;
     env?: Record<string, string>;
-    stdio?: "pipe" | "inherit";
+    stdio?: "pipe" | "inherit" | Array<"pipe" | "inherit" | "ignore">;
     onStdout?: (data: string) => void;
     onStderr?: (data: string) => void;
   },

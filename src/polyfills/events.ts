@@ -2,12 +2,15 @@
 // EventEmitter.call(this) and Object.create(EventEmitter.prototype) work.
 // ES6 classes forbid calling without `new`, which breaks tons of npm packages.
 
-import { ref, unref } from "../helpers/event-loop";
+import { isExitSentinel } from "../helpers/event-loop";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export type EventHandler = (...args: any[]) => void;
 
-const DEFAULT_CEILING = 10;
+// node exposes EventEmitter.defaultMaxListeners as a mutable static. jest
+// sets it to 0 (meaning "unlimited") to silence the warning in its test
+// suite, pino does the same. module-level so reads and writes share state.
+let DEFAULT_CEILING = 10;
 
 // VFS->chokidar HMR bridge: chokidar's async fs.watch() setup chain doesn't
 // complete in browser, so we detect FSWatchers by _watched Map and bridge
@@ -97,6 +100,7 @@ export interface EventEmitterConstructor {
   (): void;
   prototype: EventEmitter;
   EventEmitter: EventEmitterConstructor;
+  defaultMaxListeners: number;
   listenerCount(target: EventEmitter, name: string): number;
   once(target: EventEmitter, name: string): Promise<unknown[]>;
   on(target: EventEmitter, name: string): AsyncIterable<unknown[]>;
@@ -175,30 +179,36 @@ EventEmitter.prototype.emit = function emit(name: string, ...payload: unknown[])
     return false;
   }
 
-  // if a handler returns a promise, hold a ref so the process doesn't bail early
-  const trackResult = (result: unknown) => {
-    if (result && typeof (result as any).then === "function") {
-      ref();
-      (result as Promise<unknown>).then(() => unref(), () => unref());
-    }
-  };
+  // node's EventEmitter.emit is fire-and-forget. returned Promises from
+  // async listeners are NOT awaited and do NOT keep the event loop alive.
+  // an earlier version of this polyfill registered a Handle per async
+  // listener Promise, which broke parity (any listener returning a
+  // never-settling Promise leaked a refed Handle, which e.g. made vite's
+  // `q` shortcut fail to exit). fire-and-forget is correct.
+  //
+  // process.exit() throws our branded ProcessExitSentinel and we let it
+  // propagate so the wait loop sees didExit and short-circuits the rest
+  // of the handlers. other errors swallowed (matches node's per-listener
+  // exception handling in events.js for non-error events).
 
-  // Fast path: single listener — avoid slice() allocation
+  // fast path: single listener, avoid slice()
   if (slot.length === 1) {
     try {
-      const r = slot[0].apply(this, payload);
-      trackResult(r);
-    } catch (_) { /* swallow */ }
+      slot[0].apply(this, payload);
+    } catch (e) {
+      if (isExitSentinel(e)) throw e;
+      /* ignore */
+    }
     return true;
   }
 
   const snapshot = slot.slice();
   for (const handler of snapshot) {
     try {
-      const r = handler.apply(this, payload);
-      trackResult(r);
-    } catch (fault) {
-      /* swallow handler errors */
+      handler.apply(this, payload);
+    } catch (e) {
+      if (isExitSentinel(e)) throw e;
+      /* ignore */
     }
   }
   return true;
@@ -250,6 +260,27 @@ EventEmitter.listenerCount = function (target: EventEmitter, name: string): numb
   return target.listenerCount(name);
 };
 
+// read/write through DEFAULT_CEILING so emitters created after a write
+// pick up the updated value
+Object.defineProperty(EventEmitter, "defaultMaxListeners", {
+  get() {
+    return DEFAULT_CEILING;
+  },
+  set(v: number) {
+    const n = Number(v);
+    // node accepts 0 (unlimited) and any positive integer, rejects negative
+    // or non-numeric.
+    if (!Number.isFinite(n) || n < 0) {
+      throw new RangeError(
+        `defaultMaxListeners must be a non-negative number; got ${v}`,
+      );
+    }
+    DEFAULT_CEILING = n;
+  },
+  enumerable: true,
+  configurable: true,
+});
+
 // supports both `import EventEmitter from 'events'` and `import { EventEmitter }`
 const moduleFacade = EventEmitter as EventEmitterConstructor & {
   EventEmitter: EventEmitterConstructor;
@@ -280,17 +311,86 @@ moduleFacade.once = async (
 };
 
 moduleFacade.on = (target: EventEmitter, name: string) => {
-  const asyncIter = {
+  // node's events.on(emitter, name) returns an async iterator that:
+  //  - buffers events as they arrive so nothing is dropped between awaits
+  //  - supports return()/throw() so `for await ... break/throw` cleans up
+  //    the internal listener instead of leaking it
+  //  - rejects on 'error' emitted from the source emitter
+  const unread: unknown[][] = [];
+  const waiting: Array<(r: { value: unknown[]; done: boolean }) => void> = [];
+  const rejecters: Array<(e: unknown) => void> = [];
+  let finished = false;
+  let errored: unknown = null;
+
+  const onEvent = (...args: unknown[]) => {
+    if (finished) return;
+    const w = waiting.shift();
+    rejecters.shift();
+    if (w) w({ value: args, done: false });
+    else unread.push(args);
+  };
+  const onError = (err: unknown) => {
+    if (finished) return;
+    errored = err;
+    cleanup();
+    const r = rejecters.shift();
+    waiting.shift();
+    if (r) r(err);
+  };
+  const cleanup = () => {
+    if (finished) return;
+    finished = true;
+    target.removeListener(name, onEvent);
+    target.removeListener("error", onError);
+  };
+
+  target.on(name, onEvent);
+  target.on("error", onError);
+
+  const iter: AsyncIterator<unknown[]> & AsyncIterable<unknown[]> = {
     async next() {
-      return new Promise<{ value: unknown[]; done: boolean }>((fulfill) => {
-        target.once(name, (...args) => fulfill({ value: args, done: false }));
-      });
+      if (errored) {
+        const e = errored;
+        errored = null;
+        throw e;
+      }
+      if (unread.length > 0) {
+        return { value: unread.shift() as unknown[], done: false };
+      }
+      if (finished) {
+        return { value: undefined as unknown as unknown[], done: true };
+      }
+      return new Promise<{ value: unknown[]; done: boolean }>(
+        (fulfill, reject) => {
+          waiting.push(fulfill);
+          rejecters.push(reject);
+        },
+      );
+    },
+    async return(value?: unknown) {
+      cleanup();
+      // wake pending awaiters so the for-await exits cleanly
+      while (waiting.length > 0) {
+        const w = waiting.shift();
+        rejecters.shift();
+        w?.({ value: undefined as unknown as unknown[], done: true });
+      }
+      return { value, done: true } as IteratorResult<unknown[]>;
+    },
+    async throw(err?: unknown) {
+      cleanup();
+      while (rejecters.length > 0) {
+        const r = rejecters.shift();
+        waiting.shift();
+        r?.(err);
+      }
+      throw err;
     },
     [Symbol.asyncIterator]() {
       return this;
     },
   };
-  return asyncIter as AsyncIterable<unknown[]>;
+  return iter;
 };
 
 moduleFacade.getEventListeners = (target: EventEmitter, name: string) =>

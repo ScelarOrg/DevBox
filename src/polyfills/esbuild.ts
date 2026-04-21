@@ -4,7 +4,7 @@ import type { MemoryVolume } from "../memory-volume";
 import { CDN_ESBUILD_BINARY, CDN_ESBUILD_BROWSER, cdnImport } from "../constants/cdn-urls";
 import { stripTopLevelAwait } from "../syntax-transforms";
 import { ESBUILD_LOADER_MAP, RESOLVE_EXTENSIONS } from "../constants/config";
-import { ref, unref } from "../helpers/event-loop";
+import { getRegistry } from "../helpers/event-loop";
 
 const BUILTIN_MODULES = new Set([
   "assert",
@@ -171,13 +171,13 @@ export async function transform(
   source: string,
   cfg?: TransformConfig,
 ): Promise<TransformOutput> {
-  ref();
+  const h = getRegistry().register("EsbuildOp");
   try {
     if (!engine) await initialize();
     if (!engine) throw new Error("esbuild: engine not ready");
     return await engine.transform(source, cfg);
   } finally {
-    unref();
+    h.close();
   }
 }
 
@@ -186,7 +186,7 @@ export async function build(cfg: BundleConfig): Promise<BundleOutput> {
   if (!engine) throw new Error("esbuild: engine not ready");
 
   // keep event loop alive while building (Vite's dep optimizer is async)
-  ref();
+  const h = getRegistry().register("EsbuildOp");
   try {
     const volumePlugin = createVolumePlugin(cfg.external, cfg.platform, cfg.conditions);
     const allPlugins = [...(cfg.plugins || [])];
@@ -227,7 +227,7 @@ export async function build(cfg: BundleConfig): Promise<BundleOutput> {
 
     return raw;
   } finally {
-    unref();
+    h.close();
   }
 }
 
@@ -253,11 +253,11 @@ export async function context(cfg: BundleConfig): Promise<{
   cancel: () => Promise<void>;
   dispose: () => Promise<void>;
 }> {
-  ref();
+  const initHandle = getRegistry().register("EsbuildOp");
   try {
     if (!engine) await initialize();
   } finally {
-    unref();
+    initHandle.close();
   }
 
   let disposed = false;

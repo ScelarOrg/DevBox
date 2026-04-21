@@ -4,6 +4,7 @@ import { EventEmitter, type EventHandler } from "./events";
 import { Duplex } from "./stream";
 import { Buffer } from "./buffer";
 import { PORT_RANGE } from "../constants/config";
+import { getRegistry, type Handle } from "../helpers/event-loop";
 
 
 export interface NetAddress {
@@ -120,6 +121,9 @@ TcpSocket.prototype.connect = function connect(
   this.remoteFamily = "IPv4";
   this.readyState = "opening";
 
+  // keep the loop alive while connected, released on destroy
+  if (!this._elHandle) this._elHandle = getRegistry().register("TCPSocketWrap");
+
   const self = this;
   queueMicrotask(() => {
     self._isConnecting = false;
@@ -156,10 +160,12 @@ TcpSocket.prototype.setKeepAlive = function setKeepAlive(_on?: boolean, _delay?:
 };
 
 TcpSocket.prototype.ref = function ref(): any {
+  (this._elHandle as Handle | null)?.ref();
   return this;
 };
 
 TcpSocket.prototype.unref = function unref(): any {
+  (this._elHandle as Handle | null)?.unref();
   return this;
 };
 
@@ -169,6 +175,8 @@ TcpSocket.prototype.destroy = function destroy(err?: Error): any {
   this._isConnected = false;
   this.destroyed = true;
   this.readyState = "closed";
+  (this._elHandle as Handle | null)?.close();
+  this._elHandle = null;
   if (err) this.emit("error", err);
   const self = this;
   queueMicrotask(() => self.emit("close", !!err));
@@ -258,6 +266,9 @@ TcpServer.prototype.listen = function listen(
   this._bound = true;
   this.listening = true;
 
+  // keep the loop alive while listening, released on close
+  if (!this._elHandle) this._elHandle = getRegistry().register("TCPServerWrap");
+
   const self = this;
   queueMicrotask(() => {
     self.emit("listening");
@@ -277,6 +288,8 @@ TcpServer.prototype.close = function close(cb?: (err?: Error) => void): any {
   this.listening = false;
   for (const s of this._peers) s.destroy();
   this._peers.clear();
+  (this._elHandle as Handle | null)?.close();
+  this._elHandle = null;
   const self = this;
   queueMicrotask(() => {
     self.emit("close");
@@ -292,10 +305,12 @@ TcpServer.prototype.getConnections = function getConnections(
 };
 
 TcpServer.prototype.ref = function ref(): any {
+  (this._elHandle as Handle | null)?.ref();
   return this;
 };
 
 TcpServer.prototype.unref = function unref(): any {
+  (this._elHandle as Handle | null)?.unref();
   return this;
 };
 

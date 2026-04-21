@@ -34,6 +34,9 @@ export class ProcessManager extends EventEmitter {
   private _serverPorts = new Map<number, number>();
   // parent pid → child pids, used for exit deferral
   private _childPids = new Map<number, Set<number>>();
+  // pids of children that inherit their parent's stdin. stdin-forward only
+  // routes to pids in this set. stdio:'pipe' kids get their own isolated stdin.
+  private _inheritStdinChildren = new Set<number>();
   private _httpCallbacks = new Map<number, (resp: WorkerToMain_HttpResponse) => void>();
   private _nextHttpRequestId = 1;
 
@@ -307,11 +310,13 @@ export class ProcessManager extends EventEmitter {
       this._killDescendants(handle.pid, signal);
     });
 
-    // forward stdin to children even when parent is blocked on Atomics.wait
+    // forward stdin to children even when parent is blocked on Atomics.wait.
+    // only routes to stdio:'inherit' children; stdio:'pipe' kids are isolated.
     handle.on("stdin-forward", (data: string) => {
       const children = this._childPids.get(handle.pid);
       if (children) {
         for (const childPid of children) {
+          if (!this._inheritStdinChildren.has(childPid)) continue;
           const childHandle = this._processes.get(childPid);
           if (childHandle && childHandle.state !== "exited") {
             childHandle.sendStdin(data);
@@ -423,6 +428,12 @@ export class ProcessManager extends EventEmitter {
         }
         this._childPids.get(handle.pid)!.add(childHandle.pid);
 
+        // remember stdio:inherit so stdin-forward routes parent's stdin here.
+        // msg.stdio can be the legacy string or node's [stdin, stdout, stderr].
+        const inheritsStdin = msg.stdio === "inherit"
+          || (Array.isArray(msg.stdio) && msg.stdio[0] === "inherit");
+        if (inheritsStdin) this._inheritStdinChildren.add(childHandle.pid);
+
         // defer parent exit/done until child finishes (e.g. create-vite -> vite dev)
         handle.holdExit();
         handle.holdShellDone();
@@ -509,6 +520,7 @@ export class ProcessManager extends EventEmitter {
             children.delete(childHandle.pid);
             if (children.size === 0) this._childPids.delete(handle.pid);
           }
+          this._inheritStdinChildren.delete(childHandle.pid);
           handle.releaseExit();
           handle.releaseShellDone();
         });
@@ -625,6 +637,7 @@ export class ProcessManager extends EventEmitter {
             children.delete(childHandle.pid);
             if (children.size === 0) this._childPids.delete(handle.pid);
           }
+          this._inheritStdinChildren.delete(childHandle.pid);
           handle.releaseExit();
           handle.releaseShellDone();
         });
@@ -764,6 +777,7 @@ export class ProcessManager extends EventEmitter {
             children.delete(childHandle.pid);
             if (children.size === 0) this._childPids.delete(handle.pid);
           }
+          this._inheritStdinChildren.delete(childHandle.pid);
           handle.releaseExit();
           handle.releaseShellDone();
         });
@@ -813,6 +827,12 @@ export class ProcessManager extends EventEmitter {
           this._childPids.set(handle.pid, new Set());
         }
         this._childPids.get(handle.pid)!.add(childHandle.pid);
+
+        // spawnSync defaults to 'inherit' when stdio is omitted (matches node,
+        // since it's usually used for interactive children like npm install
+        // under create-vite).
+        const stdinInherits = !msg.stdio || msg.stdio[0] === "inherit";
+        if (stdinInherits) this._inheritStdinChildren.add(childHandle.pid);
 
         handle.holdExit();
         handle.holdShellDone();
@@ -875,6 +895,7 @@ export class ProcessManager extends EventEmitter {
             children.delete(childHandle.pid);
             if (children.size === 0) this._childPids.delete(handle.pid);
           }
+          this._inheritStdinChildren.delete(childHandle.pid);
 
           handle.releaseSync();
           handle.releaseExit();
@@ -888,6 +909,7 @@ export class ProcessManager extends EventEmitter {
             children.delete(childHandle.pid);
             if (children.size === 0) this._childPids.delete(handle.pid);
           }
+          this._inheritStdinChildren.delete(childHandle.pid);
           handle.releaseSync();
           handle.releaseExit();
           handle.releaseShellDone();

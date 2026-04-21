@@ -14,7 +14,7 @@
 
 import type { MemoryVolume } from "../memory-volume";
 import { EventEmitter } from "../polyfills/events";
-import { ref as eventLoopRef, unref as eventLoopUnref } from "./event-loop";
+import { getRegistry, type Handle } from "./event-loop";
 
 /**
  * true if scriptPath is a wasi-worker script in a node_modules package that
@@ -223,18 +223,15 @@ export function createNapiWorkerFactory(
       onMessage: (data: unknown) => self.emit("message", data),
       onError: (err: Error) => self.emit("error", err),
       onExit: (code: number) => {
-        if (self._isReffed) {
-          self._isReffed = false;
-          eventLoopUnref();
-        }
+        (self._elHandle as Handle | null)?.close();
+        self._elHandle = null;
         self._terminated = true;
         self.emit("exit", code);
       },
     });
 
     this._handle = handle;
-    this._isReffed = true;
-    eventLoopRef();
+    this._elHandle = getRegistry().register("Worker");
     queueMicrotask(() => {
       if (!self._terminated) self.emit("online");
     });
@@ -261,7 +258,7 @@ function createRealWebWorker(
   self.resourceLimits = {};
   self._handle = null;
   self._terminated = false;
-  self._isReffed = false;
+  self._elHandle = null;
 
   let bundleSource = bundleCache.get(scriptPath);
   if (!bundleSource) {
@@ -317,6 +314,15 @@ function createRealWebWorker(
 
   realWorker.onerror = (e: ErrorEvent) => {
     self.emit("error", new Error(e.message || "Worker error"));
+    // web workers don't emit exit, so on an unhandled error close the
+    // handle ourselves and fake exit code 1 to match node. otherwise a
+    // crashed wasi worker leaks the loop ref forever.
+    if (!self._terminated) {
+      (self._elHandle as Handle | null)?.close();
+      self._elHandle = null;
+      self._terminated = true;
+      try { self.emit("exit", 1); } catch { /* ignore */ }
+    }
   };
 
   self._realWorker = realWorker;
@@ -327,33 +333,24 @@ function createRealWebWorker(
   };
   self.terminate = () => {
     if (!self._terminated) {
-      if (self._isReffed) {
-        self._isReffed = false;
-        eventLoopUnref();
-      }
+      (self._elHandle as Handle | null)?.close();
+      self._elHandle = null;
       self._terminated = true;
       realWorker.terminate();
     }
     return Promise.resolve(0);
   };
   self.ref = () => {
-    if (!self._isReffed && !self._terminated) {
-      self._isReffed = true;
-      eventLoopRef();
-    }
+    if (!self._terminated) (self._elHandle as Handle | null)?.ref();
     return self;
   };
   self.unref = () => {
-    if (self._isReffed) {
-      self._isReffed = false;
-      eventLoopUnref();
-    }
+    (self._elHandle as Handle | null)?.unref();
     return self;
   };
 
   // start reffed like Node.js does
-  self._isReffed = true;
-  eventLoopRef();
+  self._elHandle = getRegistry().register("Worker");
 
   queueMicrotask(() => {
     if (!self._terminated) self.emit("online");

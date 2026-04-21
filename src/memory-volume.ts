@@ -69,13 +69,19 @@ export interface FileWatchHandle {
 class FSWatcher implements FileWatchHandle {
   private _listeners = new Map<string, Array<(...args: unknown[]) => void>>();
   private _closeFn: (() => void) | null = null;
+  private _closed = false;
 
   constructor(closeFn: () => void) {
     this._closeFn = closeFn;
   }
 
   close(): void {
+    if (this._closed) return;
+    this._closed = true;
     if (this._closeFn) { this._closeFn(); this._closeFn = null; }
+    // emit 'close' before clearing listeners so subscribers actually get it.
+    // chokidar and friends wait on this event to know the handle's released.
+    this.emit("close");
     this._listeners.clear();
   }
   ref(): this { return this; }

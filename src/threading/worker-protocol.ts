@@ -205,7 +205,9 @@ export interface WorkerToMain_SpawnRequest {
   args: string[];
   cwd: string;
   env: Record<string, string>;
-  stdio: "pipe" | "inherit";
+  // legacy single-string form or node's [stdin, stdout, stderr] array.
+  // main normalizes either shape via stdioInheritsStdin().
+  stdio: "pipe" | "inherit" | Array<"pipe" | "inherit" | "ignore">;
 }
 
 export interface WorkerToMain_ForkRequest {
@@ -238,6 +240,8 @@ export interface WorkerToMain_SpawnSync {
   env: Record<string, string>;
   syncSlot: number; // index in the sync SAB for Atomics.wait/notify
   shellCommand?: string;
+  // optional node-shape array, defaults to ["pipe","pipe","pipe"] if absent
+  stdio?: Array<"pipe" | "inherit" | "ignore">;
 }
 
 export interface WorkerToMain_ServerListen {

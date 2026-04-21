@@ -2,7 +2,7 @@
 // we track line/cursor on every keystroke because @clack reads rl.line directly
 
 import { EventEmitter } from "./events";
-import { ref as _elRef, unref as _elUnref } from "../helpers/event-loop";
+import { getRegistry, type Handle } from "../helpers/event-loop";
 
 // the wait loop checks this so it doesn't bail while the user is typing
 let _activeInterfaceCount = 0;
@@ -246,6 +246,8 @@ export interface Interface extends EventEmitter {
   pause(): this;
   resume(): this;
   close(): void;
+  ref(): this;
+  unref(): this;
   write(data: string | null, _key?: { ctrl?: boolean; name?: string; meta?: boolean; shift?: boolean; sequence?: string }): void;
   clearLine(dir?: number): void;
   getCursorPos(): { rows: number; cols: number };
@@ -267,7 +269,17 @@ export const Interface = function Interface(this: any, cfg?: InterfaceConfig) {
   this.closed = false;
   this._lineBuffer = "";
   this._pendingQuestions = [];
-  this.terminal = cfg?.terminal ?? false;
+  // node auto-detects terminal from input.isTTY (and output.isTTY when
+  // output is set). without this, createInterface({input: process.stdin})
+  // falls back to line mode and emitKeypressEvents never runs, which
+  // breaks vite's q-shortcut handler.
+  if (cfg?.terminal !== undefined) {
+    this.terminal = cfg.terminal;
+  } else {
+    const inputIsTTY = !!(cfg?.input as any)?.isTTY;
+    const outputIsTTY = !!(cfg?.output as any)?.isTTY;
+    this.terminal = inputIsTTY && (cfg?.output == null || outputIsTTY);
+  }
   this.line = "";
   this.cursor = 0;
 
@@ -290,9 +302,19 @@ export const Interface = function Interface(this: any, cfg?: InterfaceConfig) {
 
   if (this.input && typeof (this.input as any).on === "function") {
     _activeInterfaceCount++;
-    _elRef();
+    (this as any)._elHandle = getRegistry().register("ReadlineInterface");
     const inputStream = this.input as EventEmitter;
     const self = this;
+
+    // remember every listener we attach so close() can drop them. otherwise
+    // each closed readline leaves dead keypress/data/end handlers on stdin
+    // and they pile up across lifecycles.
+    const installed: Array<{ evt: string; fn: (...a: any[]) => void }> = [];
+    const installAndTrack = (evt: string, fn: (...a: any[]) => void) => {
+      inputStream.on(evt, fn);
+      installed.push({ evt, fn });
+    };
+    (this as any)._installedListeners = installed;
 
     if (this.terminal) {
       // raw mode so we get individual keystrokes instead of line-buffered input
@@ -302,19 +324,19 @@ export const Interface = function Interface(this: any, cfg?: InterfaceConfig) {
 
       emitKeypressEvents(this.input, this);
 
-      inputStream.on("keypress", (char: string | undefined, key: any) => {
+      installAndTrack("keypress", (char: string | undefined, key: any) => {
         if (self.closed) return;
         self._onKeypress(char, key);
       });
     } else {
-      inputStream.on("data", (data: unknown) => {
+      installAndTrack("data", (data: unknown) => {
         if (self.closed) return;
         const text = typeof data === "string" ? data : String(data);
         self._onData(text);
       });
     }
 
-    inputStream.on("end", () => {
+    installAndTrack("end", () => {
       if (!self.closed) self.close();
     });
   }
@@ -744,6 +766,20 @@ Interface.prototype.resume = function resume(this: any): any {
   return this;
 };
 
+// node's Interface.ref/unref lets users opt out of keeping the loop alive
+// while the interface is still open. forward to our Handle.
+Interface.prototype.ref = function ref(this: any): any {
+  const h = (this as any)._elHandle as Handle | undefined;
+  if (h) h.ref();
+  return this;
+};
+
+Interface.prototype.unref = function unref(this: any): any {
+  const h = (this as any)._elHandle as Handle | undefined;
+  if (h) h.unref();
+  return this;
+};
+
 Interface.prototype.close = function close(this: any): void {
   if (this.closed) return;
   this.closed = true;
@@ -753,7 +789,29 @@ Interface.prototype.close = function close(this: any): void {
   }
   if (this.input && typeof (this.input as any).on === "function") {
     _activeInterfaceCount = Math.max(0, _activeInterfaceCount - 1);
-    _elUnref();
+    const h = (this as any)._elHandle as Handle | undefined;
+    if (h) {
+      h.close();
+      (this as any)._elHandle = undefined;
+    }
+    // drop the listeners we put on input. otherwise a long-lived stdin keeps
+    // a stack of dead handlers (keypress/data/end) from every past readline,
+    // which starts interfering with later ones on the same stdin (e.g.
+    // create-vite's prompts vs vite's q-shortcut).
+    const installed = (this as any)._installedListeners as
+      | Array<{ evt: string; fn: (...a: any[]) => void }>
+      | undefined;
+    if (installed && typeof (this.input as any).removeListener === "function") {
+      for (const { evt, fn } of installed) {
+        try { (this.input as any).removeListener(evt, fn); } catch { /* ignore */ }
+      }
+      installed.length = 0;
+    }
+    // pause the input so the process can exit once the readline is gone.
+    // node's stdin handle unrefs on pause and releases the loop.
+    if (typeof (this.input as any).pause === "function") {
+      try { (this.input as any).pause(); } catch { /* ignore */ }
+    }
   }
   // answer any pending questions with empty string
   for (const q of this._pendingQuestions) {

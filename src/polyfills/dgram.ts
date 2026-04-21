@@ -1,6 +1,7 @@
 // stub - not available in browser
 
 import { EventEmitter } from "./events";
+import { getRegistry, type Handle } from "../helpers/event-loop";
 
 export interface Socket extends EventEmitter {
   bind(_port?: number, _addr?: string, _cb?: () => void): this;
@@ -32,16 +33,20 @@ export interface Socket extends EventEmitter {
 export const Socket = function Socket(this: any) {
   if (!this) return;
   EventEmitter.call(this);
+  this._elHandle = null;
 } as unknown as { new(): Socket; prototype: any };
 
 Object.setPrototypeOf(Socket.prototype, EventEmitter.prototype);
 
 Socket.prototype.bind = function bind(_port?: number, _addr?: string, _cb?: () => void) {
+  if (!this._elHandle) this._elHandle = getRegistry().register("UDPWrap");
   if (_cb) setTimeout(_cb, 0);
   return this;
 };
 
 Socket.prototype.close = function close(_cb?: () => void): void {
+  (this._elHandle as Handle | null)?.close();
+  this._elHandle = null;
   if (_cb) setTimeout(_cb, 0);
 };
 
@@ -67,8 +72,8 @@ Socket.prototype.setMulticastLoopback = function setMulticastLoopback(_flag: boo
 Socket.prototype.setMulticastInterface = function setMulticastInterface(_iface: string): void {};
 Socket.prototype.addMembership = function addMembership(_group: string, _iface?: string): void {};
 Socket.prototype.dropMembership = function dropMembership(_group: string, _iface?: string): void {};
-Socket.prototype.ref = function ref() { return this; };
-Socket.prototype.unref = function unref() { return this; };
+Socket.prototype.ref = function ref() { (this._elHandle as Handle | null)?.ref(); return this; };
+Socket.prototype.unref = function unref() { (this._elHandle as Handle | null)?.unref(); return this; };
 Socket.prototype.setRecvBufferSize = function setRecvBufferSize(_sz: number): void {};
 Socket.prototype.setSendBufferSize = function setSendBufferSize(_sz: number): void {};
 Socket.prototype.getRecvBufferSize = function getRecvBufferSize(): number { return 0; };

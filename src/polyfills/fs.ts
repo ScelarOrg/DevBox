@@ -13,6 +13,7 @@ import { precompileWasm } from "../helpers/wasm-cache";
 import { Readable, Writable } from "./stream";
 import { Buffer } from "./buffer";
 import type { FsReadStreamInstance, FsWriteStreamInstance, FsReadableState, FsWritableState } from "../types/fs-streams";
+import { getRegistry } from "../helpers/event-loop";
 
 export type { FileStat, FileWatchHandle, WatchCallback, WatchEventKind };
 
@@ -1265,8 +1266,17 @@ export function buildFileSystemBridge(
         if (resolve) { resolve(); resolve = null; }
       });
 
+      // keeps the loop alive while the iterator is open. abort/return releases
+      const elHandle = getRegistry().register("FSWatcher");
+      const releaseAll = () => {
+        if (closed) return;
+        closed = true;
+        handle.close();
+        elHandle.close();
+      };
+
       if (opts?.signal) {
-        opts.signal.addEventListener("abort", () => { closed = true; handle.close(); if (resolve) { resolve(); resolve = null; } }, { once: true });
+        opts.signal.addEventListener("abort", () => { releaseAll(); if (resolve) { resolve(); resolve = null; } }, { once: true });
       }
 
       return {
@@ -1285,8 +1295,7 @@ export function buildFileSystemBridge(
               });
             },
             return(): Promise<IteratorResult<{ eventType: string; filename: string | null }>> {
-              closed = true;
-              handle.close();
+              releaseAll();
               return Promise.resolve({ value: undefined as any, done: true });
             },
           };
@@ -1737,11 +1746,31 @@ export function buildFileSystemBridge(
       cb?: WatchCallback,
     ): FileWatchHandle {
       const p = abs(filename);
-      return volume.watch(
+      const inner = volume.watch(
         p,
         optsOrCb as { persistent?: boolean; recursive?: boolean },
         cb,
       );
+      // hold a Handle for the loop and wrap close() to release it. ref/unref
+      // mirror node's FSWatcher API so watcher.unref() lets the process exit
+      // without having to close the watcher first.
+      const elHandle = getRegistry().register("FSWatcher");
+      const origClose = inner.close?.bind(inner);
+      if (origClose) {
+        inner.close = () => {
+          origClose();
+          elHandle.close();
+        };
+      }
+      (inner as any).ref = () => {
+        elHandle.ref();
+        return inner;
+      };
+      (inner as any).unref = () => {
+        elHandle.unref();
+        return inner;
+      };
+      return inner;
     },
 
     watchFile(

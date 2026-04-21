@@ -2,6 +2,7 @@
 
 
 import { EventEmitter } from "./events";
+import { getRegistry, type Handle } from "../helpers/event-loop";
 
 /* ------------------------------------------------------------------ */
 /*  Sessions                                                           */
@@ -22,22 +23,28 @@ export interface Http2Session extends EventEmitter {
 export const Http2Session = function Http2Session(this: any) {
   if (!this) return;
   EventEmitter.call(this);
+  this._elHandle = getRegistry().register("HTTP2Session");
 } as unknown as { new(): Http2Session; prototype: any };
 
 Object.setPrototypeOf(Http2Session.prototype, EventEmitter.prototype);
 
 Http2Session.prototype.close = function close(done?: () => void): void {
+  (this._elHandle as Handle | null)?.close();
+  this._elHandle = null;
   if (done) setTimeout(done, 0);
 };
-Http2Session.prototype.destroy = function destroy(_err?: Error, _code?: number): void {};
+Http2Session.prototype.destroy = function destroy(_err?: Error, _code?: number): void {
+  (this._elHandle as Handle | null)?.close();
+  this._elHandle = null;
+};
 Object.defineProperty(Http2Session.prototype, 'destroyed', { get() { return false; }, configurable: true });
 Object.defineProperty(Http2Session.prototype, 'encrypted', { get() { return false; }, configurable: true });
 Object.defineProperty(Http2Session.prototype, 'closed', { get() { return false; }, configurable: true });
 Http2Session.prototype.ping = function ping(
   _cb: (err: Error | null, dur: number, buf: Uint8Array) => void,
 ): boolean { return false; };
-Http2Session.prototype.ref = function ref(): void {};
-Http2Session.prototype.unref = function unref(): void {};
+Http2Session.prototype.ref = function ref(): void { (this._elHandle as Handle | null)?.ref(); };
+Http2Session.prototype.unref = function unref(): void { (this._elHandle as Handle | null)?.unref(); };
 Http2Session.prototype.setTimeout = function setTimeout(_ms: number, _cb?: () => void): void {};
 
 export interface ClientHttp2Session extends Http2Session {}

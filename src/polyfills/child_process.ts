@@ -10,8 +10,13 @@ import type { MemoryVolume } from "../memory-volume";
 import { ScriptEngine } from "../script-engine";
 import type { PackageManifest } from "../types/manifest";
 import { resetActiveInterfaceCount } from "./readline";
-import { ref, unref, getRefCount, resetRefCount, addDrainListener } from "../helpers/event-loop";
-import { getActiveContext, setActiveContext } from "../threading/process-context";
+import {
+  getRegistry,
+  isExitSentinel,
+  ProcessExitSentinel,
+  type Handle,
+} from "../helpers/event-loop";
+import { createProcessContext, getActiveContext, setActiveContext } from "../threading/process-context";
 import type { ProcessContext } from "../threading/process-context";
 import type { PmDeps, PkgManager } from "../shell/commands/pm-types";
 import { createNpmCommand } from "../shell/commands/npm";
@@ -21,12 +26,18 @@ import { createBunCommand, createBunxCommand } from "../shell/commands/bun";
 import { createNodeCommand, createNpxCommand } from "../shell/commands/node";
 import { createGitCommand } from "../shell/commands/git";
 import { format as utilFormat } from "./util";
-import { VERSIONS, NPM_REGISTRY_URL_SLASH, TIMEOUTS, DEFAULT_ENV, MOCK_PID } from "../constants/config";
+import { VERSIONS, NPM_REGISTRY_URL_SLASH, DEFAULT_ENV, MOCK_PID } from "../constants/config";
 import { closeAllServers, getAllServers } from "./http";
 import type { SyncChannelWorker } from "../threading/sync-channel";
 
 let _shell: NodepodShell | null = null;
 let _vol: MemoryVolume | null = null;
+
+// grab the native setTimeout before script-engine patches it. we use this
+// to yield to the host task queue without creating a tracked Handle that
+// would bump the refed count.
+const _nativeSetTimeout: typeof globalThis.setTimeout =
+  globalThis.setTimeout.bind(globalThis);
 
 let _syncChannel: SyncChannelWorker | null = null;
 
@@ -356,7 +367,7 @@ function evalNodeCode(code: string, ctx: ShellContext): ShellResult {
   try {
     sandbox.execute(code, "/<eval>.js");
   } catch (e) {
-    if (e instanceof Error && e.message.startsWith("Process exited with code"))
+    if (isExitSentinel(e))
       return { stdout: out, stderr: err, exitCode: 0 };
     err += `Error: ${e instanceof Error ? e.message : String(e)}\n`;
     return { stdout: out, stderr: err, exitCode: 1 };
@@ -1084,6 +1095,37 @@ export async function executeNodeBinary(
   // ScriptEngine's module wrapper overwrites globalThis.process -- save and restore
   const savedProcess = (globalThis as any).process;
 
+  // isolate this script's HandleRegistry from the outer (vitest/host) process.
+  // without this, any setTimeout the host schedules ends up in the same
+  // _globalRegistry the wait loop inspects, so outer timers count as live
+  // handles and we block forever waiting for a drain that won't come. still
+  // inherit streaming config so stdout/stderr/resize keep working.
+  const prevCtx = getActiveContext();
+  const localCtx = createProcessContext({
+    volume: _vol,
+    cwd: ctx.cwd,
+    env: ctx.env,
+  });
+  localCtx.stdoutSink = prevCtx?.stdoutSink ?? _stdoutSink;
+  localCtx.stderrSink = prevCtx?.stderrSink ?? _stderrSink;
+  localCtx.liveStdin = prevCtx?.liveStdin ?? _liveStdin;
+  localCtx.termCols = prevCtx?.termCols ?? _termCols;
+  localCtx.termRows = prevCtx?.termRows ?? _termRows;
+  // Propagate halt/abort from parent context or module signal
+  if (prevCtx && prevCtx.abortController.signal.aborted) {
+    localCtx.abortController.abort();
+  } else if (_haltSignal?.aborted) {
+    localCtx.abortController.abort();
+  } else if (_haltSignal) {
+    _haltSignal.addEventListener(
+      "abort",
+      () => localCtx.abortController.abort(),
+      { once: true },
+    );
+  }
+  setActiveContext(localCtx);
+
+  try {
   const sandbox = new ScriptEngine(_vol, {
     cwd: ctx.cwd,
     env: ctx.env,
@@ -1091,7 +1133,11 @@ export async function executeNodeBinary(
       // filter out process.exit sentinel errors logged by library code
       if (cArgs.length === 1) {
         const a = cArgs[0];
-        if (a instanceof Error && a.message.startsWith("Process exited with code")) return;
+        if (isExitSentinel(a)) return;
+        // a library may have stringified the sentinel before logging
+        // (e.g. console.error(String(err))). message format is stable
+        // so matching on toString is fine. worst case we swallow a user
+        // log line that happens to start with the same prefix.
         if (typeof a === "string" && a.startsWith("Error: Process exited with code")) return;
       }
       // error/warn → stderr, everything else → stdout
@@ -1110,21 +1156,28 @@ export async function executeNodeBinary(
     if (_shell) _shell.setCwd(dir);
   };
 
+  // resolves when proc.exit() is called. the wait loop races this against
+  // drainPromise/haltPromise so an exit() from an event handler (e.g.
+  // vite's `q` shortcut) wakes the loop right away instead of waiting
+  // for the next handle drain.
+  let exitResolve!: () => void;
+  const exitPromise = new Promise<void>((r) => { exitResolve = r; });
+
   proc.exit = ((c = 0) => {
     // suppress exit when dev servers are active (SES/error handlers call exit(1) but we want to keep serving)
     if (getAllServers().size > 0 && c !== 0) {
-      // process.exit suppressed — servers still active
       return;
     }
     if (!didExit) {
       didExit = true;
       code = c;
       proc.emit("exit", c);
+      exitResolve();
     }
-    // Always throw to halt execution — mirrors real Node.js process.exit()
-    // which terminates immediately. The TLA .catch() and try/catch both
-    // handle "Process exited with code" errors.
-    throw new Error(`Process exited with code ${c}`);
+    // always throw to halt. matches real node process.exit() which
+    // terminates immediately. TLA .catch and try/catch use isExitSentinel()
+    // to detect and suppress this unwind.
+    throw new ProcessExitSentinel(c);
   }) as (c?: number) => never;
 
   proc.argv = ["node", resolved, ...args];
@@ -1183,31 +1236,32 @@ export async function executeNodeBinary(
     _activeProcs.add(proc as any);
   }
 
-  // for forked children: ref() to simulate the IPC channel handle.
-  // real Node.js keeps the IPC channel ref'd until process.disconnect().
-  // we hold a ref for the entire fork lifetime, released on disconnect or exit.
+  // forked children keep an IPCChannel handle for the whole fork lifetime,
+  // released on disconnect or exit. "IPCChannel" matches what real node
+  // reports from process.getActiveResourcesInfo() for fork IPC channels.
   const isFork = !!opts?.isFork;
+  let ipcHandle: Handle | null = null;
   if (isFork) {
-    ref();
-    // disconnect → unref (mirrors Node.js IPC channel.unref())
+    ipcHandle = getRegistry().register("IPCChannel");
     const origDisconnect = proc.disconnect;
     proc.disconnect = (() => {
       origDisconnect?.call(proc);
-      unref();
+      ipcHandle?.close();
+      ipcHandle = null;
     }) as () => void;
   }
 
   let scriptError: Error | null = null;
   let tlaSettled = false;
+  // wake the loop on TLA settle so we don't have to poll
+  let tlaResolve!: () => void;
+  const tlaDonePromise = new Promise<void>((r) => { tlaResolve = r; });
 
   try {
     const tlaPromise = sandbox.runFileTLA(resolved);
     tlaPromise
       .catch((e) => {
-        if (
-          e instanceof Error &&
-          e.message.startsWith("Process exited with code")
-        ) {
+        if (isExitSentinel(e)) {
           return;
         }
         const msg = formatThrown(e);
@@ -1219,13 +1273,11 @@ export async function executeNodeBinary(
       })
       .finally(() => {
         tlaSettled = true;
+        tlaResolve();
       });
   } catch (e) {
-    if (
-      e instanceof Error &&
-      e.message.startsWith("Process exited with code")
-    ) {
-      // process.exit() — handled by didExit flag
+    if (isExitSentinel(e)) {
+      // handled by didExit flag
     } else {
       const msg = formatThrown(e);
       scriptError = e instanceof Error ? e : new Error(msg);
@@ -1253,23 +1305,80 @@ export async function executeNodeBinary(
     return { stdout: out, stderr: err, exitCode: code };
   }
 
-  // yield one tick so microtasks settle
-  await new Promise((r) => setTimeout(r, 0));
+  // yield once before the first wait-loop decision. crossing a macrotask
+  // boundary drains the whole microtask queue, which lets deep await chains
+  // (common in create-qwik style CLIs: await a; await b; await c; finally
+  // setTimeout) reach their Handle-registering point before we check
+  // activeRefedCount.
+  await new Promise<void>((r) => _nativeSetTimeout(r, 0));
 
-  // keep the process alive while TLA hasn't settled, ref handles exist,
-  // or HTTP servers are registered. process.exit() and Ctrl+C break immediately.
-
+  // node exit rule, libuv parity: the loop is alive iff TLA is pending or
+  // activeRefedCount > 0. no timeouts, no output heuristics. every async
+  // primitive refs its own Handle and we trust the counter.
+  const registry = getRegistry();
   const shouldStayAlive = (): boolean => {
     if (!tlaSettled) return true;
-    if (getRefCount() > 0) return true;
-    if (getAllServers().size > 0) return true;
-    return false;
+    return registry.activeRefedCount() > 0;
   };
 
-  // fast path: nothing keeping the process alive
+  // resolve the tentative exit code node-style: explicit process.exit(c)
+  // wins, otherwise process.exitCode (user-settable), otherwise 0.
+  const currentCode = (): number => {
+    if (didExit) return code;
+    const ec = (proc as any).exitCode;
+    return typeof ec === "number" ? ec : 0;
+  };
+
+  // beforeExit state carries across fast-path and wait-loop exits. reset to
+  // false whenever activeRefedCount > 0 again so each drain-to-zero cycle
+  // can fire it (matches node's SpinEventLoop).
+  let beforeExitEmitted = false;
+  const emitBeforeExitOnce = async () => {
+    if (beforeExitEmitted) return;
+    beforeExitEmitted = true;
+    const beforeCode = currentCode();
+    // proc.emit is sync. if a handler calls process.exit() it throws the
+    // sentinel, let didExit propagate and bail without emitting further.
+    try {
+      proc.emit("beforeExit", beforeCode);
+    } catch (e) {
+      if (isExitSentinel(e)) {
+        return;
+      }
+      // other handler errors: swallow (matches node's exit-time semantics)
+    }
+    try {
+      await registry.emitBeforeExit(beforeCode);
+    } catch (e) {
+      if (isExitSentinel(e)) {
+        return;
+      }
+    }
+    // full drain via a native setTimeout(0). queueMicrotask only covers
+    // one microtask step, but await chains keep queueing more microtasks.
+    // setTimeout(0) crosses a macrotask boundary and forces V8 to flush
+    // every pending microtask before resuming us. using the NATIVE
+    // setTimeout (captured before patching) means this yield doesn't
+    // register a tracked Handle that would inflate the refed count.
+    await new Promise<void>((r) => _nativeSetTimeout(r, 0));
+  };
+
+  // fast path: script finished synchronously with nothing scheduled.
+  // still emit beforeExit; handlers may schedule more work and if they
+  // do we fall through into the real wait loop below.
   if (!myHaltSignal && !shouldStayAlive()) {
-    cleanup();
-    return { stdout: out, stderr: err, exitCode: 0 };
+    if (!didExit) await emitBeforeExitOnce();
+    if (!didExit && !shouldStayAlive()) {
+      const finalCode = currentCode();
+      // emit 'exit' on natural drain. node fires it once, whether the
+      // loop drained naturally or process.exit() was called. the exit()
+      // path already emitted it from the proc.exit override.
+      try { proc.emit("exit", finalCode); } catch { /* ignore */ }
+      cleanup();
+      return { stdout: out, stderr: err, exitCode: finalCode };
+    }
+    // a beforeExit handler revived the loop, fall through to the wait loop
+    if (shouldStayAlive()) beforeExitEmitted = false;
   }
 
   // avoid duplicate output when same error fires as both 'error' and 'unhandledrejection'
@@ -1278,22 +1387,18 @@ export async function executeNodeBinary(
   const rejHandler = (ev: PromiseRejectionEvent) => {
     ev.preventDefault();
     const r = ev.reason;
-    if (
-      r instanceof Error &&
-      r.message.startsWith("Process exited with code")
-    ) {
+    if (isExitSentinel(r)) {
       return;
     }
-    // mark as handled to prevent errHandler double-logging
+    // mark as handled so errHandler doesn't double-log
     if (r != null && typeof r === "object") handledErrors.add(r);
-    // emit 'unhandledRejection' on process -- if a handler exists, it handles it
     try {
       const hasHandler = proc.listenerCount
         ? proc.listenerCount("unhandledRejection") > 0
         : false;
       proc.emit("unhandledRejection", r, ev.promise);
-      if (hasHandler) return; // Handler dealt with it — don't log
-    } catch { /* ignore handler errors */ }
+      if (hasHandler) return;
+    } catch { /* ignore */ }
     const rejMsg = r instanceof Error
       ? `Unhandled rejection: ${r.message}\n${r.stack ?? ""}\n`
       : `Unhandled rejection: ${String(r)}\n`;
@@ -1302,18 +1407,21 @@ export async function executeNodeBinary(
   const errHandler = (ev: ErrorEvent) => {
     ev.preventDefault();
     const e = ev.error ?? new Error(ev.message || "Unknown error");
-    // skip if already handled by rejHandler (same error fires on both global events)
+    if (isExitSentinel(e)) {
+      return;
+    }
+    // same error may fire on both unhandledrejection and error, dedupe.
     if (e != null && typeof e === "object" && handledErrors.has(e)) return;
     if (e != null && typeof e === "object") handledErrors.add(e);
-    // emit 'uncaughtException' -- frameworks like webpack register handlers for graceful recovery
+    // webpack and friends register uncaughtException handlers for graceful recovery
     try {
       const hasUncaught = proc.listenerCount
         ? proc.listenerCount("uncaughtException") > 0
         : false;
       proc.emit("uncaughtException", e);
-      if (hasUncaught) return; // Handler dealt with it — don't log or crash
-    } catch { /* handler threw — fall through to default logging */ }
-    // if there's an unhandledRejection listener, it'll handle this -- don't double-log
+      if (hasUncaught) return;
+    } catch { /* ignore */ }
+    // if there's an unhandledRejection listener, it'll handle this, don't double-log
     try {
       const hasRej = proc.listenerCount
         ? proc.listenerCount("unhandledRejection") > 0
@@ -1325,8 +1433,12 @@ export async function executeNodeBinary(
       : `Uncaught: ${String(e)}\n`;
     pushErr(msg);
   };
-  globalThis.addEventListener("unhandledrejection", rejHandler);
-  globalThis.addEventListener("error", errHandler);
+  // browser and Worker globalThis has addEventListener, node-test doesn't.
+  const hasGlobalEvents = typeof (globalThis as any).addEventListener === "function";
+  if (hasGlobalEvents) {
+    (globalThis as any).addEventListener("unhandledrejection", rejHandler);
+    (globalThis as any).addEventListener("error", errHandler);
+  }
 
   try {
     // resolves when Ctrl+C / signal fires
@@ -1337,91 +1449,84 @@ export async function executeNodeBinary(
         })
       : null;
 
-    // give async startup code time to register handles before deciding the process is done
-    let consecutiveEmpty = 0;
-    let everNonEmpty = false;
+    // event-driven wait loop. wake sources:
+    //   drainPromise: activeRefedCount transitions to 0
+    //   tlaDonePromise: top-level-await settles
+    //   haltPromise: Ctrl+C / SIGINT
+    //   exitPromise: process.exit() from anywhere (including async handlers
+    //     like vite's `q` shortcut). without this, an exit() from a handler
+    //     that runs while we're awaiting drainPromise wouldn't wake us until
+    //     drain happens, which might never happen if readline/stdin keep
+    //     the loop alive.
+    // on any wake, check if we should still be alive. if not, emit beforeExit,
+    // let handlers schedule more work, re-check, exit if truly drained.
 
-    while (!didExit) {
-      if (myHaltSignal?.aborted) {
-        break;
+    while (!didExit && !myHaltSignal?.aborted) {
+      // TLA still pending, wait for it (or drain/halt/exit).
+      if (!tlaSettled) {
+        const racers: Promise<unknown>[] = [
+          tlaDonePromise,
+          registry.drainPromise(),
+          exitPromise,
+        ];
+        if (haltPromise) racers.push(haltPromise);
+        await Promise.race(racers);
+        continue;
       }
 
-      // wake on drain notification or periodic tick
-      let wakeResolve!: () => void;
-      const wakePromise = new Promise<void>((r) => { wakeResolve = r; });
-      const removeDrain = addDrainListener(wakeResolve);
-
-      const tickMs = (!everNonEmpty && myHaltSignal && !out && !err)
-        ? TIMEOUTS.WAIT_LOOP_TICK
-        : 50;
-      const racers: Promise<unknown>[] = [
-        wakePromise,
-        new Promise<void>((r) => setTimeout(r, tickMs)),
-      ];
-      if (haltPromise) racers.push(haltPromise);
-
-      await Promise.race(racers);
-      removeDrain();
-
-      if (myHaltSignal?.aborted) {
-        break;
-      }
-      if (didExit) {
-        break;
-      }
-
-      if (!shouldStayAlive()) {
-        // yield one microtask turn for async transitions (e.g. @clack closing/reopening readline)
-        await new Promise<void>((r) => queueMicrotask(r));
-        if (didExit || myHaltSignal?.aborted) break;
-        if (shouldStayAlive()) {
-          everNonEmpty = true;
-          consecutiveEmpty = 0;
-          continue;
-        }
-
-        consecutiveEmpty++;
-
-        if (myHaltSignal) {
-          // terminal mode: tiered timeout -- no output yet (10s), had refs before (5s), output but no refs (2s)
-          if (!everNonEmpty && !out && !err) {
-            if (consecutiveEmpty >= 50) {
-              break;
-            }
-          } else if (!everNonEmpty) {
-            if (consecutiveEmpty >= Math.ceil(2_000 / tickMs)) {
-              break;
-            }
-          } else {
-            if (consecutiveEmpty >= 100) {
-              break;
-            }
+      // TLA has settled. Check live handles.
+      if (registry.activeRefedCount() === 0) {
+        if (!beforeExitEmitted) {
+          await emitBeforeExitOnce();
+          if (didExit || myHaltSignal?.aborted) break;
+          if (registry.activeRefedCount() > 0) {
+            // a beforeExit handler revived us, reset for the next drain
+            beforeExitEmitted = false;
+            continue;
           }
-        } else {
-          break; // Non-terminal: exit immediately when empty.
         }
-      } else {
-        consecutiveEmpty = 0;
-        everNonEmpty = true;
+        break;
       }
+
+      // something is refed, wait for drain/halt/exit.
+      const racers: Promise<unknown>[] = [registry.drainPromise(), exitPromise];
+      if (haltPromise) racers.push(haltPromise);
+      await Promise.race(racers);
+
+      // if anything was scheduled while draining, allow beforeExit to fire
+      // again on the next drain-to-zero cycle
+      if (registry.activeRefedCount() > 0) beforeExitEmitted = false;
     }
 
-    return { stdout: out, stderr: err, exitCode: didExit ? code : 0 };
+    const finalCode = currentCode();
+    // emit 'exit' on natural drain. process.exit() path already emitted
+    // it from proc.exit, so skip if didExit is true.
+    if (!didExit) {
+      try { proc.emit("exit", finalCode); } catch { /* ignore */ }
+    }
+    return { stdout: out, stderr: err, exitCode: finalCode };
   } finally {
     cleanup();
-    // defuse proc.exit so floating Promises don't throw unhandled rejections
+    // defuse proc.exit so floating promises don't throw unhandled rejections
     proc.exit = (() => {}) as unknown as (c?: number) => never;
-    globalThis.removeEventListener("unhandledrejection", rejHandler);
-    globalThis.removeEventListener("error", errHandler);
-    // restore _liveStdin for the parent's stdin relay
+    if (hasGlobalEvents) {
+      (globalThis as any).removeEventListener("unhandledrejection", rejHandler);
+      (globalThis as any).removeEventListener("error", errHandler);
+    }
     _liveStdin = prevLiveStdin;
     const ctxRestore = getActiveContext();
     if (ctxRestore) ctxRestore.liveStdin = prevLiveStdin;
     _activeProcs.delete(proc as any);
-    // full reset
     closeAllServers();
-    resetRefCount();
+    getRegistry().closeAll();
     resetActiveInterfaceCount();
+  }
+  } finally {
+    // restore outer process context. must happen AFTER the inner finally
+    // has closed this script's registry and restored streaming callbacks.
+    // reached from every exit path including early returns and thrown
+    // errors from ScriptEngine construction.
+    setActiveContext(prevCtx);
   }
 }
 
@@ -1943,6 +2048,29 @@ function handleSyncCommand(cmd: string, opts?: RunOptions): string | null {
   return null;
 }
 
+// stdio normalizer. accepts:
+//   'pipe'|'inherit'|'ignore'     expanded to [same, same, same]
+//   ['pipe','inherit','ignore']   kept as-is, padded to 3
+//   undefined                     'pipe' (node's default for spawn)
+function normalizeStdio(
+  stdio: SpawnConfig["stdio"] | undefined,
+): ["pipe" | "inherit" | "ignore", "pipe" | "inherit" | "ignore", "pipe" | "inherit" | "ignore"] {
+  const norm = (v: unknown): "pipe" | "inherit" | "ignore" => {
+    if (v === "inherit" || v === "ignore" || v === "pipe") return v;
+    // streams, fds, null/undefined: treat as pipe
+    return "pipe";
+  };
+  if (stdio == null) return ["pipe", "pipe", "pipe"];
+  if (typeof stdio === "string") {
+    const v = norm(stdio);
+    return [v, v, v];
+  }
+  if (Array.isArray(stdio)) {
+    return [norm(stdio[0]), norm(stdio[1]), norm(stdio[2])];
+  }
+  return ["pipe", "pipe", "pipe"];
+}
+
 export function spawn(
   command: string,
   argsOrOpts?: string[] | SpawnConfig,
@@ -1956,40 +2084,59 @@ export function spawn(
   } else if (argsOrOpts) cfg = argsOrOpts;
 
   const child = new ShellProcess();
+  // normalize stdio, node parity: 'pipe' default, 'inherit' to share parent
+  // streams, 'ignore' to drop. current spawn protocol only carries one
+  // top-level "pipe"|"inherit" so we pass "inherit" when stdin is inherit,
+  // else "pipe". stdout/stderr inherit works anyway because the streaming
+  // onStdout/onStderr callbacks route through getStdoutSink/getStderrSink.
+  const stdioArr = normalizeStdio(cfg.stdio);
+  const stdinInherit = stdioArr[0] === "inherit";
+  const stdoutInherit = stdioArr[1] === "inherit";
+  const stderrInherit = stdioArr[2] === "inherit";
 
-  // spawn() gets a dedicated worker (streaming output, long-lived processes).
-  // exec() runs inline since it collects all output at the end.
+  // spawn gets a dedicated worker (streaming output, long-lived). exec runs
+  // inline since it collects all output at the end.
   if (_spawnChildFn) {
     const cwd = cfg.cwd ?? getShellCwd();
     const env = (cfg.env as Record<string, string>) ?? {};
     const fullCmd = spawnArgs.length ? `${command} ${spawnArgs.join(" ")}` : command;
 
-    // keep parent alive while child is running
-    ref();
+    // keep parent alive while child is running. stash the Handle on the
+    // ShellProcess so its .ref()/.unref() can forward to it.
+    const childHandle = getRegistry().register("ChildProcess");
+    (child as any)._elHandle = childHandle;
 
-    // Track whether streaming callbacks fire (they don't for builtins like ls)
+    // builtins like ls don't stream, so track whether callbacks actually fired
     let stdoutStreamed = false;
     let stderrStreamed = false;
 
     _spawnChildFn(command, spawnArgs, {
       cwd,
       env,
-      stdio: "pipe",
+      stdio: stdinInherit ? "inherit" : "pipe",
       onStdout: (data: string) => {
         stdoutStreamed = true;
-        child.stdout?.push(Buffer.from(data));
-        // also route through parent's stdout sink for terminal output
-        const sink = getStdoutSink();
-        if (sink) sink(data);
+        // pipe: buffer for parent to read via child.stdout.on('data')
+        // ignore: drop entirely
+        if (stdioArr[1] === "pipe") child.stdout?.push(Buffer.from(data));
+        // inherit: also route through parent's stdout sink (terminal).
+        // we always route to the terminal sink for compatibility, this is
+        // what pre-stdio-normalization behavior did.
+        if (stdoutInherit) {
+          const sink = getStdoutSink();
+          if (sink) sink(data);
+        }
       },
       onStderr: (data: string) => {
         stderrStreamed = true;
-        child.stderr?.push(Buffer.from(data));
-        const sink = getStderrSink();
-        if (sink) sink(data);
+        if (stdioArr[2] === "pipe") child.stderr?.push(Buffer.from(data));
+        if (stderrInherit) {
+          const sink = getStderrSink();
+          if (sink) sink(data);
+        }
       },
     }).then(({ exitCode, stdout, stderr }) => {
-      unref(); // Child done — release event loop hold
+      childHandle.close();
       // For commands that don't stream (builtins), push the buffered output
       if (!stdoutStreamed && stdout) child.stdout?.push(Buffer.from(stdout));
       if (!stderrStreamed && stderr) child.stderr?.push(Buffer.from(stderr));
@@ -1999,7 +2146,7 @@ export function spawn(
       child.emit("close", exitCode, null);
       child.emit("exit", exitCode, null);
     }).catch((e) => {
-      unref(); // Child done — release event loop hold
+      childHandle.close();
       child.emit("error", e instanceof Error ? e : new Error(String(e)));
     });
   } else if (_shell) {
@@ -2086,6 +2233,10 @@ export function spawnSync(
   const slot = _syncChannel.allocateSlot();
   const cwd = cfg.cwd ?? (globalThis as any).process?.cwd?.() ?? "/";
   const env = (cfg.env as Record<string, string>) ?? {};
+  // carry stdio to the main thread so it knows whether terminal stdin should
+  // be forwarded to the child (inherit) vs ignored (pipe). see the spawn-sync
+  // handler in process-manager.ts.
+  const stdioArr = normalizeStdio(cfg.stdio);
 
   (self as any).postMessage({
     type: "spawn-sync",
@@ -2096,6 +2247,7 @@ export function spawnSync(
     env,
     syncSlot: slot,
     shellCommand: full,
+    stdio: stdioArr,
   });
 
   // blocks until main thread spawns child and child completes
@@ -2195,8 +2347,10 @@ export function fork(
     return child;
   }
 
-  // keep parent alive while forked child is running
-  ref();
+  // keep parent alive while the forked child runs. stash on ShellProcess
+  // so .ref()/.unref() forward to it.
+  const childHandle = getRegistry().register("ChildProcess");
+  (child as any)._elHandle = childHandle;
   const handle = _forkChildFn(resolved, args, {
     cwd,
     env,
@@ -2215,7 +2369,7 @@ export function fork(
       child.emit("message", data);
     },
     onExit: (exitCode: number) => {
-      unref(); // Child done — release event loop hold
+      childHandle.close();
       child.exitCode = exitCode;
       child.connected = false;
       child.emit("exit", exitCode, null);
@@ -2305,10 +2459,14 @@ ShellProcess.prototype.send = function send(this: any, msg: unknown, cb?: (e: Er
 };
 
 ShellProcess.prototype.ref = function ref(this: any): any {
+  const h = this._elHandle as Handle | undefined;
+  if (h) h.ref();
   return this;
 };
 
 ShellProcess.prototype.unref = function unref(this: any): any {
+  const h = this._elHandle as Handle | undefined;
+  if (h) h.unref();
   return this;
 };
 

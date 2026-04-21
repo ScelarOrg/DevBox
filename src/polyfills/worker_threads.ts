@@ -3,7 +3,7 @@
 
 
 import { EventEmitter } from "./events";
-import { ref as eventLoopRef, unref as eventLoopUnref } from "../helpers/event-loop";
+import { getRegistry, type Handle } from "../helpers/event-loop";
 
 // shared defaults for main thread; child workers get per-engine overrides via buildResolver
 export let isMainThread = true;
@@ -66,15 +66,27 @@ interface MessagePortConstructor {
 export const MessagePort = function MessagePort(this: any) {
   if (!this) return;
   EventEmitter.call(this);
+  // starts unref'd, node refs on start()
+  this._elHandle = null;
 } as unknown as MessagePortConstructor;
 
 Object.setPrototypeOf(MessagePort.prototype, EventEmitter.prototype);
 
 MessagePort.prototype.postMessage = function postMessage(_val: unknown, _transfer?: unknown[]): void {};
-MessagePort.prototype.start = function start(): void {};
-MessagePort.prototype.close = function close(): void {};
-MessagePort.prototype.ref = function ref(): void {};
-MessagePort.prototype.unref = function unref(): void {};
+MessagePort.prototype.start = function start(this: any): void {
+  if (!this._elHandle) this._elHandle = getRegistry().register("MessagePort");
+};
+MessagePort.prototype.close = function close(this: any): void {
+  (this._elHandle as Handle | null)?.close();
+  this._elHandle = null;
+};
+MessagePort.prototype.ref = function ref(this: any): void {
+  if (!this._elHandle) this._elHandle = getRegistry().register("MessagePort");
+  else this._elHandle.ref();
+};
+MessagePort.prototype.unref = function unref(this: any): void {
+  (this._elHandle as Handle | null)?.unref();
+};
 
 
 export interface MessageChannel {
@@ -110,7 +122,7 @@ export interface Worker extends EventEmitter {
   resourceLimits: object;
   _handle: ReturnType<WorkerThreadForkFn> | null;
   _terminated: boolean;
-  _isReffed: boolean;
+  _elHandle: Handle | null;
   postMessage(value: unknown, _transferListOrOptions?: unknown): void;
   terminate(): Promise<number>;
   ref(): this;
@@ -157,7 +169,7 @@ export const Worker = function Worker(
   this.resourceLimits = {};
   this._handle = null;
   this._terminated = false;
-  this._isReffed = false;
+  this._elHandle = null;
 
   // if override is installed (napi-rs WASI worker factory), delegate — it handles both WASI workers and fork-based fallback
   if (_workerConstructorOverride) {
@@ -202,10 +214,8 @@ export const Worker = function Worker(
       self.emit("error", err);
     },
     onExit: (code: number) => {
-      if (self._isReffed) {
-        self._isReffed = false;
-        eventLoopUnref();
-      }
+      self._elHandle?.close();
+      self._elHandle = null;
       self._terminated = true;
       self.emit("exit", code);
     },
@@ -221,9 +231,8 @@ export const Worker = function Worker(
 
   this._handle = handle;
 
-  // keep parent alive while worker runs (Node.js default)
-  this._isReffed = true;
-  eventLoopRef();
+  // workers are refed by default in node, keeps parent alive
+  this._elHandle = getRegistry().register("Worker");
 
   queueMicrotask(() => {
     if (!self._terminated) self.emit("online");
@@ -240,10 +249,8 @@ Worker.prototype.postMessage = function postMessage(this: any, value: unknown, _
 
 Worker.prototype.terminate = function terminate(this: any): Promise<number> {
   if (this._handle && !this._terminated) {
-    if (this._isReffed) {
-      this._isReffed = false;
-      eventLoopUnref();
-    }
+    this._elHandle?.close();
+    this._elHandle = null;
     this._terminated = true;
     this._handle.terminate();
   }
@@ -251,18 +258,12 @@ Worker.prototype.terminate = function terminate(this: any): Promise<number> {
 };
 
 Worker.prototype.ref = function ref(this: any): any {
-  if (!this._isReffed && !this._terminated) {
-    this._isReffed = true;
-    eventLoopRef();
-  }
+  if (!this._terminated) (this._elHandle as Handle | null)?.ref();
   return this;
 };
 
 Worker.prototype.unref = function unref(this: any): any {
-  if (this._isReffed) {
-    this._isReffed = false;
-    eventLoopUnref();
-  }
+  (this._elHandle as Handle | null)?.unref();
   return this;
 };
 
@@ -329,14 +330,22 @@ export const BroadcastChannel = function BroadcastChannel(this: any, label: stri
   if (!this) return;
   EventEmitter.call(this);
   this.name = label;
+  this._elHandle = getRegistry().register("BroadcastChannel");
 } as unknown as BroadcastChannelConstructor;
 
 Object.setPrototypeOf(BroadcastChannel.prototype, EventEmitter.prototype);
 
 BroadcastChannel.prototype.postMessage = function postMessage(_msg: unknown): void {};
-BroadcastChannel.prototype.close = function close(): void {};
-BroadcastChannel.prototype.ref = function ref(): void {};
-BroadcastChannel.prototype.unref = function unref(): void {};
+BroadcastChannel.prototype.close = function close(this: any): void {
+  (this._elHandle as Handle | null)?.close();
+  this._elHandle = null;
+};
+BroadcastChannel.prototype.ref = function ref(this: any): void {
+  (this._elHandle as Handle | null)?.ref();
+};
+BroadcastChannel.prototype.unref = function unref(this: any): void {
+  (this._elHandle as Handle | null)?.unref();
+};
 
 
 export function moveMessagePortToContext(

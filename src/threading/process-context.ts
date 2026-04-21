@@ -3,6 +3,7 @@
 // One active context on main thread; each worker gets its own.
 
 import type { MemoryVolume } from "../memory-volume";
+import { createHandleRegistry, type HandleRegistry } from "../helpers/event-loop";
 
 // --- I/O interfaces ---
 
@@ -29,8 +30,8 @@ export interface ProcessContext {
 
   volume: MemoryVolume;
 
-  refCount: number;
-  drainListeners: Set<() => void>;
+  /** typed Handle registry, tracks live async primitives for loop liveness */
+  handles: HandleRegistry;
 
   termCols: (() => number) | null;
   termRows: (() => number) | null;
@@ -68,8 +69,7 @@ export function createProcessContext(opts: {
 
     volume: opts.volume,
 
-    refCount: 0,
-    drainListeners: new Set(),
+    handles: createHandleRegistry(),
 
     termCols: null,
     termRows: null,
