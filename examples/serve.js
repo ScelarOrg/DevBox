@@ -51,4 +51,5 @@ createServer((req, res) => {
   console.log(`  Native WASI test:     http://localhost:${port}/examples/native-wasi-test/`);
   console.log(`  SW setup DX:          http://localhost:${port}/examples/sw-setup/`);
   console.log(`  Terminal resize:      http://localhost:${port}/examples/terminal-resize/`);
+  console.log(`  Shared FS attach:     http://localhost:${port}/examples/shared-fs-attach/`);
 });

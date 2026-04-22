@@ -206,26 +206,31 @@ export class VFSBridge {
     const handle = this._volume.watch("/", { recursive: true }, (event, filename) => {
       if (!filename || this._suppressWatch) return;
 
+      // watch callbacks get filenames relative to the watch root, so
+      // writing /hello.txt while watching / comes through as "hello.txt".
+      // SharedVFS and broadcast keys are absolute, promote it here.
+      const absPath = filename.startsWith("/") ? filename : "/" + filename;
+
       try {
-        if (this._volume.existsSync(filename)) {
-          const stat = this._volume.statSync(filename);
+        if (this._volume.existsSync(absPath)) {
+          const stat = this._volume.statSync(absPath);
           if (stat.isDirectory()) {
-            this.broadcastChange(filename, new ArrayBuffer(0), -1);
-            if (this._sharedVFS) this._sharedVFS.writeDirectory(filename);
+            this.broadcastChange(absPath, new ArrayBuffer(0), -1);
+            if (this._sharedVFS) this._sharedVFS.writeDirectory(absPath);
           } else {
-            const data = this._volume.readFileSync(filename);
+            const data = this._volume.readFileSync(absPath);
             // fresh ArrayBuffer copy — VFS nodes may store SAB-backed Uint8Arrays when written from WASM threads, and SAB isn't transferable via postMessage
             const buffer = new ArrayBuffer(data.byteLength);
             new Uint8Array(buffer).set(data);
-            this.broadcastChange(filename, buffer, -1);
-            if (this._sharedVFS) this._sharedVFS.writeFile(filename, data);
+            this.broadcastChange(absPath, buffer, -1);
+            if (this._sharedVFS) this._sharedVFS.writeFile(absPath, data);
           }
         } else {
-          this.broadcastChange(filename, null, -1);
-          if (this._sharedVFS) this._sharedVFS.deleteFile(filename);
+          this.broadcastChange(absPath, null, -1);
+          if (this._sharedVFS) this._sharedVFS.deleteFile(absPath);
         }
       } catch (e) {
-        console.warn(`[VFSBridge] Watch error for "${filename}":`, e);
+        console.warn(`[VFSBridge] Watch error for "${absPath}":`, e);
       }
     });
 

@@ -48,6 +48,14 @@ const DATA_OFFSET = HEADER_SIZE + TABLE_SIZE;
 
 const DEFAULT_BUFFER_SIZE = 64 * 1024 * 1024; // 64MB
 
+export interface SharedVFSStat {
+  isFile: boolean;
+  isDirectory: boolean;
+  size: number;
+  /** ms since epoch. resolution is seconds, the SAB only stores seconds. */
+  mtime: number;
+}
+
 /* ------------------------------------------------------------------ */
 /*  FNV-1a hash                                                        */
 /* ------------------------------------------------------------------ */
@@ -314,6 +322,51 @@ export class SharedVFSReader {
     return (flags & FLAG_ACTIVE) !== 0 && (flags & FLAG_DIRECTORY) !== 0;
   }
 
+  statSync(path: string): SharedVFSStat | null {
+    const idx = this._findEntry(path);
+    if (idx === -1) return null;
+    const entryOffset = HEADER_SIZE + idx * ENTRY_SIZE;
+    const flags = this._view.getUint32(entryOffset + ENTRY_FLAGS_OFFSET);
+    if (!(flags & FLAG_ACTIVE)) return null;
+    const isDirectory = (flags & FLAG_DIRECTORY) !== 0;
+    const contentLength = this._view.getUint32(entryOffset + ENTRY_CONTENT_LENGTH);
+    const modified = this._view.getUint32(entryOffset + ENTRY_MODIFIED_OFFSET);
+    return {
+      isFile: !isDirectory,
+      isDirectory,
+      size: isDirectory ? 0 : contentLength,
+      mtime: modified * 1000,
+    };
+  }
+
+  // immediate children only, basenames, O(n) over the entry table.
+  // returns [] for missing paths.
+  readdirSync(dir: string): string[] {
+    const prefix = dir === "/" ? "/" : dir.endsWith("/") ? dir : dir + "/";
+    const entryCount = Atomics.load(this._int32, 1);
+    const names: string[] = [];
+    const seen = new Set<string>();
+
+    for (let i = 0; i < entryCount; i++) {
+      const entryOffset = HEADER_SIZE + i * ENTRY_SIZE;
+      const flags = this._view.getUint32(entryOffset + ENTRY_FLAGS_OFFSET);
+      if (!(flags & FLAG_ACTIVE)) continue;
+
+      const path = this._readPath(entryOffset);
+      if (!path.startsWith(prefix) || path === prefix) continue;
+
+      // strip prefix then take up to the next slash, skip nested entries
+      const rest = path.slice(prefix.length);
+      const slashIdx = rest.indexOf("/");
+      const name = slashIdx === -1 ? rest : rest.slice(0, slashIdx);
+      if (!name || seen.has(name)) continue;
+      seen.add(name);
+      names.push(name);
+    }
+
+    return names;
+  }
+
   get version(): number {
     return Atomics.load(this._int32, 0);
   }
@@ -348,5 +401,18 @@ export class SharedVFSReader {
       }
     }
     return -1;
+  }
+
+  // decode a null-terminated path from an entry. needs a non-shared copy
+  // because TextDecoder throws on SAB views.
+  private _readPath(entryOffset: number): string {
+    let end = 0;
+    while (end < ENTRY_PATH_MAX && this._uint8[entryOffset + ENTRY_PATH_OFFSET + end] !== 0) {
+      end++;
+    }
+    if (end === 0) return "";
+    const copy = new Uint8Array(end);
+    copy.set(this._uint8.subarray(entryOffset + ENTRY_PATH_OFFSET, entryOffset + ENTRY_PATH_OFFSET + end));
+    return this._pathDecoder.decode(copy);
   }
 }

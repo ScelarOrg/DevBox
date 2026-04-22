@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>nodepod - shared FS attach from sibling worker</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: monospace; background: #1a1a2e; color: #e0e0e0; padding: 24px; }
+    h1 { font-size: 18px; margin-bottom: 8px; color: #fff; }
+    p { font-size: 13px; color: #888; margin-bottom: 20px; max-width: 800px; line-height: 1.5; }
+    #output {
+      background: #0d0d1a;
+      border: 1px solid #333;
+      border-radius: 6px;
+      padding: 16px;
+      min-height: 400px;
+      white-space: pre-wrap;
+      font-size: 14px;
+      line-height: 1.6;
+      overflow-y: auto;
+    }
+    .stdout { color: #a8e6a3; }
+    .stderr { color: #e68a8a; }
+    .info   { color: #8ac4e6; }
+    .dim    { color: #555; }
+    .pass   { color: #a8e6a3; }
+    .fail   { color: #e68a8a; font-weight: bold; }
+    .main   { color: #e6c38a; }
+    .sib    { color: #c48ae6; }
+  </style>
+</head>
+<body>
+  <h1>nodepod - shared FS attach from sibling worker</h1>
+  <p>
+    Demo of <code>Nodepod.attachFS(sab)</code>. Main thread boots nodepod, creates a plain
+    <em>sibling</em> Web Worker (not one nodepod spawned via <code>spawn()</code>), and
+    postMessages it the shared VFS buffer. The sibling reads files straight out of the same
+    SharedArrayBuffer, no IPC per call. When main writes a new file the sibling sees it on the
+    next read because they're looking at the same memory. [gold = main, purple = sibling]
+  </p>
+  <div id="output"></div>
+
+  <script type="module">
+    import { Nodepod } from "/dist/index.mjs";
+
+    const out = document.getElementById('output');
+    function log(text, cls = 'stdout') {
+      const span = document.createElement('span');
+      span.className = cls;
+      span.textContent = text + '\n';
+      out.appendChild(span);
+      out.scrollTop = out.scrollHeight;
+    }
+
+    log('[main] Booting nodepod...', 'main');
+
+    const nodepod = await Nodepod.boot({
+      files: {
+        '/hello.txt': 'hello from the main thread',
+        '/proj/package.json': JSON.stringify({ name: 'demo', version: '1.0.0' }, null, 2),
+        '/proj/src/index.js': '// sibling worker reads this one direct from SAB\nmodule.exports = 42;',
+        '/proj/src/util.js': 'module.exports = { add: (a, b) => a + b };',
+        '/proj/README.md': '# demo project\n\nused in the shared-fs-attach example',
+      },
+      serviceWorker: false, // not needed for this demo
+    });
+
+    log('[main] Booted. SAB size: ' + nodepod.sharedFSBuffer?.byteLength + ' bytes', 'main');
+    log('', 'dim');
+
+    // sibling runs outside nodepod's process manager
+    const sibling = new Worker('/examples/shared-fs-attach/sibling-worker.js', { type: 'module' });
+
+    sibling.addEventListener('message', (ev) => {
+      const { type, text, cls } = ev.data;
+      if (type === 'log') {
+        log('[sibling] ' + text, cls || 'sib');
+      }
+    });
+
+    // the whole attach handshake, one postMessage
+    log('[main] postMessage sharedFSBuffer to sibling...', 'main');
+    sibling.postMessage({ type: 'attach', buffer: nodepod.sharedFSBuffer });
+
+    await new Promise((r) => setTimeout(r, 600));
+
+    log('[main] Writing /live.txt via nodepod.fs ...', 'main');
+    await nodepod.fs.writeFile('/live.txt', 'written after sibling attached');
+    sibling.postMessage({ type: 'reread', path: '/live.txt' });
+
+    await new Promise((r) => setTimeout(r, 400));
+    log('', 'dim');
+    log('[main] Trying a write from the sibling (should throw ENOTSUP)...', 'main');
+    sibling.postMessage({ type: 'try-write' });
+
+    await new Promise((r) => setTimeout(r, 400));
+    log('', 'dim');
+    log('[main] Demo complete.', 'info');
+  </script>
+</body>
+</html>

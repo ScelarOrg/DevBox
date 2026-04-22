@@ -27,7 +27,9 @@ import { VFSBridge } from "../threading/vfs-bridge";
 import {
   isSharedArrayBufferAvailable,
   SharedVFSController,
+  SharedVFSReader,
 } from "../threading/shared-vfs";
+import { NodepodFSClient } from "./nodepod-fs-client";
 import { SyncChannelController } from "../threading/sync-channel";
 import { MemoryHandler } from "../memory-handler";
 import { openSnapshotCache } from "../persistence/idb-cache";
@@ -651,6 +653,33 @@ export class Nodepod {
       };
     }
     return { vfs, engine, heap };
+  }
+
+  /**
+   * postMessage this to a sibling worker (one the host app spawned, not one
+   * nodepod spawned via spawn()), then call Nodepod.attachFS(buffer) on the
+   * other side. null if SAB is unavailable, but boot() would have thrown in
+   * that case so this is mostly defensive.
+   *
+   * caps: 16,384 entries, 64 MB, 248-byte paths. writes past the caps
+   * silently drop, not ideal for node_modules scale scans.
+   */
+  get sharedFSBuffer(): SharedArrayBuffer | null {
+    return this._sharedVFS?.buffer ?? null;
+  }
+
+  /**
+   * attach to an existing nodepod from a sibling worker using the buffer
+   * from nodepod.sharedFSBuffer. the returned client is read-only, writes
+   * throw ENOTSUP.
+   */
+  static attachFS(buffer: SharedArrayBuffer): NodepodFSClient {
+    if (!isSharedArrayBufferAvailable()) {
+      throw new Error(
+        "[Nodepod.attachFS] SharedArrayBuffer is required. Ensure COOP/COEP headers are set.",
+      );
+    }
+    return new NodepodFSClient(new SharedVFSReader(buffer));
   }
 
   /* ---- Escape hatches ---- */

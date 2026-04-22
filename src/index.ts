@@ -162,6 +162,7 @@ export { Nodepod } from "./sdk/nodepod";
 export { NodepodTerminal } from "./sdk/nodepod-terminal";
 export { NodepodProcess } from "./sdk/nodepod-process";
 export { NodepodFS } from "./sdk/nodepod-fs";
+export { NodepodFSClient, NodepodFSClientError } from "./sdk/nodepod-fs-client";
 export type {
   NodepodOptions,
   TerminalOptions,
@@ -182,6 +183,7 @@ export { VFSBridge } from "./threading/vfs-bridge";
 export { WorkerVFS } from "./threading/worker-vfs";
 export { SyncChannelController, SyncChannelWorker } from "./threading/sync-channel";
 export { SharedVFSController, SharedVFSReader, isSharedArrayBufferAvailable } from "./threading/shared-vfs";
+export type { SharedVFSStat } from "./threading/shared-vfs";
 export { createProcessContext, getActiveContext, setActiveContext } from "./threading/process-context";
 export type { ProcessContext, ProcessWriter, ProcessReader, OpenFileEntry } from "./threading/process-context";
 export type {
