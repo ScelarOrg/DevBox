@@ -40,6 +40,7 @@ const _nativeSetTimeout: typeof globalThis.setTimeout =
   globalThis.setTimeout.bind(globalThis);
 
 let _syncChannel: SyncChannelWorker | null = null;
+let _sabEnabled = true;
 
 let _stdoutSink: ((text: string) => void) | null = null;
 let _stderrSink: ((text: string) => void) | null = null;
@@ -162,6 +163,10 @@ export function clearStreamingCallbacks(): void {
 // set the SyncChannelWorker for true blocking execSync/spawnSync in worker mode
 export function setSyncChannel(channel: SyncChannelWorker): void {
   _syncChannel = channel;
+}
+
+export function setSabEnabled(enabled: boolean): void {
+  _sabEnabled = enabled;
 }
 
 // onStdout/onStderr fire in real-time as output arrives; promise resolves on child exit
@@ -353,6 +358,7 @@ function evalNodeCode(code: string, ctx: ShellContext): ShellResult {
   const sandbox = new ScriptEngine(_vol!, {
     cwd: ctx.cwd,
     env: ctx.env,
+    enableSharedArrayBuffer: _sabEnabled,
     onConsole: (m: string, args: unknown[]) => {
       const line = utilFormat(args[0], ...args.slice(1)) + "\n";
       m === "error" ? (err += line) : (out += line);
@@ -381,6 +387,7 @@ function printNodeCode(code: string, ctx: ShellContext): ShellResult {
   const sandbox = new ScriptEngine(_vol!, {
     cwd: ctx.cwd,
     env: ctx.env,
+    enableSharedArrayBuffer: _sabEnabled,
     onConsole: (m: string, args: unknown[]) => {
       const line = utilFormat(args[0], ...args.slice(1)) + "\n";
       m === "error" ? (err += line) : (out += line);
@@ -1129,6 +1136,7 @@ export async function executeNodeBinary(
   const sandbox = new ScriptEngine(_vol, {
     cwd: ctx.cwd,
     env: ctx.env,
+    enableSharedArrayBuffer: _sabEnabled,
     onConsole: (m: string, cArgs: unknown[]) => {
       // filter out process.exit sentinel errors logged by library code
       if (cArgs.length === 1) {
@@ -1795,8 +1803,8 @@ export function execSync(cmd: string, opts?: RunOptions): string | Buffer {
   // true blocking path via Atomics.wait()
   if (!_syncChannel) {
     throw new Error(
-      "[Nodepod] execSync requires SyncChannel (worker mode with SharedArrayBuffer). " +
-      "Ensure Nodepod is running in worker mode with COOP/COEP headers.",
+      "[Nodepod] execSync needs SharedArrayBuffer + SyncChannel. " +
+      "enable COOP/COEP headers, or drop `enableSharedArrayBuffer: false` from NodepodOptions.",
     );
   }
 
@@ -2225,8 +2233,8 @@ export function spawnSync(
   // true blocking path via Atomics.wait()
   if (!_syncChannel) {
     throw new Error(
-      "[Nodepod] spawnSync requires SyncChannel (worker mode with SharedArrayBuffer). " +
-      "Ensure Nodepod is running in worker mode with COOP/COEP headers.",
+      "[Nodepod] spawnSync needs SharedArrayBuffer + SyncChannel. " +
+      "enable COOP/COEP headers, or drop `enableSharedArrayBuffer: false` from NodepodOptions.",
     );
   }
 
@@ -2485,6 +2493,7 @@ export default {
   clearStreamingCallbacks,
   sendStdin,
   setSyncChannel,
+  setSabEnabled,
   setSpawnChildCallback,
   setForkChildCallback,
   setIPCSend,

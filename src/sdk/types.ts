@@ -27,6 +27,15 @@ export interface NodepodOptions {
   memory?: MemoryHandlerOptions;
   /** Cache installed node_modules in IndexedDB for faster re-boots. Default: true. */
   enableSnapshotCache?: boolean;
+  /**
+   * set to false to force SAB off even if the runtime has it.
+   * useful for envs without COOP/COEP or for testing partial mode.
+   * when off: execSync/spawnSync throw on call, threaded wasi modules
+   * (rolldown, lightningcss, tailwind-oxide) refuse to load, and cross
+   * thread vfs reads fall back to async message passing.
+   * defaults to true.
+   */
+  enableSharedArrayBuffer?: boolean;
   /** domains allowed through the cors proxy. merged with built-in defaults
    *  (npm, github, esm.sh etc). pass null to allow everything */
   allowedFetchDomains?: string[] | null;

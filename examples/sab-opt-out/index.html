@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>nodepod - SharedArrayBuffer opt-out</title>
+    <style>
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      body { font-family: monospace; background: #1a1a2e; color: #e0e0e0; padding: 24px; line-height: 1.6; }
+      h1 { font-size: 18px; margin-bottom: 4px; color: #fff; }
+      h2 { font-size: 14px; margin: 20px 0 8px; color: #8ac4e6; }
+      p { font-size: 13px; color: #888; margin-bottom: 12px; }
+      code { background: #0d0d1a; padding: 2px 6px; border-radius: 3px; color: #a8e6a3; }
+      .demo { background: #0d0d1a; border: 1px solid #333; border-radius: 6px; padding: 16px; margin-bottom: 16px; }
+      button { background: #2a2a4a; color: #e0e0e0; border: 1px solid #444; border-radius: 4px; padding: 8px 14px; font-family: monospace; cursor: pointer; margin-right: 8px; margin-top: 8px; }
+      button:hover { background: #3a3a5a; }
+      button:disabled { opacity: 0.5; cursor: not-allowed; }
+      pre { background: #000; padding: 10px; border-radius: 3px; font-size: 12px; overflow-x: auto; margin-top: 8px; white-space: pre-wrap; color: #ccc; }
+      .ok { color: #a8e6a3; }
+      .err { color: #e68a8a; }
+      .warn { color: #e6c88a; }
+      .info { color: #8ac4e6; }
+      .dim { color: #555; }
+    </style>
+  </head>
+  <body>
+    <h1>nodepod · SharedArrayBuffer opt-out</h1>
+    <p>
+      By default nodepod uses SharedArrayBuffer for sync fs reads,
+      <code>execSync</code>/<code>spawnSync</code>, and threaded wasi modules
+      (rolldown, lightningcss, tailwind-oxide). Pass
+      <code>enableSharedArrayBuffer: false</code> to force it off.
+      Dependent features either degrade to async message passing, or
+      lazy-throw when actually invoked.
+    </p>
+
+    <div class="demo">
+      <h2>1 · Default boot (SAB on)</h2>
+      <p>
+        Happy path, matches what every other example does. Both a regular
+        script and <code>execSync</code> work.
+      </p>
+      <button id="default-boot">Boot with SAB on</button>
+      <pre id="default-out" class="dim">(click to run)</pre>
+    </div>
+
+    <div class="demo">
+      <h2>2 · Opt-out: <code>{ enableSharedArrayBuffer: false }</code></h2>
+      <p>
+        Boot still succeeds, you get a warn in devtools.
+        <code>isSharedArrayBufferEnabled</code> reads false. Regular scripts
+        and async fs still work. Common builtins like <code>echo</code>,
+        <code>ls</code>, <code>cat</code>, <code>pwd</code>, version checks
+        etc. have fast-paths that run in pure JS and still work. Anything
+        that needs a real subprocess (like
+        <code>execSync("node -e ...")</code>) throws with a message that
+        tells you how to turn SAB back on.
+      </p>
+      <button id="off-boot">Boot with SAB off</button>
+      <pre id="off-out" class="dim">(click to run)</pre>
+    </div>
+
+    <script type="module">
+      import { Nodepod } from "/dist/index.mjs";
+
+      function writeLine(el, text, cls = "") {
+        const line = document.createElement("div");
+        if (cls) line.className = cls;
+        line.textContent = text;
+        el.appendChild(line);
+      }
+      function resetOut(id) {
+        const el = document.getElementById(id);
+        el.textContent = "";
+        el.className = "";
+        return el;
+      }
+
+      const REGULAR_SCRIPT = `
+const os = require('os');
+const fs = require('fs');
+console.log('platform:', os.platform());
+fs.writeFileSync('/tmp/hello.txt', 'hi from partial mode');
+console.log('read back:', fs.readFileSync('/tmp/hello.txt', 'utf8'));
+`.trim();
+
+      // lots of commands have fast-paths inside child_process.handleSyncCommand
+      // (echo, pwd, cat, ls, uname, test, git, version checks) so they work
+      // without the sync channel. to actually hit the Atomics.wait route we
+      // need to spawn a real subprocess. node -e does that.
+      const EXECSYNC_SCRIPT = `
+const { execSync } = require('child_process');
+try {
+  const out = execSync('echo hi');
+  console.log('fast-path echo ok:', out.toString().trim());
+} catch (e) {
+  console.error('fast-path echo threw:', e.message);
+}
+try {
+  const out = execSync('node -e "console.log(2+2)"');
+  console.log('blocking node -e ok:', out.toString().trim());
+} catch (e) {
+  console.error('blocking node -e threw:', e.message);
+}
+`.trim();
+
+      async function bootAndRun(out, opts) {
+        writeLine(out, "> Nodepod.boot(" + JSON.stringify(opts) + ")", "dim");
+        const pod = await Nodepod.boot({
+          ...opts,
+          serviceWorker: false,
+          files: {
+            "/regular.js": REGULAR_SCRIPT,
+            "/exec.js": EXECSYNC_SCRIPT,
+          },
+        });
+        writeLine(
+          out,
+          "isSharedArrayBufferEnabled = " + pod.isSharedArrayBufferEnabled,
+          pod.isSharedArrayBufferEnabled ? "ok" : "warn",
+        );
+
+        writeLine(out, "", "dim");
+        writeLine(out, "> node regular.js", "dim");
+        const p1 = await pod.spawn("node", ["regular.js"]);
+        p1.on("output", (t) => writeLine(out, t.trimEnd(), "ok"));
+        p1.on("error", (t) => writeLine(out, t.trimEnd(), "err"));
+        await p1.completion;
+
+        writeLine(out, "", "dim");
+        writeLine(out, "> node exec.js", "dim");
+        const p2 = await pod.spawn("node", ["exec.js"]);
+        p2.on("output", (t) => writeLine(out, t.trimEnd(), "ok"));
+        p2.on("error", (t) => writeLine(out, t.trimEnd(), "err"));
+        await p2.completion;
+
+        return pod;
+      }
+
+      document.getElementById("default-boot").addEventListener("click", async () => {
+        const out = resetOut("default-out");
+        try {
+          await bootAndRun(out, {});
+          writeLine(out, "", "dim");
+          writeLine(out, "done", "info");
+        } catch (e) {
+          writeLine(out, "boot failed: " + e.message, "err");
+        }
+      });
+
+      document.getElementById("off-boot").addEventListener("click", async () => {
+        const out = resetOut("off-out");
+        writeLine(out, "(check devtools console for the boot warn)", "dim");
+        try {
+          await bootAndRun(out, { enableSharedArrayBuffer: false });
+          writeLine(out, "", "dim");
+          writeLine(out, "done. echo works (fast-path), node -e threw (needed real blocking)", "info");
+        } catch (e) {
+          writeLine(out, "boot failed: " + e.message, "err");
+        }
+      });
+    </script>
+  </body>
+</html>

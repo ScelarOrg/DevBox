@@ -169,6 +169,7 @@ export function createNapiWorkerFactory(
   processEnv: Record<string, string>,
   fsBridge: any, // for handling __fs__ proxy messages
   fallbackWorkerFn: ((...args: any[]) => any) | null,
+  sabEnabled: boolean,
 ) {
   // bundled scripts don't change at runtime, so cache per entry path
   const bundleCache = new Map<string, string>();
@@ -181,6 +182,19 @@ export function createNapiWorkerFactory(
     const scriptStr = typeof script === "string" ? script : script.href;
 
     if (isNapiWasiWorkerScript(scriptStr, vol)) {
+      // threaded wasi needs SAB for Atomics.wait, would deadlock without it
+      if (!sabEnabled) {
+        queueMicrotask(() => {
+          this.emit?.(
+            "error",
+            new Error(
+              `[Nodepod] ${scriptStr} needs SharedArrayBuffer (threaded wasi module). ` +
+                "enable COOP/COEP headers, or drop `enableSharedArrayBuffer: false` from NodepodOptions.",
+            ),
+          );
+        });
+        return;
+      }
       return createRealWebWorker.call(
         this,
         scriptStr,

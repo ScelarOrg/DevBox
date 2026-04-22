@@ -24,6 +24,7 @@ let _suppressVFSWatch = false;
 let _shellInitialized = false;
 let _shellMod: typeof import("../polyfills/child_process") | null = null;
 let _syncChannelWorker: SyncChannelWorker | null = null;
+let _sabEnabled = true;
 let _ipcMessageHandler: ((data: unknown) => void) | null = null;
 let _cols = 80;
 let _rows = 24;
@@ -184,6 +185,8 @@ function handleInit(msg: MainToWorker_Init): void {
   if (msg.syncBuffer) {
     _syncChannelWorker = new SyncChannelWorker(msg.syncBuffer);
   }
+  // if main had SAB off, neither buffer was sent
+  _sabEnabled = !!msg.syncBuffer;
 
   _initialized = true;
   post({ type: "ready", pid: _pid });
@@ -200,6 +203,7 @@ async function ensureShell(): Promise<typeof import("../polyfills/child_process"
     if (_syncChannelWorker) {
       _shellMod.setSyncChannel(_syncChannelWorker);
     }
+    _shellMod.setSabEnabled(_sabEnabled);
     _shellMod.setSpawnChildCallback(spawnChild);
     _shellMod.setForkChildCallback(forkChild);
     const wtMod = await import("../polyfills/worker_threads");

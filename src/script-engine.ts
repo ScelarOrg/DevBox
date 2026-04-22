@@ -879,6 +879,7 @@ export interface EngineOptions {
     threadId: number;
   };
   handler?: import("./memory-handler").MemoryHandler;
+  enableSharedArrayBuffer?: boolean;
 }
 
 export interface ResolverFn {
@@ -2118,6 +2119,7 @@ export class ScriptEngine {
         this.proc.env as Record<string, string>,
         this.fsBridge,
         (threadPoolPolyfill as any)._workerThreadForkFn ?? null,
+        this.opts.enableSharedArrayBuffer ?? true,
       );
       threadPoolPolyfill.setWorkerConstructorOverride((self, script, opts) => {
         workerFactory.call(self, script, opts);

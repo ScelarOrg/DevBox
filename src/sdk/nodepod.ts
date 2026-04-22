@@ -49,6 +49,7 @@ export class Nodepod {
   private _syncChannel: SyncChannelController | null = null;
   private _unwatchVFS: (() => void) | null = null;
   private _handler: MemoryHandler;
+  private _sabEnabled: boolean;
 
   /* ---- Construction (use Nodepod.boot()) ---- */
 
@@ -59,6 +60,7 @@ export class Nodepod {
     cwd: string,
     handler: MemoryHandler,
     env: Record<string, string>,
+    sabEnabled: boolean,
   ) {
     this._volume = volume;
     this._packages = packages;
@@ -66,6 +68,7 @@ export class Nodepod {
     this._cwd = cwd;
     this._env = env;
     this._handler = handler;
+    this._sabEnabled = sabEnabled;
     this.fs = new NodepodFS(volume);
     this._processManager = new ProcessManager(volume);
     this._vfsBridge = new VFSBridge(volume);
@@ -85,7 +88,7 @@ export class Nodepod {
     // VFS watcher broadcasts main-thread file changes to workers (needed for HMR)
     this._unwatchVFS = this._vfsBridge.watch();
 
-    if (isSharedArrayBufferAvailable()) {
+    if (sabEnabled) {
       try {
         this._sharedVFS = new SharedVFSController();
         this._processManager.setSharedBuffer(this._sharedVFS.buffer);
@@ -99,6 +102,14 @@ export class Nodepod {
         this._processManager.setSyncBuffer(this._syncChannel.buffer);
       } catch (e) {
         // SyncChannel init failed
+      }
+
+      // SAB was detected but controllers failed, probably COOP/COEP
+      if (!this._sharedVFS || !this._syncChannel) {
+        this._sabEnabled = false;
+        console.warn(
+          "[Nodepod] SharedArrayBuffer init failed mid-boot, features disabled.",
+        );
       }
     }
 
@@ -154,9 +165,18 @@ export class Nodepod {
         "[Nodepod] Web Workers are required. Nodepod cannot run without Web Worker support.",
       );
     }
-    if (typeof SharedArrayBuffer === "undefined") {
-      throw new Error(
-        "[Nodepod] SharedArrayBuffer is required. Ensure Cross-Origin-Isolation headers are set (Cross-Origin-Opener-Policy: same-origin, Cross-Origin-Embedder-Policy: credentialless).",
+
+    const sabAvailable = isSharedArrayBufferAvailable();
+    const sabEnabled = opts.enableSharedArrayBuffer !== false && sabAvailable;
+    if (!sabEnabled) {
+      const reason = !sabAvailable
+        ? "unavailable (likely missing COOP/COEP headers)"
+        : "disabled via enableSharedArrayBuffer: false";
+      console.warn(
+        `[Nodepod] SharedArrayBuffer ${reason}. ` +
+          "execSync/spawnSync will throw on call, threaded wasi modules " +
+          "(rolldown, lightningcss, tailwind-oxide) will refuse to load, " +
+          "cross-thread vfs reads use async message passing.",
       );
     }
 
@@ -189,7 +209,15 @@ export class Nodepod {
       setAllowedDomains(opts.allowedFetchDomains ?? []);
     }
 
-    const nodepod = new Nodepod(volume, packages, proxy, cwd, handler, env);
+    const nodepod = new Nodepod(
+      volume,
+      packages,
+      proxy,
+      cwd,
+      handler,
+      env,
+      sabEnabled,
+    );
 
     if (opts.files) {
       for (const [path, content] of Object.entries(opts.files)) {
@@ -705,5 +733,9 @@ export class Nodepod {
   }
   get cwd(): string {
     return this._cwd;
+  }
+  /** true if SAB features are active on this instance */
+  get isSharedArrayBufferEnabled(): boolean {
+    return this._sabEnabled;
   }
 }
