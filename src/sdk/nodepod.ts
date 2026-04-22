@@ -34,8 +34,22 @@ import { SyncChannelController } from "../threading/sync-channel";
 import { MemoryHandler } from "../memory-handler";
 import { openSnapshotCache } from "../persistence/idb-cache";
 
+// short url-safe id. always starts with a letter so it can't be confused
+// with a port number in /__virtual__/{id}/{port}
+function makeInstanceId(): string {
+  const rand =
+    typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+      ? crypto.randomUUID().replace(/-/g, "").slice(0, 8)
+      : Math.random().toString(36).slice(2, 10);
+  return "pod" + rand;
+}
+
 export class Nodepod {
   readonly fs: NodepodFS;
+
+  /** unique id used by RequestProxy + SW to route back to this Nodepod when
+   *  multiple coexist on one page */
+  readonly instanceId: string;
 
   private _volume: MemoryVolume;
   private _packages: DependencyInstaller;
@@ -61,6 +75,7 @@ export class Nodepod {
     handler: MemoryHandler,
     env: Record<string, string>,
     sabEnabled: boolean,
+    instanceId: string,
   ) {
     this._volume = volume;
     this._packages = packages;
@@ -69,6 +84,7 @@ export class Nodepod {
     this._env = env;
     this._handler = handler;
     this._sabEnabled = sabEnabled;
+    this.instanceId = instanceId;
     this.fs = new NodepodFS(volume);
     this._processManager = new ProcessManager(volume);
     this._vfsBridge = new VFSBridge(volume);
@@ -146,15 +162,15 @@ export class Nodepod {
             };
           },
         };
-        this._proxy.register(proxyServer, port);
+        this._proxy.register(this.instanceId, proxyServer, port);
       },
     );
 
     this._processManager.on("server-close", (_pid: number, port: number) => {
-      this._proxy.unregister(port);
+      this._proxy.unregister(this.instanceId, port);
     });
 
-    this._proxy.setProcessManager(this._processManager);
+    this._proxy.attach(this.instanceId, this._processManager);
   }
 
   /* ---- Static factory ---- */
@@ -217,6 +233,7 @@ export class Nodepod {
       handler,
       env,
       sabEnabled,
+      makeInstanceId(),
     );
 
     if (opts.files) {
@@ -595,19 +612,20 @@ export class Nodepod {
   // Useful for setting up a communication bridge between the main window and
   // the preview iframe, injecting polyfills, analytics, etc.
   async setPreviewScript(script: string): Promise<void> {
-    this._proxy.setPreviewScript(script);
+    this._proxy.setPreviewScript(this.instanceId, script);
   }
 
   async clearPreviewScript(): Promise<void> {
-    this._proxy.setPreviewScript(null);
+    this._proxy.setPreviewScript(this.instanceId, null);
   }
 
   /* ---- port() ---- */
 
-  // Returns the preview URL for a server on this port, or null
+  // preview url for a server on this port, or null. scoped to instanceId so
+  // multiple Nodepods on one page don't collide
   port(num: number): string | null {
-    if (this._proxy.activePorts().includes(num)) {
-      return this._proxy.serverUrl(num);
+    if (this._proxy.activePorts(this.instanceId).includes(num)) {
+      return this._proxy.serverUrl(this.instanceId, num);
     }
     return null;
   }
@@ -648,6 +666,12 @@ export class Nodepod {
     if (this._unwatchVFS) {
       this._unwatchVFS();
       this._unwatchVFS = null;
+    }
+    // release our slot so sibling Nodepods on the same page keep working
+    try {
+      this._proxy.detach(this.instanceId);
+    } catch {
+      /* */
     }
     this._processManager.teardown();
     this._volume.dispose();

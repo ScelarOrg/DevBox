@@ -1,5 +1,11 @@
 // bridges Service Worker HTTP requests to virtual servers.
 // intercepts browser fetches via SW and routes them to the http polyfill's server registry.
+//
+// multi-tenant: one RequestProxy singleton (one SW per scope), state is
+// multiplexed across N Nodepods by instanceId. each Nodepod attach()/detach()s
+// and routes its servers/preview scripts/WS bridge under its own id. SW fetches
+// carry /__virtual__/{instanceId}/{port}/... back to the right instance.
+// Legacy /__virtual__/{port}/... falls back to DEFAULT_INSTANCE.
 
 import type { CompletedResponse } from "./polyfills/http";
 import {
@@ -24,6 +30,17 @@ export { NodepodSWSetupError };
 export type { NodepodSWFrameworkHint } from "./integrations/shared/errors";
 
 const _enc = new TextEncoder();
+
+/** used by legacy zero-arg callers (createWorkspace, setServerListenCallback).
+ *  multi-tenant callers pass their own instanceId */
+export const DEFAULT_INSTANCE = "default";
+
+/** id must be non-empty, url-safe, and have at least one non-digit so the url
+ *  parser can tell it apart from a port number */
+function isValidInstanceId(id: string): boolean {
+  if (!id || !/^[A-Za-z0-9_-]+$/.test(id)) return false;
+  return /\D/.test(id);
+}
 
 export interface IVirtualServer {
   listening: boolean;
@@ -56,21 +73,44 @@ export interface ServiceWorkerConfig {
   skipPreflight?: boolean;
 }
 
+interface InstanceState {
+  processManager: any | null;
+  previewScript: string | null;
+  wsBridgeToken: string | null;
+  registry: Map<number, RegisteredServer>;
+  workerWsConns: Map<string, { pid: number }>;
+  wsConns: Map<
+    string,
+    { socket: import("./polyfills/net").TcpSocket; cleanup: () => void }
+  >;
+  /** kept so detach() can remove it */
+  wsFrameListener: ((msg: any) => void) | null;
+}
+
 export { CompletedResponse };
 
 export class RequestProxy extends EventEmitter {
   static DEBUG = false;
-  private registry = new Map<number, RegisteredServer>();
+  // ── Shared (process-wide) state ──
   private baseUrl: string;
   private opts: ProxyOptions;
   private channel: MessageChannel | null = null;
   private swReady = false;
   private heartbeat: ReturnType<typeof setInterval> | null = null;
-  private _processManager: any | null = null;
-  private _workerWsConns = new Map<string, { pid: number }>();
-  private _previewScript: string | null = null;
   private _swAuthToken: string | null = null;
-  private _wsBridgeToken: string | null = null;
+  /** memoizes concurrent initServiceWorker() callers so N parallel boots
+   *  don't kick off N registrations that hang Chromium */
+  private _swInitPromise: Promise<void> | null = null;
+  /** global, not per-instance. last writer wins across tabs */
+  private _watermarkEnabled = true;
+  /** guards pagehide/beforeunload listener registration so reinit doesn't stack them */
+  private _farewellInstalled = false;
+
+  // ── Per-instance state, keyed by instanceId ──
+  private _instances = new Map<string, InstanceState>();
+
+  // ── WS bridge (one BroadcastChannel for the page, messages tagged per-instance) ──
+  private _wsBridge: BroadcastChannel | null = null;
 
   constructor(opts: ProxyOptions = {}) {
     super();
@@ -80,42 +120,191 @@ export class RequestProxy extends EventEmitter {
         ? opts.baseUrl || `${location.protocol}//${location.host}`
         : opts.baseUrl || "http://localhost";
 
+    // legacy http polyfill callbacks fire only when main thread calls
+    // http.createServer().listen() directly (createWorkspace path). routed
+    // to DEFAULT_INSTANCE. Nodepod SDK uses register(instanceId, ...) instead
     setServerListenCallback((port, srv) => this.register(srv, port));
     setServerCloseCallback((port) => this.unregister(port));
   }
 
-  setProcessManager(pm: any): void {
-    this._processManager = pm;
-    pm.on("ws-frame", (msg: any) => {
-      this._handleWorkerWsFrame(msg);
-    });
+  private _getOrCreateInstance(instanceId: string): InstanceState {
+    let inst = this._instances.get(instanceId);
+    if (!inst) {
+      inst = {
+        processManager: null,
+        previewScript: null,
+        wsBridgeToken: null,
+        registry: new Map(),
+        workerWsConns: new Map(),
+        wsConns: new Map(),
+        wsFrameListener: null,
+      };
+      this._instances.set(instanceId, inst);
+    }
+    return inst;
   }
 
+  // ── Instance lifecycle ──
+
+  /** attach a Nodepod to this proxy. idempotent: re-attaching with the same
+   *  id rewires the process manager but keeps registry/preview script etc */
+  attach(instanceId: string, processManager: any): void {
+    if (instanceId !== DEFAULT_INSTANCE && !isValidInstanceId(instanceId)) {
+      throw new Error(
+        `[RequestProxy] invalid instanceId ${JSON.stringify(instanceId)}: ` +
+          `must be URL-safe and contain at least one non-digit char`,
+      );
+    }
+    const inst = this._getOrCreateInstance(instanceId);
+
+    // drop the old ws-frame listener on re-attach
+    if (inst.processManager && inst.wsFrameListener) {
+      try {
+        inst.processManager.removeListener?.(
+          "ws-frame",
+          inst.wsFrameListener,
+        );
+      } catch {
+        /* */
+      }
+    }
+
+    inst.processManager = processManager;
+    const listener = (msg: any) => this._handleWorkerWsFrame(instanceId, msg);
+    inst.wsFrameListener = listener;
+    processManager.on("ws-frame", listener);
+
+    // tell the SW which tab owns this instanceId so multi-tab fetches route
+    // correctly. without this Tab A's requests land on Tab B's RequestProxy
+    this.notifySW("claim-instance", { instanceId });
+  }
+
+  /** detach an instance, unregister all its servers and tear down its ws
+   *  connections. safe on an unknown id */
+  detach(instanceId: string): void {
+    const inst = this._instances.get(instanceId);
+    if (!inst) return;
+
+    for (const port of [...inst.registry.keys()]) {
+      this.notifySW("server-unregistered", { instanceId, port });
+    }
+    // release the routing claim so future fetches for this instance 503
+    // instead of hitting stale state
+    this.notifySW("release-instance", { instanceId });
+
+    if (inst.processManager && inst.wsFrameListener) {
+      try {
+        inst.processManager.removeListener?.(
+          "ws-frame",
+          inst.wsFrameListener,
+        );
+      } catch {
+        /* */
+      }
+    }
+
+    for (const { cleanup } of inst.wsConns.values()) {
+      try {
+        cleanup();
+      } catch {
+        /* */
+      }
+    }
+
+    this._instances.delete(instanceId);
+  }
+
+  /** @deprecated use attach(instanceId, pm). legacy callers route to DEFAULT_INSTANCE */
+  setProcessManager(pm: any): void {
+    this.attach(DEFAULT_INSTANCE, pm);
+  }
+
+  // ── Server registration ──
+
+  register(
+    instanceId: string,
+    server: Server | IVirtualServer,
+    port: number,
+    hostname?: string,
+  ): void;
   register(
     server: Server | IVirtualServer,
     port: number,
-    hostname = "0.0.0.0",
-  ): void {
-    this.registry.set(port, { server, port, hostname });
-    const url = this.serverUrl(port);
+    hostname?: string,
+  ): void;
+  register(...args: any[]): void {
+    let instanceId: string;
+    let server: Server | IVirtualServer;
+    let port: number;
+    let hostname: string;
+
+    if (typeof args[0] === "string") {
+      instanceId = args[0];
+      server = args[1];
+      port = args[2];
+      hostname = args[3] ?? "0.0.0.0";
+    } else {
+      instanceId = DEFAULT_INSTANCE;
+      server = args[0];
+      port = args[1];
+      hostname = args[2] ?? "0.0.0.0";
+    }
+
+    const inst = this._getOrCreateInstance(instanceId);
+    inst.registry.set(port, { server, port, hostname });
+    const url = this.serverUrl(instanceId, port);
+    // flat (port, url) shape kept for back-compat with existing listeners
     this.emit("server-ready", port, url);
     this.opts.onServerReady?.(port, url);
-    this.notifySW("server-registered", { port, hostname });
+    this.notifySW("server-registered", { instanceId, port, hostname });
   }
 
-  unregister(port: number): void {
-    this.registry.delete(port);
-    this.notifySW("server-unregistered", { port });
+  unregister(instanceId: string, port: number): void;
+  unregister(port: number): void;
+  unregister(...args: any[]): void {
+    let instanceId: string;
+    let port: number;
+    if (typeof args[0] === "string") {
+      instanceId = args[0];
+      port = args[1];
+    } else {
+      instanceId = DEFAULT_INSTANCE;
+      port = args[0];
+    }
+    const inst = this._instances.get(instanceId);
+    if (!inst) return;
+    inst.registry.delete(port);
+    this.notifySW("server-unregistered", { instanceId, port });
   }
 
   // Sends a script to the Service Worker that gets injected into every HTML
   // response served to preview iframes. Runs before any page content.
-  setPreviewScript(script: string | null): void {
-    this._previewScript = script;
-    this._sendPreviewScriptToSW();
+  setPreviewScript(instanceId: string, script: string | null): void;
+  setPreviewScript(script: string | null): void;
+  setPreviewScript(...args: any[]): void {
+    let instanceId: string;
+    let script: string | null;
+    if (args.length >= 2 || (args.length === 1 && typeof args[0] === "string" && isValidInstanceId(args[0]))) {
+      // 2 args means (instanceId, script). 1 string arg is the legacy shape
+      // where the string is the script itself
+      if (args.length >= 2) {
+        instanceId = args[0];
+        script = args[1];
+      } else {
+        instanceId = DEFAULT_INSTANCE;
+        script = args[0];
+      }
+    } else {
+      instanceId = DEFAULT_INSTANCE;
+      script = args[0] ?? null;
+    }
+    const inst = this._getOrCreateInstance(instanceId);
+    inst.previewScript = script;
+    this._sendPreviewScriptToSW(instanceId);
   }
 
   setWatermark(enabled: boolean): void {
+    this._watermarkEnabled = enabled;
     if (
       typeof navigator !== "undefined" &&
       navigator.serviceWorker?.controller
@@ -128,54 +317,101 @@ export class RequestProxy extends EventEmitter {
     }
   }
 
-  private _sendPreviewScriptToSW(): void {
+  private _sendPreviewScriptToSW(instanceId: string): void {
     if (
-      typeof navigator !== "undefined" &&
-      navigator.serviceWorker?.controller
+      typeof navigator === "undefined" ||
+      !navigator.serviceWorker?.controller
     ) {
-      navigator.serviceWorker.controller.postMessage({
-        type: "set-preview-script",
-        script: this._previewScript,
-        token: this._swAuthToken,
-      });
+      return;
     }
+    const inst = this._instances.get(instanceId);
+    if (!inst) return;
+    navigator.serviceWorker.controller.postMessage({
+      type: "set-preview-script",
+      instanceId,
+      script: inst.previewScript,
+      token: this._swAuthToken,
+    });
   }
 
-  private _sendWsTokenToSW(): void {
+  private _sendWsTokenToSW(instanceId: string): void {
     if (
-      typeof navigator !== "undefined" &&
-      navigator.serviceWorker?.controller
+      typeof navigator === "undefined" ||
+      !navigator.serviceWorker?.controller
     ) {
-      navigator.serviceWorker.controller.postMessage({
-        type: "set-ws-token",
-        wsToken: this._wsBridgeToken,
-        token: this._swAuthToken,
-      });
+      return;
     }
+    const inst = this._instances.get(instanceId);
+    if (!inst) return;
+    navigator.serviceWorker.controller.postMessage({
+      type: "set-ws-token",
+      instanceId,
+      wsToken: inst.wsBridgeToken,
+      token: this._swAuthToken,
+    });
   }
 
-  serverUrl(port: number): string {
-    return `${this.baseUrl}/__virtual__/${port}`;
+  serverUrl(instanceId: string, port: number): string;
+  serverUrl(port: number): string;
+  serverUrl(a: string | number, b?: number): string {
+    const instanceId = typeof a === "string" ? a : DEFAULT_INSTANCE;
+    const port = typeof a === "string" ? (b as number) : a;
+    return `${this.baseUrl}/__virtual__/${instanceId}/${port}`;
   }
 
-  activePorts(): number[] {
-    return [...this.registry.keys()];
+  /** ports registered with the given instance. no arg returns the union
+   *  across all instances (flat-list back-compat) */
+  activePorts(instanceId?: string): number[] {
+    if (instanceId !== undefined) {
+      const inst = this._instances.get(instanceId);
+      return inst ? [...inst.registry.keys()] : [];
+    }
+    const all = new Set<number>();
+    for (const inst of this._instances.values()) {
+      for (const p of inst.registry.keys()) all.add(p);
+    }
+    return [...all];
   }
 
+  async handleRequest(
+    instanceId: string,
+    port: number,
+    method: string,
+    url: string,
+    headers: Record<string, string>,
+    body?: ArrayBuffer,
+  ): Promise<CompletedResponse>;
   async handleRequest(
     port: number,
     method: string,
     url: string,
     headers: Record<string, string>,
     body?: ArrayBuffer,
-  ): Promise<CompletedResponse> {
-    const entry = this.registry.get(port);
+  ): Promise<CompletedResponse>;
+  async handleRequest(...args: any[]): Promise<CompletedResponse> {
+    let instanceId: string;
+    let port: number;
+    let method: string;
+    let url: string;
+    let headers: Record<string, string>;
+    let body: ArrayBuffer | undefined;
+    if (typeof args[0] === "string") {
+      [instanceId, port, method, url, headers, body] = args;
+    } else {
+      instanceId = DEFAULT_INSTANCE;
+      [port, method, url, headers, body] = args;
+    }
+
+    const inst = this._instances.get(instanceId);
+    const entry = inst?.registry.get(port);
     if (!entry) {
       return {
         statusCode: 503,
         statusMessage: "Service Unavailable",
         headers: { "Content-Type": "text/plain" },
-        body: Buffer.from(`No server on port ${port}`),
+        body: Buffer.from(
+          `No server on ${instanceId}/${port}`,
+        ),
       };
     }
     try {
@@ -233,7 +469,28 @@ export class RequestProxy extends EventEmitter {
     }
   }
 
-  async initServiceWorker(config?: ServiceWorkerConfig): Promise<void> {
+  /** concurrent callers share one in-flight promise, stops the Chromium
+   *  SW-registration storm when N Nodepods boot in parallel.
+   *
+   *  NOT async on purpose. an async wrapper would create a fresh outer
+   *  promise per call, so N callers each get their own identity and a
+   *  .catch() on the inner shared promise wouldn't reach them, causing
+   *  unhandled rejection warnings. returning the memoized promise directly
+   *  means all callers share one object */
+  initServiceWorker(config?: ServiceWorkerConfig): Promise<void> {
+    if (this.swReady) return Promise.resolve();
+    if (this._swInitPromise) return this._swInitPromise;
+    this._swInitPromise = this._doInitServiceWorker(config).catch((err) => {
+      // allow retry on failure
+      this._swInitPromise = null;
+      throw err;
+    });
+    return this._swInitPromise;
+  }
+
+  private async _doInitServiceWorker(
+    config?: ServiceWorkerConfig,
+  ): Promise<void> {
     if (!("serviceWorker" in navigator))
       throw new Error("Service Workers not supported");
 
@@ -243,70 +500,99 @@ export class RequestProxy extends EventEmitter {
       await this._preflightServiceWorker(swPath);
     }
 
-    // unregister old SWs and re-register with cache-busting to ensure latest __sw__.js
-    const existingRegs = await navigator.serviceWorker.getRegistrations();
-    for (const r of existingRegs) {
-      await r.unregister();
-    }
-    await new Promise(r => setTimeout(r, 100));
+    // fire and forget: register() can stall for seconds on hard refresh
+    // (Ctrl+Shift+R) while the browser reconciles the bypass. we don't need
+    // its promise to resolve, navigator.serviceWorker.ready below is the
+    // real signal
+    navigator.serviceWorker
+      .register(swPath, { scope: "/", updateViaCache: "none" })
+      .catch((err) => {
+        console.warn("[Nodepod] SW register() rejected:", err);
+      });
 
-    const controllerReady = new Promise<void>((res) => {
-      navigator.serviceWorker.addEventListener(
-        "controllerchange",
-        () => res(),
-        { once: true },
+    // .ready handles first install, repeat reload, hard refresh, and
+    // update-pending uniformly. timeout is a safety net
+    const reg = await Promise.race([
+      navigator.serviceWorker.ready,
+      new Promise<ServiceWorkerRegistration>((_, reject) =>
+        setTimeout(
+          () => reject(new Error("SW ready timeout")),
+          TIMEOUTS.SW_ACTIVATION,
+        ),
+      ),
+    ]);
+    const sw = reg.active;
+    if (!sw) {
+      throw new Error(
+        "Service Worker registration has no active worker after ready",
       );
-    });
-
-    const swUrl = `${swPath}?v=${Date.now()}`;
-    const reg = await navigator.serviceWorker.register(swUrl, { scope: "/", updateViaCache: "none" });
-
-    const sw = reg.installing || reg.waiting || reg.active;
-    if (!sw) throw new Error("Service Worker registration failed");
-
-    await new Promise<void>((resolve) => {
-      if (sw.state === "activated") return resolve();
-      const check = () => {
-        if (sw.state === "activated") {
-          sw.removeEventListener("statechange", check);
-          resolve();
-        }
-      };
-      sw.addEventListener("statechange", check);
-    });
+    }
 
     this._swAuthToken = crypto.randomUUID();
 
     this.channel = new MessageChannel();
     this.channel.port1.onmessage = this.onSWMessage.bind(this);
-    sw.postMessage({ type: "init", port: this.channel.port2, token: this._swAuthToken }, [
-      this.channel.port2,
-    ]);
+    sw.postMessage(
+      { type: "init", port: this.channel.port2, token: this._swAuthToken },
+      [this.channel.port2],
+    );
 
-    await controllerReady;
+    // claim every instance attached before the SW was ready. bypassing
+    // notifySW because swReady flips further down, but MessagePort delivery
+    // doesn't care: the browser queues messages on port2 until the SW sets
+    // its onmessage in the init handler
+    for (const id of this._instances.keys()) {
+      this.channel.port1.postMessage({
+        type: "claim-instance",
+        data: { instanceId: id },
+      });
+    }
 
+    // on SW update (controllerchange) the new SW has empty state. resend
+    // init + claims so it learns our routing table again
     const reinit = () => {
-      if (navigator.serviceWorker.controller) {
-        this.channel = new MessageChannel();
-        this.channel.port1.onmessage = this.onSWMessage.bind(this);
-        navigator.serviceWorker.controller.postMessage(
-          { type: "init", port: this.channel.port2, token: this._swAuthToken },
-          [this.channel.port2],
-        );
-        // Resend preview script to the new SW controller
-        if (this._previewScript !== null) {
-          this._sendPreviewScriptToSW();
-        }
-        // re-send ws bridge token too
-        if (this._wsBridgeToken) {
-          this._sendWsTokenToSW();
-        }
+      if (!navigator.serviceWorker.controller) return;
+      this.channel = new MessageChannel();
+      this.channel.port1.onmessage = this.onSWMessage.bind(this);
+      navigator.serviceWorker.controller.postMessage(
+        { type: "init", port: this.channel.port2, token: this._swAuthToken },
+        [this.channel.port2],
+      );
+      for (const id of this._instances.keys()) {
+        this.notifySW("claim-instance", { instanceId: id });
       }
+      for (const id of this._instances.keys()) {
+        const inst = this._instances.get(id)!;
+        if (inst.previewScript !== null) this._sendPreviewScriptToSW(id);
+        if (inst.wsBridgeToken) this._sendWsTokenToSW(id);
+      }
+      navigator.serviceWorker.controller.postMessage({
+        type: "set-watermark",
+        enabled: this._watermarkEnabled,
+        token: this._swAuthToken,
+      });
     };
     navigator.serviceWorker.addEventListener("controllerchange", reinit);
     navigator.serviceWorker.addEventListener("message", (ev) => {
       if (ev.data?.type === "sw-needs-init") reinit();
     });
+
+    // tell the SW to drop this tab's port + instance claims when the page
+    // goes away. without this a closed tab leaves stale routing entries and
+    // the next request for its instance times out after 30s. pagehide fires
+    // reliably (including bfcache), beforeunload is a backup
+    if (!this._farewellInstalled && typeof window !== "undefined") {
+      const farewell = () => {
+        try {
+          this.channel?.port1.postMessage({ type: "release-all" });
+        } catch {
+          // channel already torn down
+        }
+      };
+      window.addEventListener("pagehide", farewell);
+      window.addEventListener("beforeunload", farewell);
+      this._farewellInstalled = true;
+    }
 
     this.heartbeat = setInterval(() => {
       this.channel?.port1.postMessage({ type: "keepalive" });
@@ -316,14 +602,33 @@ export class RequestProxy extends EventEmitter {
     this.emit("sw-ready");
 
     this._startWsBridge();
+
+    // mint a ws token for every instance that attached before the SW was
+    // ready. common case: Nodepod constructor runs before initServiceWorker
+    // finishes because N parallel boots serialize here
+    for (const id of this._instances.keys()) {
+      this._ensureWsTokenForInstance(id);
+      this._sendWsTokenToSW(id);
+    }
   }
 
-  // strip /__preview__/{port} prefix from SW URLs if present
-  private _normalizeSwUrl(url: string, headers: Record<string, string>): string | null {
-    // Strip /__preview__/{port} prefix (fixes RSC HMR .rsc requests etc.)
-    const ppMatch = url.match(/^\/__preview__\/\d+(.*)?$/);
-    if (ppMatch) {
-      let stripped = ppMatch[1] || "/";
+  // strip /__preview__/{instanceId}/{port} or legacy /__preview__/{port} prefix
+  private _normalizeSwUrl(url: string, _headers: Record<string, string>): string | null {
+    // new: /__preview__/{instanceId}/{port}/rest
+    const newMatch = url.match(/^\/__preview__\/[^/]+\/\d+(.*)?$/);
+    if (newMatch) {
+      let stripped = newMatch[1] || "/";
+      if (stripped[0] !== "/") stripped = "/" + stripped;
+      const qIdx = url.indexOf("?");
+      if (qIdx >= 0 && !stripped.includes("?")) {
+        stripped += url.slice(qIdx);
+      }
+      return stripped;
+    }
+    // legacy: /__preview__/{port}/rest
+    const oldMatch = url.match(/^\/__preview__\/\d+(.*)?$/);
+    if (oldMatch) {
+      let stripped = oldMatch[1] || "/";
       if (stripped[0] !== "/") stripped = "/" + stripped;
       const qIdx = url.indexOf("?");
       if (qIdx >= 0 && !stripped.includes("?")) {
@@ -340,7 +645,16 @@ export class RequestProxy extends EventEmitter {
       console.log("[RequestProxy] SW:", type, id, data?.url);
 
     if (type === "request") {
-      const { port, method, headers, body, streaming, originalUrl } = data;
+      const {
+        instanceId: rawInstanceId,
+        port,
+        method,
+        headers,
+        body,
+        streaming,
+        originalUrl,
+      } = data;
+      const instanceId: string = rawInstanceId || DEFAULT_INSTANCE;
       let url: string = data.url;
 
       const normalized = this._normalizeSwUrl(url, headers);
@@ -350,9 +664,18 @@ export class RequestProxy extends EventEmitter {
 
       try {
         if (streaming) {
-          await this.handleStreaming(id, port, method, url, headers, body);
+          await this.handleStreaming(
+            instanceId,
+            id,
+            port,
+            method,
+            url,
+            headers,
+            body,
+          );
         } else {
           const resp = await this.handleRequest(
+            instanceId,
             port,
             method,
             url,
@@ -421,6 +744,7 @@ export class RequestProxy extends EventEmitter {
   }
 
   private async handleStreaming(
+    instanceId: string,
     id: number,
     port: number,
     method: string,
@@ -428,7 +752,8 @@ export class RequestProxy extends EventEmitter {
     headers: Record<string, string>,
     body?: ArrayBuffer,
   ): Promise<void> {
-    const entry = this.registry.get(port);
+    const inst = this._instances.get(instanceId);
+    const entry = inst?.registry.get(port);
     if (!entry) {
       this.channel?.port1.postMessage({
         type: "stream-start",
@@ -506,11 +831,13 @@ export class RequestProxy extends EventEmitter {
 
   // ---- WebSocket bridge ----
 
-  private _wsBridge: BroadcastChannel | null = null;
-  private _wsConns = new Map<
-    string,
-    { socket: import("./polyfills/net").TcpSocket; cleanup: () => void }
-  >();
+  /** mint a ws bridge token if the instance doesn't have one yet */
+  private _ensureWsTokenForInstance(instanceId: string): void {
+    const inst = this._getOrCreateInstance(instanceId);
+    if (!inst.wsBridgeToken) {
+      inst.wsBridgeToken = crypto.randomUUID();
+    }
+  }
 
   // listens on BroadcastChannel "nodepod-ws" for connect/send/close from preview
   // iframes, dispatches WS upgrade events on the virtual server, relays frames.
@@ -518,35 +845,37 @@ export class RequestProxy extends EventEmitter {
     if (typeof BroadcastChannel === "undefined") return;
     if (this._wsBridge) return;
 
-    this._wsBridgeToken = crypto.randomUUID();
-
     this._wsBridge = new BroadcastChannel("nodepod-ws");
     this._wsBridge.onmessage = (ev: MessageEvent) => {
       const d = ev.data;
       if (!d || !d.kind) return;
 
-      // check token
-      if (this._wsBridgeToken && d.token !== this._wsBridgeToken) return;
+      // validate against the instance-specific token
+      const instanceId: string = d.instanceId || DEFAULT_INSTANCE;
+      const inst = this._instances.get(instanceId);
+      if (!inst) return;
+      if (inst.wsBridgeToken && d.token !== inst.wsBridgeToken) return;
 
       if (d.kind === "ws-connect") {
-        this._handleWsConnect(d.uid, d.port, d.path, d.protocols);
+        this._handleWsConnect(instanceId, d.uid, d.port, d.path, d.protocols);
       } else if (d.kind === "ws-send") {
-        this._handleWsSend(d.uid, d.data, d.type);
+        this._handleWsSend(instanceId, d.uid, d.data, d.type);
       } else if (d.kind === "ws-close") {
-        this._handleWsClose(d.uid, d.code, d.reason);
+        this._handleWsClose(instanceId, d.uid, d.code, d.reason);
       }
     };
-
-    // Send the WS bridge token to the Service Worker so it can embed it in the WS shim
-    this._sendWsTokenToSW();
   }
 
   private _handleWsConnect(
+    instanceId: string,
     uid: string,
     port: number,
     path: string,
     protocols?: string,
   ): void {
+    const inst = this._instances.get(instanceId);
+    if (!inst) return;
+
     const server = getServer(port);
 
     const wsKey = btoa(
@@ -562,26 +891,33 @@ export class RequestProxy extends EventEmitter {
     };
     if (protocols) headers["sec-websocket-protocol"] = protocols;
 
-    // no local server -- try routing through ProcessManager (worker mode)
+    // no local server, try the instance's process manager (worker mode)
     if (!server) {
-      if (this._processManager) {
-        const pid = this._processManager.dispatchWsUpgrade(port, uid, path || "/", headers);
+      if (inst.processManager) {
+        const pid = inst.processManager.dispatchWsUpgrade(
+          port,
+          uid,
+          path || "/",
+          headers,
+        );
         if (pid >= 0) {
-          this._workerWsConns.set(uid, { pid });
+          inst.workerWsConns.set(uid, { pid });
           return;
         }
       }
       this._wsBridge?.postMessage({
         kind: "ws-error",
+        instanceId,
         uid,
         message: `No server on port ${port}`,
-        token: this._wsBridgeToken,
+        token: inst.wsBridgeToken,
       });
       return;
     }
 
     const { socket } = server.dispatchUpgrade(path || "/", headers);
     const bridge = this._wsBridge!;
+    const token = inst.wsBridgeToken;
 
     let outboundBuf = new Uint8Array(0);
     let handshakeDone = false;
@@ -600,7 +936,7 @@ export class RequestProxy extends EventEmitter {
         const text = new TextDecoder().decode(raw);
         if (text.startsWith("HTTP/1.1 101")) {
           handshakeDone = true;
-          bridge.postMessage({ kind: "ws-open", uid, token: this._wsBridgeToken });
+          bridge.postMessage({ kind: "ws-open", instanceId, uid, token });
           if (fn) queueMicrotask(() => fn(null));
           return true;
         }
@@ -621,20 +957,22 @@ export class RequestProxy extends EventEmitter {
             const text = new TextDecoder().decode(frame.data);
             bridge.postMessage({
               kind: "ws-message",
+              instanceId,
               uid,
               data: text,
               type: "text",
-              token: this._wsBridgeToken,
+              token,
             });
             break;
           }
           case WS_OPCODE.BINARY:
             bridge.postMessage({
               kind: "ws-message",
+              instanceId,
               uid,
               data: Array.from(frame.data),
               type: "binary",
-              token: this._wsBridgeToken,
+              token,
             });
             break;
           case WS_OPCODE.CLOSE: {
@@ -642,7 +980,13 @@ export class RequestProxy extends EventEmitter {
               frame.data.length >= 2
                 ? (frame.data[0] << 8) | frame.data[1]
                 : 1000;
-            bridge.postMessage({ kind: "ws-closed", uid, code, token: this._wsBridgeToken });
+            bridge.postMessage({
+              kind: "ws-closed",
+              instanceId,
+              uid,
+              code,
+              token,
+            });
             break;
           }
           case WS_OPCODE.PING:
@@ -661,42 +1005,75 @@ export class RequestProxy extends EventEmitter {
       outboundBuf = new Uint8Array(0);
       try { socket.destroy(); } catch { /* */ }
     };
-    this._wsConns.set(uid, { socket, cleanup });
+    inst.wsConns.set(uid, { socket, cleanup });
   }
 
-  private _handleWorkerWsFrame(msg: any): void {
+  private _handleWorkerWsFrame(instanceId: string, msg: any): void {
     const bridge = this._wsBridge;
     if (!bridge) return;
+    const inst = this._instances.get(instanceId);
+    if (!inst) return;
     const uid = msg.uid;
+    const token = inst.wsBridgeToken;
 
     switch (msg.kind) {
       case "open":
-        bridge.postMessage({ kind: "ws-open", uid, token: this._wsBridgeToken });
+        bridge.postMessage({ kind: "ws-open", instanceId, uid, token });
         break;
       case "text":
-        bridge.postMessage({ kind: "ws-message", uid, data: msg.data, type: "text", token: this._wsBridgeToken });
+        bridge.postMessage({
+          kind: "ws-message",
+          instanceId,
+          uid,
+          data: msg.data,
+          type: "text",
+          token,
+        });
         break;
       case "binary":
-        bridge.postMessage({ kind: "ws-message", uid, data: msg.bytes, type: "binary", token: this._wsBridgeToken });
+        bridge.postMessage({
+          kind: "ws-message",
+          instanceId,
+          uid,
+          data: msg.bytes,
+          type: "binary",
+          token,
+        });
         break;
       case "close":
-        bridge.postMessage({ kind: "ws-closed", uid, code: msg.code || 1000, token: this._wsBridgeToken });
-        this._workerWsConns.delete(uid);
+        bridge.postMessage({
+          kind: "ws-closed",
+          instanceId,
+          uid,
+          code: msg.code || 1000,
+          token,
+        });
+        inst.workerWsConns.delete(uid);
         break;
       case "error":
-        bridge.postMessage({ kind: "ws-error", uid, message: msg.message, token: this._wsBridgeToken });
-        this._workerWsConns.delete(uid);
+        bridge.postMessage({
+          kind: "ws-error",
+          instanceId,
+          uid,
+          message: msg.message,
+          token,
+        });
+        inst.workerWsConns.delete(uid);
         break;
     }
   }
 
   private _handleWsSend(
+    instanceId: string,
     uid: string,
     data: unknown,
     type?: string,
   ): void {
-    const workerConn = this._workerWsConns.get(uid);
-    if (workerConn && this._processManager) {
+    const inst = this._instances.get(instanceId);
+    if (!inst) return;
+
+    const workerConn = inst.workerWsConns.get(uid);
+    if (workerConn && inst.processManager) {
       let payload: Uint8Array;
       let op: number;
       if (type === "binary" && Array.isArray(data)) {
@@ -707,11 +1084,15 @@ export class RequestProxy extends EventEmitter {
         op = WS_OPCODE.TEXT;
       }
       const frame = encodeFrame(op, payload, true);
-      this._processManager.dispatchWsData(workerConn.pid, uid, Array.from(new Uint8Array(frame)));
+      inst.processManager.dispatchWsData(
+        workerConn.pid,
+        uid,
+        Array.from(new Uint8Array(frame)),
+      );
       return;
     }
 
-    const conn = this._wsConns.get(uid);
+    const conn = inst.wsConns.get(uid);
     if (!conn) return;
 
     let payload: Uint8Array;
@@ -727,15 +1108,23 @@ export class RequestProxy extends EventEmitter {
     conn.socket._feedData(Buffer.from(frame));
   }
 
-  private _handleWsClose(uid: string, code?: number, reason?: string): void {
-    const workerConn = this._workerWsConns.get(uid);
-    if (workerConn && this._processManager) {
-      this._processManager.dispatchWsClose(workerConn.pid, uid, code ?? 1000);
-      this._workerWsConns.delete(uid);
+  private _handleWsClose(
+    instanceId: string,
+    uid: string,
+    code?: number,
+    _reason?: string,
+  ): void {
+    const inst = this._instances.get(instanceId);
+    if (!inst) return;
+
+    const workerConn = inst.workerWsConns.get(uid);
+    if (workerConn && inst.processManager) {
+      inst.processManager.dispatchWsClose(workerConn.pid, uid, code ?? 1000);
+      inst.workerWsConns.delete(uid);
       return;
     }
 
-    const conn = this._wsConns.get(uid);
+    const conn = inst.wsConns.get(uid);
     if (!conn) return;
 
     const codeBuf = new Uint8Array(2);
@@ -745,7 +1134,7 @@ export class RequestProxy extends EventEmitter {
     try { conn.socket._feedData(Buffer.from(frame)); } catch { /* */ }
 
     conn.cleanup();
-    this._wsConns.delete(uid);
+    inst.wsConns.delete(uid);
   }
 
   private notifySW(type: string, data: unknown): void {
@@ -756,11 +1145,37 @@ export class RequestProxy extends EventEmitter {
   createFetchHandler(): (req: Request) => Promise<Response> {
     return async (req: Request): Promise<Response> => {
       const parsed = new URL(req.url);
-      const match = parsed.pathname.match(/^\/__virtual__\/(\d+)(\/.*)?$/);
-      if (!match) throw new Error("Not a virtual server request");
+      // /__virtual__/{instanceId}/{port}/... or legacy /__virtual__/{port}/...
+      // new form requires at least one non-digit char in the first segment
+      const newMatch = parsed.pathname.match(
+        /^\/__virtual__\/([^/]+)\/(\d+)(\/.*)?$/,
+      );
+      const oldMatch =
+        !newMatch &&
+        parsed.pathname.match(/^\/__virtual__\/(\d+)(\/.*)?$/);
 
-      const port = parseInt(match[1], 10);
-      const path = match[2] || "/";
+      let instanceId: string;
+      let port: number;
+      let path: string;
+      if (newMatch) {
+        // all-digits first segment means the old form with a swallowed slash
+        if (/^\d+$/.test(newMatch[1])) {
+          instanceId = DEFAULT_INSTANCE;
+          port = parseInt(newMatch[1], 10);
+          path = (newMatch[2] ? "/" + newMatch[2] : "/") + (newMatch[3] || "");
+        } else {
+          instanceId = newMatch[1];
+          port = parseInt(newMatch[2], 10);
+          path = newMatch[3] || "/";
+        }
+      } else if (oldMatch) {
+        instanceId = DEFAULT_INSTANCE;
+        port = parseInt(oldMatch[1], 10);
+        path = oldMatch[2] || "/";
+      } else {
+        throw new Error("Not a virtual server request");
+      }
+
       const hdrs: Record<string, string> = {};
       req.headers.forEach((v, k) => {
         hdrs[k] = v;
@@ -770,6 +1185,7 @@ export class RequestProxy extends EventEmitter {
         reqBody = await req.arrayBuffer();
 
       const resp = await this.handleRequest(
+        instanceId,
         port,
         req.method,
         path + parsed.search,

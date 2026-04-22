@@ -178,6 +178,9 @@ export const TIMEOUTS = {
   SYNC_OP: 120_000,
   WAIT_LOOP_TICK: 200,
   SW_HEARTBEAT: 20_000,
+  /** cap on navigator.serviceWorker.ready so init doesn't hang forever if the
+   *  SW gets stuck installing/waiting */
+  SW_ACTIVATION: 10_000,
   WORKER_REAP_INTERVAL: 10_000,
   WORKER_IDLE_TIMEOUT: 30_000,
   WORKER_INIT_TIMEOUT: 30_000,

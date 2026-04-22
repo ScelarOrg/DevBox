@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>nodepod - multi-boot race (reproduces #39)</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: monospace; background: #1a1a2e; color: #e0e0e0; padding: 24px; }
+    h1 { font-size: 18px; margin-bottom: 8px; color: #fff; }
+    p { font-size: 13px; color: #888; margin-bottom: 16px; max-width: 820px; line-height: 1.5; }
+    .controls { margin-bottom: 16px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    button {
+      background: #2a2a4a; color: #e0e0e0; border: 1px solid #444;
+      padding: 6px 14px; border-radius: 4px; font-family: monospace; cursor: pointer;
+    }
+    button:hover { background: #3a3a5a; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    label { font-size: 13px; color: #aaa; }
+    input[type=number] {
+      background: #0d0d1a; color: #e0e0e0; border: 1px solid #444;
+      padding: 4px 8px; border-radius: 4px; width: 60px; font-family: monospace;
+    }
+    #output {
+      background: #0d0d1a; border: 1px solid #333; border-radius: 6px;
+      padding: 16px; min-height: 400px; white-space: pre-wrap;
+      font-size: 13px; line-height: 1.55; overflow-y: auto;
+    }
+    .stdout { color: #a8e6a3; }
+    .stderr { color: #e68a8a; }
+    .info { color: #8ac4e6; }
+    .dim { color: #555; }
+    .pass { color: #a8e6a3; }
+    .fail { color: #e68a8a; font-weight: bold; }
+    .warn { color: #e6c38a; }
+    .hang { color: #e68a8a; font-weight: bold; background: #3a1010; padding: 0 4px; }
+    code { background: #2a2a4a; padding: 1px 5px; border-radius: 3px; }
+  </style>
+</head>
+<body>
+  <h1>nodepod - multi-boot race (reproduces <a href="https://github.com/ScelarOrg/Nodepod/issues/39" style="color:#8ac4e6">#39</a>)</h1>
+  <p>
+    Reproduces: "when booting multiple Nodepod instances at once, the boot promises sometimes never resolve".
+    Click <b>Run</b> to fire N <code>Nodepod.boot()</code> calls in parallel via <code>Promise.allSettled()</code>.
+    Each boot is wrapped in a <code>BOOT_TIMEOUT_MS</code> watchdog, any boot that doesn't settle within that
+    window is flagged as <span class="hang">HUNG</span>. Adjust the instance count and re-run, higher counts
+    (4+) make the hang much more likely to appear.
+  </p>
+
+  <div class="controls">
+    <label>Instances: <input id="count" type="number" value="4" min="2" max="16"></label>
+    <label>Timeout (ms): <input id="timeout" type="number" value="30000" min="1000" step="1000"></label>
+    <label><input id="sw" type="checkbox" checked> Service worker</label>
+    <button id="run">Run</button>
+    <button id="clear">Clear log</button>
+  </div>
+
+  <div id="output"></div>
+
+  <script type="module">
+    import { Nodepod } from "/dist/index.mjs";
+
+    const out = document.getElementById('output');
+    const countInput = document.getElementById('count');
+    const timeoutInput = document.getElementById('timeout');
+    const swInput = document.getElementById('sw');
+    const runBtn = document.getElementById('run');
+    const clearBtn = document.getElementById('clear');
+
+    function log(text, cls = 'stdout') {
+      const span = document.createElement('span');
+      span.className = cls;
+      span.textContent = text + '\n';
+      out.appendChild(span);
+      out.scrollTop = out.scrollHeight;
+    }
+
+    clearBtn.addEventListener('click', () => { out.innerHTML = ''; });
+
+    // boot one instance with a timeout watchdog.
+    // returns { idx, state: 'resolved'|'rejected'|'hung', ms, error?, nodepod? }
+    function bootWithTimeout(idx, timeoutMs, serviceWorker) {
+      const t0 = performance.now();
+      let hungTimer;
+      const hung = new Promise((resolve) => {
+        hungTimer = setTimeout(() => {
+          resolve({ idx, state: 'hung', ms: performance.now() - t0 });
+        }, timeoutMs);
+      });
+
+      const boot = Nodepod.boot({
+        // separate workdir per instance so they're clearly independent
+        workdir: `/i${idx}`,
+        serviceWorker,
+        files: {
+          [`/i${idx}/hello.js`]: `console.log('hello from instance ${idx}, pid=' + process.pid);`,
+        },
+      }).then(
+        (nodepod) => {
+          clearTimeout(hungTimer);
+          return { idx, state: 'resolved', ms: performance.now() - t0, nodepod };
+        },
+        (error) => {
+          clearTimeout(hungTimer);
+          return { idx, state: 'rejected', ms: performance.now() - t0, error };
+        },
+      );
+
+      return Promise.race([boot, hung]);
+    }
+
+    async function run() {
+      runBtn.disabled = true;
+      const count = Math.max(2, Math.min(16, parseInt(countInput.value, 10) || 4));
+      const timeoutMs = Math.max(1000, parseInt(timeoutInput.value, 10) || 30000);
+      const serviceWorker = swInput.checked;
+
+      log(`\n=== Firing ${count} Nodepod.boot() calls in parallel (timeout ${timeoutMs}ms, serviceWorker=${serviceWorker}) ===`, 'info');
+      log(`User agent: ${navigator.userAgent}`, 'dim');
+      log(`crossOriginIsolated: ${self.crossOriginIsolated}`, 'dim');
+      log(`SharedArrayBuffer: ${typeof SharedArrayBuffer !== 'undefined'}`, 'dim');
+      log(`navigator.serviceWorker: ${'serviceWorker' in navigator}`, 'dim');
+      log('', 'dim');
+
+      const t0 = performance.now();
+      const starts = Array.from({ length: count }, (_, i) => {
+        log(`[${i}] boot() called at t=${(performance.now() - t0).toFixed(0)}ms`, 'dim');
+        return bootWithTimeout(i, timeoutMs, serviceWorker);
+      });
+
+      // stream each result as it settles instead of waiting on all
+      const pending = new Set(starts.map((_, i) => i));
+      const results = new Array(count);
+
+      await Promise.all(starts.map(async (p, i) => {
+        const r = await p;
+        results[i] = r;
+        pending.delete(i);
+        if (r.state === 'resolved') {
+          log(`[${i}] RESOLVED in ${r.ms.toFixed(0)}ms`, 'pass');
+        } else if (r.state === 'rejected') {
+          log(`[${i}] REJECTED in ${r.ms.toFixed(0)}ms: ${r.error?.message ?? r.error}`, 'fail');
+        } else {
+          log(`[${i}] HUNG, no settle after ${r.ms.toFixed(0)}ms  (still waiting)`, 'hang');
+        }
+      }));
+
+      const total = performance.now() - t0;
+      const resolved = results.filter(r => r.state === 'resolved').length;
+      const rejected = results.filter(r => r.state === 'rejected').length;
+      const hung = results.filter(r => r.state === 'hung').length;
+
+      log('', 'dim');
+      log(`=== Summary (wall time ${total.toFixed(0)}ms) ===`, 'info');
+      log(`  resolved: ${resolved} / ${count}`, resolved === count ? 'pass' : 'stdout');
+      log(`  rejected: ${rejected} / ${count}`, rejected > 0 ? 'fail' : 'dim');
+      log(`  hung:     ${hung} / ${count}`, hung > 0 ? 'hang' : 'dim');
+
+      if (hung > 0) {
+        log('', 'dim');
+        log(`REPRODUCED ISSUE #39: ${hung} boot promise(s) never resolved within ${timeoutMs}ms.`, 'fail');
+        log('These workers/service-workers may still be alive in devtools > Application > Service Workers', 'warn');
+      } else if (resolved === count) {
+        log('', 'dim');
+        log(`All ${count} instances booted successfully this round. Try again, the race is non-deterministic.`, 'warn');
+      }
+
+      runBtn.disabled = false;
+    }
+
+    runBtn.addEventListener('click', run);
+
+    // auto-run once on load so the bug is visible immediately
+    log('Page ready. Click Run, or wait - auto-running with default settings in 500ms...', 'info');
+    setTimeout(run, 500);
+  </script>
+</body>
+</html>

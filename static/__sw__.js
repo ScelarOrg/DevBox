@@ -1,39 +1,161 @@
 /**
- * Nodepod Service Worker — proxies requests to virtual servers.
- * Version: 2 (cross-origin passthrough + prefix stripping)
+ * Nodepod Service Worker - proxies requests to virtual servers.
+ * Version: 8 (multi-tab)
  *
  * Intercepts:
- *   /__virtual__/{port}/{path}  — virtual server API
- *   /__preview__/{port}/{path}  — preview iframe navigation
- *   Any request from a client loaded via /__preview__/ — module imports etc.
+ *   /__virtual__/{instanceId}/{port}/{path}  virtual server API (new)
+ *   /__preview__/{instanceId}/{port}/{path}  preview iframe navigation (new)
+ *   /__virtual__/{port}/{path}               legacy, routes to DEFAULT_INSTANCE
+ *   /__preview__/{port}/{path}               legacy, routes to DEFAULT_INSTANCE
+ *   Any request from a client loaded via /__preview__/ (module imports etc)
  *
- * When an iframe navigates to /__preview__/{port}/, the SW records the
- * resulting clientId. All subsequent requests from that client (including
- * ES module imports like /@react-refresh) are intercepted and routed
- * through the virtual server.
+ * When an iframe navigates to /__preview__/{instanceId}/{port}/, the SW records
+ * the resulting clientId with its (instanceId, port). All subsequent requests
+ * from that client (including ES module imports like /@react-refresh) are
+ * intercepted and routed through the right instance's virtual server.
+ *
+ * Multi-tab: one SW serves every tab at this scope, but each tab has its own
+ * RequestProxy and its own MessageChannel. we hold a map of MessagePorts
+ * (one per tab) and route each fetch to whichever port claimed the fetch's
+ * instanceId. without this a second tab's init would overwrite the first
+ * tab's port and you'd get "No server on {instanceId}/{port}" 503s.
  */
 
-const SW_VERSION = 6;
+const SW_VERSION = 8;
+const DEFAULT_INSTANCE = "default";
 
-let port = null;
 let nextId = 1;
+// id -> { resolve, reject, port }
 const pending = new Map();
 
-// Maps clientId -> serverPort for preview iframes
+// one entry per connected tab. MessagePort -> { token, instances: Set<string> }
+const ports = new Map();
+
+// routing table for fetches. instanceId -> MessagePort
+const instancePorts = new Map();
+
+// clientId -> { instanceId, serverPort } for preview iframes
 const previewClients = new Map();
 
-// User-injected script that runs before any page content in preview iframes.
-// Set via postMessage({ type: "set-preview-script", script: "..." }) from main thread.
-let previewScript = null;
+// per-instance script injected into preview iframe HTML
+const previewScripts = new Map();
 
-// Watermark badge shown in preview iframes. On by default.
+// global watermark toggle, last writer across tabs wins
 let watermarkEnabled = true;
 
-// auth token from init, checked on control messages
-let authToken = null;
+// per-instance ws bridge tokens
+const wsTokens = new Map();
 
-// ws bridge token, gets baked into the shim script
-let wsToken = null;
+// any token from any currently connected tab is accepted. used for control
+// messages that aren't tied to a specific instance (set-watermark etc)
+function isValidToken(t) {
+  if (!t) return false;
+  for (const info of ports.values()) {
+    if (info.token === t) return true;
+  }
+  return false;
+}
+
+// for per-instance messages the token must match the tab that claimed the
+// instance. if no one claimed it yet any valid token passes
+function isValidTokenForInstance(token, instanceId) {
+  const mp = instancePorts.get(instanceId);
+  if (mp) {
+    const info = ports.get(mp);
+    return info ? info.token === token : false;
+  }
+  return isValidToken(token);
+}
+
+// exact match first, then fall back to whoever owns DEFAULT_INSTANCE (legacy
+// single-tenant callers), then any connected port
+function getPortForInstance(instanceId) {
+  const mp = instancePorts.get(instanceId);
+  if (mp) return mp;
+  const def = instancePorts.get(DEFAULT_INSTANCE);
+  if (def) return def;
+  if (ports.size > 0) return ports.keys().next().value;
+  return null;
+}
+
+function claimInstance(mp, instanceId) {
+  if (!mp || !ports.has(mp)) return;
+  instancePorts.set(instanceId, mp);
+  ports.get(mp).instances.add(instanceId);
+}
+
+// only release if this port still owns it. a newer tab may have reclaimed it
+function releaseInstance(mp, instanceId) {
+  if (instancePorts.get(instanceId) === mp) {
+    instancePorts.delete(instanceId);
+    previewScripts.delete(instanceId);
+    wsTokens.delete(instanceId);
+  }
+  const info = ports.get(mp);
+  if (info) info.instances.delete(instanceId);
+}
+
+// drop every reference to a port so stale entries don't route fetches nowhere
+function cleanupPort(mp) {
+  const info = ports.get(mp);
+  if (info) {
+    for (const id of info.instances) {
+      if (instancePorts.get(id) === mp) {
+        instancePorts.delete(id);
+        previewScripts.delete(id);
+        wsTokens.delete(id);
+      }
+    }
+  }
+  ports.delete(mp);
+}
+
+// Extract (instanceId, port, restPath) from a /__virtual__/... or /__preview__/... pathname.
+// Returns null if no match. Handles both the new 3-segment form and the legacy
+// 2-segment form (falls back to DEFAULT_INSTANCE).
+function matchPreviewOrVirtualPath(pathname, kind /* "virtual" | "preview" */) {
+  const prefix = kind === "virtual" ? "__virtual__" : "__preview__";
+  // New: /__{kind}__/{instanceId}/{port}[/rest]
+  // Require non-digit in first segment so we don't swallow legacy ports.
+  const newRe = new RegExp(
+    "^\\/" + prefix + "\\/([A-Za-z0-9_-]*[A-Za-z_-][A-Za-z0-9_-]*)\\/(\\d+)(\\/.*)?$"
+  );
+  const m1 = pathname.match(newRe);
+  if (m1) {
+    return {
+      instanceId: m1[1],
+      port: parseInt(m1[2], 10),
+      rest: m1[3] || "/",
+    };
+  }
+  // Legacy: /__{kind}__/{port}[/rest]
+  const oldRe = new RegExp("^\\/" + prefix + "\\/(\\d+)(\\/.*)?$");
+  const m2 = pathname.match(oldRe);
+  if (m2) {
+    return {
+      instanceId: DEFAULT_INSTANCE,
+      port: parseInt(m2[1], 10),
+      rest: m2[2] || "/",
+    };
+  }
+  return null;
+}
+
+// Strip the /__{kind}__/{instanceId}/{port} or /__{kind}__/{port} prefix from
+// a pathname when a client was loaded via a preview URL and the browser
+// resolved a relative URL against it. Returns the unprefixed path or the
+// original if no prefix was found.
+function stripPreviewPrefix(pathname) {
+  const m = pathname.match(
+    /^\/__(?:preview|virtual)__\/(?:[A-Za-z0-9_-]*[A-Za-z_-][A-Za-z0-9_-]*\/\d+|\d+)(\/.*)?$/
+  );
+  if (m) {
+    let stripped = m[1] || "/";
+    if (stripped[0] !== "/") stripped = "/" + stripped;
+    return stripped;
+  }
+  return pathname;
+}
 
 // Standard MIME types by file extension — used as a safety net when
 // the virtual server returns text/html (SPA fallback) or omits Content-Type
@@ -116,46 +238,115 @@ self.addEventListener("activate", (event) => {
 
 self.addEventListener("message", (event) => {
   const data = event.data;
+  if (!data) return;
 
-  // init sets up the port + grabs the auth token
-  if (data?.type === "init" && data.port) {
-    port = data.port;
-    port.onmessage = onPortMessage;
-    if (data.token) {
-      authToken = data.token;
+  // register a new tab's MessagePort. if the same tab reinits (same token,
+  // new channel from controllerchange) drop the old port first so stale
+  // entries don't accumulate. RequestProxy resends claim-instance after.
+  if (data.type === "init" && data.port) {
+    const mp = data.port;
+    const token = data.token || null;
+    if (token) {
+      for (const [old, info] of [...ports.entries()]) {
+        if (old !== mp && info.token === token) {
+          cleanupPort(old);
+        }
+      }
+    }
+    ports.set(mp, { token, instances: new Set() });
+    mp.onmessage = (ev) => onPortMessage(ev, mp);
+
+    // claim uncontrolled clients now. the activate event's clients.claim()
+    // only covers fresh install, it does NOT cover hard refresh (Ctrl+Shift+R)
+    // of a page that already had this SW registered, the browser bypasses the
+    // SW for the top-level nav and the page stays uncontrolled forever since
+    // activate doesn't re-run. reclaiming here fires controllerchange on that
+    // page so its fetches route through the SW like normal.
+    if (event.waitUntil) {
+      event.waitUntil(self.clients.claim());
+    } else {
+      self.clients.claim();
     }
     return;
   }
 
-  // everything else needs the right token
-  if (authToken && data?.token !== authToken) return;
+  // everything else requires a token from some live tab
+  if (!isValidToken(data.token)) return;
 
-  // Allow main thread to register/unregister preview clients
-  if (data?.type === "register-preview") {
-    previewClients.set(data.clientId, data.serverPort);
+  if (data.type === "register-preview") {
+    previewClients.set(data.clientId, {
+      instanceId: data.instanceId || DEFAULT_INSTANCE,
+      serverPort: data.serverPort,
+    });
+    return;
   }
-  if (data?.type === "unregister-preview") {
+  if (data.type === "unregister-preview") {
     previewClients.delete(data.clientId);
+    return;
   }
-  if (data?.type === "set-preview-script") {
-    previewScript = data.script ?? null;
+  if (data.type === "set-preview-script") {
+    const id = data.instanceId || DEFAULT_INSTANCE;
+    if (!isValidTokenForInstance(data.token, id)) return;
+    if (data.script === null || data.script === undefined) {
+      previewScripts.delete(id);
+    } else {
+      previewScripts.set(id, data.script);
+    }
+    return;
   }
-  if (data?.type === "set-watermark") {
+  if (data.type === "set-watermark") {
     watermarkEnabled = !!data.enabled;
+    return;
   }
-  if (data?.type === "set-ws-token") {
-    wsToken = data.wsToken ?? null;
+  if (data.type === "set-ws-token") {
+    const id = data.instanceId || DEFAULT_INSTANCE;
+    if (!isValidTokenForInstance(data.token, id)) return;
+    if (data.wsToken === null || data.wsToken === undefined) {
+      wsTokens.delete(id);
+    } else {
+      wsTokens.set(id, data.wsToken);
+    }
+    return;
   }
 });
 
-function onPortMessage(event) {
+// messages over a tab's MessagePort. mp is captured at init time so we always
+// know which tab spoke
+function onPortMessage(event, mp) {
   const msg = event.data;
+  if (!msg) return;
+
   if (msg.type === "response" && pending.has(msg.id)) {
     const { resolve, reject } = pending.get(msg.id);
     pending.delete(msg.id);
     if (msg.error) reject(new Error(msg.error));
     else resolve(msg.data);
+    return;
   }
+
+  if (msg.type === "claim-instance" && msg.data && msg.data.instanceId) {
+    claimInstance(mp, msg.data.instanceId);
+    return;
+  }
+  if (msg.type === "release-instance" && msg.data && msg.data.instanceId) {
+    releaseInstance(mp, msg.data.instanceId);
+    return;
+  }
+  if (msg.type === "release-all") {
+    cleanupPort(mp);
+    return;
+  }
+
+  // server-registered implicitly claims the instance so legacy callers that
+  // never sent claim-instance still route correctly
+  if (msg.type === "server-registered" && msg.data && msg.data.instanceId) {
+    claimInstance(mp, msg.data.instanceId);
+    return;
+  }
+  // note: server-unregistered does NOT release. a tab may register multiple
+  // servers for one instance and we only want to unclaim on explicit release
+
+  if (msg.type === "keepalive") return;
 }
 
 // ── Fetch interception ──
@@ -163,104 +354,97 @@ function onPortMessage(event) {
 self.addEventListener("fetch", (event) => {
   const url = new URL(event.request.url);
 
-  // 1. explicit /__virtual__/{port}/{path} — navigating an iframe here (the URL
-  //    request-proxy.serverUrl() returns) must also register the resulting
-  //    clientId, else absolute-path module imports from the HTML (e.g.
-  //    /@vite/client, /src/main.tsx) miss every branch below and hit the host
-  const virtualMatch = url.pathname.match(/^\/__virtual__\/(\d+)(\/.*)?$/);
-  if (virtualMatch) {
-    const serverPort = parseInt(virtualMatch[1], 10);
-    const path = (virtualMatch[2] || "/") + url.search;
+  // 1. explicit /__virtual__/{instanceId}/{port}/{path} or legacy /__virtual__/{port}/{path}
+  const virtualHit = matchPreviewOrVirtualPath(url.pathname, "virtual");
+  if (virtualHit) {
+    const { instanceId, port: serverPort, rest } = virtualHit;
+    const path = rest + url.search;
     if (event.request.mode === "navigate") {
       event.respondWith(
         (async () => {
           if (event.resultingClientId) {
-            previewClients.set(event.resultingClientId, serverPort);
+            previewClients.set(event.resultingClientId, { instanceId, serverPort });
           }
-          return proxyToVirtualServer(event.request, serverPort, path);
+          return proxyToVirtualServer(event.request, instanceId, serverPort, path);
         })(),
       );
     } else {
-      event.respondWith(proxyToVirtualServer(event.request, serverPort, path));
+      event.respondWith(
+        proxyToVirtualServer(event.request, instanceId, serverPort, path),
+      );
     }
     return;
   }
 
-  // 2. Explicit /__preview__/{port}/{path} — navigation or subresource
-  const previewMatch = url.pathname.match(/^\/__preview__\/(\d+)(\/.*)?$/);
-  if (previewMatch) {
-    const serverPort = parseInt(previewMatch[1], 10);
-    const path = (previewMatch[2] || "/") + url.search;
+  // 2. Explicit /__preview__/{instanceId}/{port}/{path} or legacy /__preview__/{port}/{path}
+  const previewHit = matchPreviewOrVirtualPath(url.pathname, "preview");
+  if (previewHit) {
+    const { instanceId, port: serverPort, rest } = previewHit;
+    const path = rest + url.search;
 
-    // Track the resulting client (for navigation requests) or current client
     if (event.request.mode === "navigate") {
       event.respondWith(
         (async () => {
-          // resultingClientId is the client that will be created by this navigation
           if (event.resultingClientId) {
-            previewClients.set(event.resultingClientId, serverPort);
+            previewClients.set(event.resultingClientId, { instanceId, serverPort });
           }
-          return proxyToVirtualServer(event.request, serverPort, path);
+          return proxyToVirtualServer(event.request, instanceId, serverPort, path);
         })(),
       );
     } else {
-      event.respondWith(proxyToVirtualServer(event.request, serverPort, path));
+      event.respondWith(
+        proxyToVirtualServer(event.request, instanceId, serverPort, path),
+      );
     }
     return;
   }
 
-  // 3. Request from a tracked preview client — route through virtual server.
-  //    This catches module imports like /@react-refresh, /src/main.tsx, etc.
-  //    Only intercept same-origin requests; let cross-origin requests
-  //    (e.g. Google Fonts, external CDNs) pass through to the real server.
+  // 3. request from a tracked preview client, route through that instance's
+  //    virtual server. catches module imports like /@react-refresh etc.
+  //    only same-origin, let cross-origin (google fonts, CDNs) pass through
   const clientId = event.clientId;
   if (clientId && previewClients.has(clientId)) {
     const host = url.hostname;
     if (host === "localhost" || host === "127.0.0.1" || host === "0.0.0.0" || host === self.location.hostname) {
-      const serverPort = previewClients.get(clientId);
-      // strip /__preview__/{port} or /__virtual__/{port} prefix if the browser
-      // resolved a relative URL against the preview page's location
-      // (e.g. /__preview__/3001.rsc → /.rsc, /__virtual__/3001/foo → /foo)
-      let path = url.pathname;
-      const ppMatch = path.match(/^\/__(?:preview|virtual)__\/\d+(.*)?$/);
-      if (ppMatch) {
-        path = ppMatch[1] || "/";
-        if (path[0] !== "/") path = "/" + path;
-      }
+      const { instanceId, serverPort } = previewClients.get(clientId);
+      // strip /__preview__/{instanceId}/{port} or /__virtual__/{instanceId}/{port}
+      // (or legacy forms) if the browser resolved a relative URL against the
+      // preview page's location.
+      let path = stripPreviewPrefix(url.pathname);
       path += url.search;
-      event.respondWith(proxyToVirtualServer(event.request, serverPort, path, event.request));
+      event.respondWith(
+        proxyToVirtualServer(event.request, instanceId, serverPort, path, event.request),
+      );
       return;
     }
   }
 
-  // 4. fallback: check Referer header for /__preview__/ or /__virtual__/ prefix.
-  //    handles the Firefox race where the first subresource after a navigation
-  //    arrives with event.clientId === "" (before the new client is registered).
-  //    covers either URL style since both are valid entry points. only intercept
-  //    same-origin requests (not cross-origin like Google Fonts)
+  // 4. fallback: check Referer header. Handles the Firefox race where the first
+  //    subresource after a navigation arrives with event.clientId === "".
   const referer = event.request.referrer;
   if (referer) {
     try {
       const refUrl = new URL(referer);
-      const refMatch = refUrl.pathname.match(/^\/__(?:preview|virtual)__\/(\d+)/);
-      if (refMatch) {
+      // Try new then legacy shape in the referer path
+      const refHit =
+        matchPreviewOrVirtualPath(refUrl.pathname, "preview") ||
+        matchPreviewOrVirtualPath(refUrl.pathname, "virtual");
+      if (refHit) {
         const host = url.hostname;
-        if (host === "localhost" || host === "127.0.0.1" || host === "0.0.0.0" || host === self.location.hostname) {
-          const serverPort = parseInt(refMatch[1], 10);
-          // strip /__preview__/{port} or /__virtual__/{port} prefix if present
-          let path = url.pathname;
-          const ppMatch2 = path.match(/^\/__(?:preview|virtual)__\/\d+(.*)?$/);
-          if (ppMatch2) {
-            path = ppMatch2[1] || "/";
-            if (path[0] !== "/") path = "/" + path;
-          }
+        if (
+          host === "localhost" ||
+          host === "127.0.0.1" ||
+          host === "0.0.0.0" ||
+          host === self.location.hostname
+        ) {
+          const { instanceId, port: serverPort } = refHit;
+          let path = stripPreviewPrefix(url.pathname);
           path += url.search;
-          // Also register this client for future requests
           if (clientId) {
-            previewClients.set(clientId, serverPort);
+            previewClients.set(clientId, { instanceId, serverPort });
           }
           event.respondWith(
-            proxyToVirtualServer(event.request, serverPort, path, event.request),
+            proxyToVirtualServer(event.request, instanceId, serverPort, path, event.request),
           );
           return;
         }
@@ -280,8 +464,10 @@ self.addEventListener("fetch", (event) => {
 // to the main thread's request-proxy, which dispatches upgrade events on the
 // virtual HTTP server. Works with any framework/library, not specific to Vite.
 
-function getWsShimScript() {
-  const tokenStr = wsToken ? JSON.stringify(wsToken) : "null";
+function getWsShimScript(instanceId) {
+  const token = wsTokens.get(instanceId);
+  const tokenStr = token ? JSON.stringify(token) : "null";
+  const instanceIdStr = JSON.stringify(instanceId);
   return `<script>
 (function() {
   if (window.__nodepodWsShim) return;
@@ -289,17 +475,18 @@ function getWsShimScript() {
   var NativeWS = window.WebSocket;
   var bc = new BroadcastChannel("nodepod-ws");
   var _wsToken = ${tokenStr};
+  var _instanceId = ${instanceIdStr};
   var nextId = 0;
   var active = {};
 
-  // detect the virtual server port from the page URL.
-  // when loaded via /__preview__/{port}/ or /__virtual__/{port}/, use that port
-  // for WS connections instead of the literal port from the WS URL (which may
-  // be the host page's port, not the virtual server's port)
+  // detect the virtual server port from the page URL. When loaded via
+  // /__preview__/{instanceId}/{port}/ or /__virtual__/{instanceId}/{port}/,
+  // use that port for WS connections instead of the literal port from the
+  // WS URL (which may be the host page's port, not the virtual server's).
   var _previewPort = 0;
   try {
-    var _m = location.pathname.match(/^\\/__(?:preview|virtual)__\\/(\\d+)/);
-    if (_m) _previewPort = parseInt(_m[1], 10);
+    var _m = location.pathname.match(/^\\/__(?:preview|virtual)__\\/(?:[A-Za-z0-9_-]*[A-Za-z_-][A-Za-z0-9_-]*\\/(\\d+)|(\\d+))/);
+    if (_m) _previewPort = parseInt(_m[1] || _m[2], 10);
   } catch(e) {}
 
   function NodepodWS(url, protocols) {
@@ -314,7 +501,7 @@ function getWsShimScript() {
     }
     var self = this;
     var uid = "ws-iframe-" + (++nextId) + "-" + Math.random().toString(36).slice(2,8);
-    // Use the preview port (from /__preview__/{port}/) if available,
+    // Use the preview port (from /__preview__/.../{port}/) if available,
     // otherwise fall back to the port from the WebSocket URL.
     var port = _previewPort || parseInt(parsed.port) || (parsed.protocol === "wss:" ? 443 : 80);
     var path = parsed.pathname + parsed.search;
@@ -336,6 +523,7 @@ function getWsShimScript() {
 
     bc.postMessage({
       kind: "ws-connect",
+      instanceId: _instanceId,
       uid: uid,
       port: port,
       path: path,
@@ -387,12 +575,12 @@ function getWsShimScript() {
       type = "binary";
       payload = Array.from(data);
     }
-    bc.postMessage({ kind: "ws-send", uid: this._uid, data: payload, type: type, token: _wsToken });
+    bc.postMessage({ kind: "ws-send", instanceId: _instanceId, uid: this._uid, data: payload, type: type, token: _wsToken });
   };
   NodepodWS.prototype.close = function(code, reason) {
     if (this.readyState >= 2) return;
     this.readyState = 2;
-    bc.postMessage({ kind: "ws-close", uid: this._uid, code: code || 1000, reason: reason || "", token: _wsToken });
+    bc.postMessage({ kind: "ws-close", instanceId: _instanceId, uid: this._uid, code: code || 1000, reason: reason || "", token: _wsToken });
     var self = this;
     setTimeout(function() {
       self.readyState = 3;
@@ -415,6 +603,8 @@ function getWsShimScript() {
   bc.onmessage = function(ev) {
     var d = ev.data;
     if (!d || !d.uid) return;
+    // Filter by instance so a sibling Nodepod's chatter doesn't leak in
+    if (d.instanceId && d.instanceId !== _instanceId) return;
     // check bridge token
     if (_wsToken && d.token !== _wsToken) return;
     var ws = active[d.uid];
@@ -527,14 +717,19 @@ function errorPage(status, title, message) {
 
 // ── Virtual server proxy ──
 
-async function proxyToVirtualServer(request, serverPort, path, originalRequest) {
-  if (!port) {
+async function proxyToVirtualServer(request, instanceId, serverPort, path, originalRequest) {
+  // route to whichever tab owns this instanceId
+  let targetPort = getPortForInstance(instanceId);
+
+  if (!targetPort) {
+    // no tabs connected, poke clients to reinit and give them a moment
     const clients = await self.clients.matchAll();
     for (const client of clients) {
       client.postMessage({ type: "sw-needs-init" });
     }
     await new Promise((r) => setTimeout(r, 200));
-    if (!port) {
+    targetPort = getPortForInstance(instanceId);
+    if (!targetPort) {
       return errorPage(503, "Service Unavailable", "The Nodepod service worker is still initializing. Please refresh the page.");
     }
   }
@@ -560,31 +755,43 @@ async function proxyToVirtualServer(request, serverPort, path, originalRequest) 
 
   const id = nextId++;
   const promise = new Promise((resolve, reject) => {
-    pending.set(id, { resolve, reject });
+    pending.set(id, { resolve, reject, port: targetPort });
     setTimeout(() => {
       if (pending.has(id)) {
+        const entry = pending.get(id);
         pending.delete(id);
+        // port never answered, likely stale (tab closed without pagehide).
+        // evict so the next request doesn't waste another 30s on it
+        if (entry.port && ports.has(entry.port)) {
+          cleanupPort(entry.port);
+        }
         reject(new Error("Request timeout: " + path));
       }
     }, 30000);
   });
 
-  port.postMessage({
-    type: "request",
-    id,
-    data: {
-      port: serverPort,
-      method: request.method,
-      url: path,
-      headers,
-      body,
-      // Pass the full original URL so the main thread can do a fallback
-      // network fetch if the virtual server returns 404. This handles
-      // cross-origin resources (fonts, CDN assets) that the preview app
-      // references but the virtual server doesn't serve.
-      originalUrl: request.url,
-    },
-  });
+  try {
+    targetPort.postMessage({
+      type: "request",
+      id,
+      data: {
+        instanceId,
+        port: serverPort,
+        method: request.method,
+        url: path,
+        headers,
+        body,
+        // original url so main thread can fall back to a network fetch if
+        // the virtual server returns 404 (fonts, CDNs etc)
+        originalUrl: request.url,
+      },
+    });
+  } catch (err) {
+    // port got detached between lookup and post
+    pending.delete(id);
+    cleanupPort(targetPort);
+    return errorPage(503, "Service Unavailable", "The owning tab for this server is no longer connected.");
+  }
 
   try {
     const data = await promise;
@@ -614,7 +821,8 @@ async function proxyToVirtualServer(request, serverPort, path, originalRequest) 
     let finalBody = responseBody;
     const ct = respHeaders["content-type"] || respHeaders["Content-Type"] || "";
     if (ct.includes("text/html") && responseBody) {
-      let injection = getWsShimScript();
+      let injection = getWsShimScript(instanceId);
+      const previewScript = previewScripts.get(instanceId);
       if (previewScript) {
         injection += `<script>${previewScript}<` + `/script>`;
       }
