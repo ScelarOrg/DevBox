@@ -85,8 +85,25 @@ export function satisfiesRange(version: string, range: string): boolean {
   const sv = parseSemver(version);
   if (!sv) return false;
 
-  // pre-release versions only match ranges that explicitly include one
-  if (sv.prerelease && !range.includes("-")) return false;
+  // pre-release versions only match ranges that explicitly include a prerelease
+  // for the SAME major.minor.patch (npm semantics). e.g. 5.0.0-next.0 matches
+  // ^5.0.0-beta.0 but NOT >=4.0.0-beta.0 (different major.minor.patch)
+  if (sv.prerelease) {
+    // Extract the comparator version(s) from the range and check if any
+    // share the same major.minor.patch as the candidate
+    const rangeVersions = range.match(/\d+\.\d+\.\d+(?:-[^\s)]*)?/g) || [];
+    const hasMatchingPrerelease = rangeVersions.some((rv) => {
+      if (!rv.includes("-")) return false;
+      const rvParsed = parseSemver(rv);
+      return (
+        rvParsed &&
+        rvParsed.major === sv.major &&
+        rvParsed.minor === sv.minor &&
+        rvParsed.patch === sv.patch
+      );
+    });
+    if (!hasMatchingPrerelease) return false;
+  }
 
   range = range.trim();
 
@@ -502,8 +519,12 @@ async function installPackageAt(
   }
 
   if (versionInfo.optionalDependencies) {
+    const optEntries = Object.entries(versionInfo.optionalDependencies);
+
     if (state.config.optionalDependencies) {
-      Object.assign(edges, versionInfo.optionalDependencies);
+      for (const [optName, optRange] of optEntries) {
+        edges[optName] = optRange as string;
+      }
     } else {
       // Always include wasm32-wasi optional deps — they're WASM alternatives
       // to native bindings and are the only variant that can run in-browser
