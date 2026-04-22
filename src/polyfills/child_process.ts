@@ -701,11 +701,25 @@ async function installPackages(
       (a: string) => a === "--no-save",
     );
 
+    let registryUrl: string | undefined;
+    for (let i = 0; i < args.length; i++) {
+      const a = args[i];
+      if (a === "--registry" && args[i + 1]) {
+        registryUrl = args[i + 1];
+        break;
+      }
+      if (a.startsWith("--registry=")) {
+        registryUrl = a.slice("--registry=".length);
+        break;
+      }
+    }
+
     let totalAdded = 0;
     if (names.length === 0) {
       const ir = await installer.installFromManifest(undefined, {
         withDevDeps: true,
         onProgress,
+        registry: registryUrl,
       });
       totalAdded = ir.newPackages.length;
     } else {
@@ -714,6 +728,7 @@ async function installPackages(
           persist: !noSave,
           persistDev: isDev && !noSave,
           onProgress,
+          registry: registryUrl,
         });
         totalAdded += ir.newPackages.length;
       }

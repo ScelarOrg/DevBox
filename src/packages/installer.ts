@@ -130,7 +130,9 @@ export class DependencyInstaller {
     onProgress?.(`Resolving ${targetName}@${targetRange}...`);
 
     const resolutionOpts: ResolutionConfig = {
-      registry: this.registryClient,
+      registry: flags.registry
+        ? new RegistryClient({ endpoint: flags.registry })
+        : this.registryClient,
       devDependencies: flags.withDevDeps,
       optionalDependencies: flags.withOptionalDeps,
       onProgress,
@@ -209,7 +211,9 @@ export class DependencyInstaller {
     onProgress?.("Resolving dependency tree...");
 
     const resolutionOpts: ResolutionConfig = {
-      registry: this.registryClient,
+      registry: flags.registry
+        ? new RegistryClient({ endpoint: flags.registry })
+        : this.registryClient,
       devDependencies: flags.withDevDeps,
       optionalDependencies: flags.withOptionalDeps,
       onProgress,
