@@ -25,6 +25,7 @@ const RE_EXPORT_DEFAULT_CLASS = /export\s+default\s+class\s+(\w+)/g;
 const RE_EXPORT_DEFAULT_FN_NAMED = /export\s+default\s+function\s+(\w+)/g;
 const RE_EXPORT_DEFAULT_FN_ANON = /export\s+default\s+function\s*\(/g;
 const RE_EXPORT_DEFAULT = /export\s+default\s+/g;
+const RE_EXPORT_STAR_AS = /export\s+\*\s+as\s+(\w+)\s+from\s+['"]([^'"]+)['"]\s*;?/g;
 const RE_EXPORT_STAR = /export\s+\*\s+from\s+['"]([^'"]+)['"]\s*;?/g;
 const RE_EXPORT_NAMED_FROM = /export\s+\{([^}]+)\}\s+from\s+['"]([^'"]+)['"]\s*;?/g;
 const RE_EXPORT_NAMED = /export\s+\{([^}]+)\}\s*;?/g;
@@ -219,11 +220,20 @@ export function collectEsmCjsPatches(
       }
     } else if (node.type === "ExportAllDeclaration") {
       const src = node.source.value;
-      patches.push([
-        node.start,
-        node.end,
-        `Object.assign(exports, require(${JSON.stringify(src)}))`,
-      ]);
+      if (node.exported) {
+        const name = node.exported.name || node.exported.value;
+        patches.push([
+          node.start,
+          node.end,
+          `exports[${JSON.stringify(name)}] = require(${JSON.stringify(src)})`,
+        ]);
+      } else {
+        patches.push([
+          node.start,
+          node.end,
+          `Object.assign(exports, require(${JSON.stringify(src)}))`,
+        ]);
+      }
     }
   }
 }
@@ -503,6 +513,7 @@ function esmToCjsViaRegex(code: string): string {
   out = out.replace(RE_EXPORT_DEFAULT_FN_ANON, "module.exports = function(");
   out = out.replace(RE_EXPORT_DEFAULT, "module.exports = ");
   // re-exports
+  out = out.replace(RE_EXPORT_STAR_AS, 'exports.$1 = require("$2");');
   out = out.replace(RE_EXPORT_STAR, 'Object.assign(exports, require("$1"));');
   out = out.replace(
     RE_EXPORT_NAMED_FROM,
