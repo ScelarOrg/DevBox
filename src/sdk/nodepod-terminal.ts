@@ -69,6 +69,8 @@ export interface TerminalWiring {
 export class NodepodTerminal {
   private _term: any = null;
   private _fitAddon: any = null;
+  private _serializeAddon: any = null;
+  private _serializedBuffer = "";
   private _dataDisposable: any = null;
   private _xtermResizeDisposable: any = null;
   private _resizeHandler: (() => void) | null = null;
@@ -151,7 +153,16 @@ export class NodepodTerminal {
       this._term.loadAddon(this._fitAddon);
     }
 
+    if (this._opts.SerializeAddon) {
+      this._serializeAddon = new this._opts.SerializeAddon();
+      this._term.loadAddon(this._serializeAddon);
+    }
+
     this._term.open(container);
+
+    if (this._serializedBuffer) {
+      this._term.write(this._serializedBuffer);
+    }
 
     if (this._opts.WebglAddon) {
       try {
@@ -232,6 +243,10 @@ export class NodepodTerminal {
       window.removeEventListener("resize", this._resizeHandler);
       this._resizeHandler = null;
     }
+    if (this._serializeAddon) {
+      this._serializedBuffer = this._serializeAddon.serialize();
+      this._serializeAddon = null;
+    }
     if (this._term) {
       this._term.dispose();
       this._term = null;
@@ -259,6 +274,13 @@ export class NodepodTerminal {
 
   fit(): void {
     this._fitAddon?.fit();
+  }
+
+  serialize(): string {
+    if (this._serializeAddon) {
+      return this._serializeAddon.serialize();
+    }
+    return this._serializedBuffer;
   }
 
   write(text: string): void {

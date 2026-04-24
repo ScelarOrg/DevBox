@@ -71,6 +71,7 @@ export interface TerminalOptions {
   Terminal: any;
   FitAddon?: any;
   WebglAddon?: any;
+  SerializeAddon?: any;
   theme?: TerminalTheme;
   fontSize?: number;
   fontFamily?: string;
