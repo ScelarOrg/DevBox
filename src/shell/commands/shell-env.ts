@@ -119,7 +119,7 @@ const exitCmd: BuiltinFn = (args) => {
   return { stdout: "", stderr: "", exitCode: code };
 };
 
-const clear: BuiltinFn = () => ok("\x1b[2J\x1b[H");
+const clear: BuiltinFn = () => ok("\x1b[H\x1b[2J\x1b[3J");
 
 /* ------------------------------------------------------------------ */
 /*  test / [                                                           */
