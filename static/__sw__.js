@@ -37,6 +37,11 @@ const instancePorts = new Map();
 // clientId -> { instanceId, serverPort } for preview iframes
 const previewClients = new Map();
 
+// stripped path -> pod. iframes claim their path so a reload that lands on
+// the stripped url (no prefix, new clientId) can still be routed. bounded.
+const pathToPodMap = new Map();
+const PATH_MAP_MAX = 512;
+
 // per-instance script injected into preview iframe HTML
 const previewScripts = new Map();
 
@@ -270,6 +275,23 @@ self.addEventListener("message", (event) => {
     return;
   }
 
+  // iframe claims its stripped path. we look up the pod from the sender's
+  // clientId so a page can't claim for a pod it isn't already tied to.
+  if (data.type === "nodepod-path-claim" && typeof data.path === "string") {
+    const clientId = event.source && event.source.id;
+    const pod = clientId ? previewClients.get(clientId) : null;
+    if (pod) {
+      if (pathToPodMap.size >= PATH_MAP_MAX) {
+        const oldest = pathToPodMap.keys().next().value;
+        if (oldest !== undefined) pathToPodMap.delete(oldest);
+      }
+      // re-insert to bump recency
+      pathToPodMap.delete(data.path);
+      pathToPodMap.set(data.path, pod);
+    }
+    return;
+  }
+
   // everything else requires a token from some live tab
   if (!isValidToken(data.token)) return;
 
@@ -451,6 +473,31 @@ self.addEventListener("fetch", (event) => {
       }
     } catch {
       // Invalid referer URL, ignore
+    }
+  }
+
+  // 5. fallback: path-claim map. catches iframe reloads where the URL was
+  //    stripped by the location patch, so clientId and referer are no help.
+  //    gated to iframe/frame navigations so outer-page top-level nav to a
+  //    path that happens to be claimed doesn't get misrouted to a pod.
+  {
+    const dest = event.request.destination;
+    const isIframeNav = event.request.mode === "navigate" && (dest === "iframe" || dest === "frame");
+    const host = url.hostname;
+    const sameOrigin = host === "localhost" || host === "127.0.0.1" || host === "0.0.0.0" || host === self.location.hostname;
+    if (isIframeNav && sameOrigin) {
+      const pathHit = pathToPodMap.get(url.pathname);
+      if (pathHit) {
+        const { instanceId, serverPort } = pathHit;
+        const path = url.pathname + url.search;
+        if (event.resultingClientId) {
+          previewClients.set(event.resultingClientId, { instanceId, serverPort });
+        }
+        event.respondWith(
+          proxyToVirtualServer(event.request, instanceId, serverPort, path, event.request),
+        );
+        return;
+      }
     }
   }
 
@@ -648,6 +695,105 @@ function getWsShimScript(instanceId) {
 </script>`;
 }
 
+// ── Virtual-prefix URL patch ──
+//
+// iframes live at /__virtual__/{id}/{port}/ but client-side routers read
+// location.pathname and want the app's real path. Location is
+// [LegacyUnforgeable] so we can't override its getters. instead we strip
+// the prefix from the real URL via history.replaceState before any user
+// script runs. SW routes later requests via clientId, with the path-claim
+// map as a fallback for force-reloads.
+const LOCATION_PATCH_SCRIPT = `<script>
+(function() {
+  if (window.__nodepodLocPatch) return;
+  window.__nodepodLocPatch = true;
+
+  // /__virtual__/{id}/{port} (|\\d+ branch is the legacy id-less form)
+  var PREFIX_RE = /^\\/__(?:preview|virtual)__\\/(?:[A-Za-z0-9_-]*[A-Za-z_-][A-Za-z0-9_-]*\\/\\d+|\\d+)/;
+
+  var m = location.pathname.match(PREFIX_RE);
+  if (!m) return;
+  var PREFIX = m[0];
+
+  function strip(u) {
+    if (typeof u !== 'string') return u;
+    if (u === PREFIX) return '/';
+    if (u.indexOf(PREFIX + '/') === 0) return u.slice(PREFIX.length);
+    if (u.indexOf(PREFIX + '?') === 0) return '/' + u.slice(PREFIX.length);
+    if (u.indexOf(PREFIX + '#') === 0) return '/' + u.slice(PREFIX.length);
+    return u;
+  }
+
+  // let the SW know our path so a force-reload without the prefix still routes
+  function claimPath() {
+    try {
+      var sw = navigator.serviceWorker && navigator.serviceWorker.controller;
+      if (sw) sw.postMessage({ type: 'nodepod-path-claim', path: location.pathname });
+    } catch (e) {}
+  }
+
+  // swap the visible URL to the stripped form. same document, just history.
+  try {
+    var newPath = strip(location.pathname);
+    if (newPath !== location.pathname) {
+      history.replaceState(history.state, '', newPath + location.search + location.hash);
+    }
+  } catch (e) {
+    console.warn('[nodepod] initial URL strip failed:', e);
+  }
+  claimPath();
+
+  // strip any prefix user code passes, re-claim on every nav so the SW's
+  // fallback map stays current
+  var origPush = history.pushState;
+  var origRepl = history.replaceState;
+  history.pushState = function(state, title, url) {
+    if (typeof url === 'string') url = strip(url);
+    var r = origPush.call(this, state, title, url);
+    claimPath();
+    return r;
+  };
+  history.replaceState = function(state, title, url) {
+    if (typeof url === 'string') url = strip(url);
+    var r = origRepl.call(this, state, title, url);
+    claimPath();
+    return r;
+  };
+  window.addEventListener('popstate', claimPath);
+
+  // plain <a href="/..."> clicks would full-navigate and lose our clientId.
+  // turn them into pushState. bubble phase so framework Link handlers win.
+  document.addEventListener('click', function(ev) {
+    if (ev.defaultPrevented || ev.button !== 0) return;
+    if (ev.metaKey || ev.ctrlKey || ev.altKey || ev.shiftKey) return;
+    var el = ev.target;
+    while (el && el.nodeName !== 'A') el = el.parentNode;
+    if (!el || !el.getAttribute) return;
+    if (el.target && el.target !== '' && el.target !== '_self') return;
+    if (el.hasAttribute('download')) return;
+    var raw = el.getAttribute('href');
+    if (!raw || raw.charAt(0) !== '/' || raw.charAt(1) === '/') return;
+    ev.preventDefault();
+    var target = strip(raw);
+    if (target !== location.pathname + location.search + location.hash) {
+      history.pushState({}, '', target);
+      dispatchEvent(new PopStateEvent('popstate', { state: history.state }));
+    }
+  });
+
+  // <form action="/..."> posts to origin. strip any prefix before submit,
+  // SW handles the rest via clientId.
+  document.addEventListener('submit', function(ev) {
+    var form = ev.target;
+    if (!form || form.nodeName !== 'FORM') return;
+    var a = form.getAttribute('action');
+    if (!a) return;
+    var stripped = strip(a);
+    if (stripped !== a) form.setAttribute('action', stripped);
+  }, true);
+})();
+</script>`;
+
 // Small "nodepod" badge in the bottom-right corner of preview iframes.
 const WATERMARK_SCRIPT = `<script>
 (function() {
@@ -821,7 +967,8 @@ async function proxyToVirtualServer(request, instanceId, serverPort, path, origi
     let finalBody = responseBody;
     const ct = respHeaders["content-type"] || respHeaders["Content-Type"] || "";
     if (ct.includes("text/html") && responseBody) {
-      let injection = getWsShimScript(instanceId);
+      // location patch runs first so user scripts see the stripped URL
+      let injection = LOCATION_PATCH_SCRIPT + getWsShimScript(instanceId);
       const previewScript = previewScripts.get(instanceId);
       if (previewScript) {
         injection += `<script>${previewScript}<` + `/script>`;

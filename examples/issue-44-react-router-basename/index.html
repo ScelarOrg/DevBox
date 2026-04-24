@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>nodepod - issue #44 followup - react router basename</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: monospace; background: #1a1a2e; color: #e0e0e0; padding: 20px; line-height: 1.5; }
+    h1 { font-size: 18px; margin-bottom: 4px; color: #fff; }
+    p { font-size: 13px; color: #888; margin-bottom: 12px; max-width: 900px; }
+    a { color: #8ac4e6; }
+    code { background: #0d0d1a; padding: 2px 6px; border-radius: 3px; color: #a8e6a3; font-size: 12px; }
+    .layout { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .pane {
+      background: #0d0d1a; border: 1px solid #333; border-radius: 6px;
+      padding: 12px; display: flex; flex-direction: column; min-height: 560px;
+    }
+    .pane h2 { font-size: 13px; margin-bottom: 8px; color: #8ac4e6; }
+    #output {
+      flex: 1; white-space: pre-wrap; font-size: 12px; line-height: 1.55;
+      overflow-y: auto; max-height: 540px;
+    }
+    #frame { flex: 1; border: 1px solid #333; border-radius: 4px; background: #fff; min-height: 400px; }
+    #status {
+      font-size: 12px; padding: 6px 10px; border-radius: 3px;
+      background: #181830; color: #aaa; border: 1px solid #222; margin-bottom: 8px;
+    }
+    .stdout { color: #a8e6a3; }
+    .stderr { color: #e68a8a; }
+    .info { color: #8ac4e6; }
+    .dim { color: #666; }
+    .pass { color: #a8e6a3; font-weight: bold; }
+    .fail { color: #e68a8a; font-weight: bold; }
+    .warn { color: #e6c38a; }
+    .title { color: #c38ae6; font-weight: bold; }
+    .controls { display: flex; gap: 8px; margin-bottom: 12px; align-items: center; flex-wrap: wrap; }
+    button {
+      background: #2a2a4a; color: #e0e0e0; border: 1px solid #444;
+      padding: 6px 12px; border-radius: 4px; font-family: monospace; cursor: pointer;
+    }
+    button:hover { background: #3a3a5a; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+  </style>
+</head>
+<body>
+  <h1>nodepod - issue <a href="https://github.com/ScelarOrg/Nodepod/issues/44">#44</a> followup - react router basename</h1>
+  <p>
+    repro of the followup report: a vite + react app using
+    react-router-dom BrowserRouter mounted inside a nodepod iframe never
+    matches any app routes. the iframe's location.pathname is
+    <code>/__virtual__/podXXXX/5173/</code>, which doesn't line up with
+    routes declared as <code>/</code>, <code>/about</code> etc. the user
+    gets the catch-all (NoMatch) branch and the iframe devtools logs
+    <code>No routes matched location "/__virtual__/pod.../5173/"</code>.
+  </p>
+
+  <div class="controls">
+    <button id="run">boot + install + dev</button>
+    <button id="clear">clear log</button>
+  </div>
+
+  <div class="layout">
+    <div class="pane">
+      <h2>log</h2>
+      <div id="output"></div>
+    </div>
+    <div class="pane">
+      <h2>preview iframe</h2>
+      <div id="status">idle</div>
+      <iframe id="frame" sandbox="allow-scripts allow-same-origin allow-forms allow-popups"></iframe>
+    </div>
+  </div>
+
+  <script type="module">
+    import { Nodepod } from "/dist/index.mjs";
+
+    // project files as JS template literals. the escape <\/ inside any
+    // script-tag strings gets unescaped when the template literal runs
+    const FILES = {
+      '/app/package.json': `{
+  "name": "router-repro",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "react-router-dom": "^7.0.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^5.0.0",
+    "vite": "8.0.10"
+  }
+}
+`,
+
+      '/app/vite.config.js': `import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+
+export default defineConfig({
+  plugins: [react()],
+  server: { host: '0.0.0.0', port: 5173, strictPort: true },
+});
+`,
+
+      '/app/index.html': `<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>router repro</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"><\/script>
+  </body>
+</html>
+`,
+
+      '/app/src/main.jsx': `import React from 'react';
+import ReactDOM from 'react-dom/client';
+import { BrowserRouter } from 'react-router-dom';
+import App from './App.jsx';
+
+ReactDOM.createRoot(document.getElementById('root')).render(
+  <React.StrictMode>
+    <BrowserRouter>
+      <App />
+    </BrowserRouter>
+  </React.StrictMode>
+);
+`,
+
+      '/app/src/App.jsx': `import { Routes, Route, Link, useLocation } from 'react-router-dom';
+
+function DebugBar() {
+  const loc = useLocation();
+  return (
+    <div style={{ background: '#eef', padding: 8, fontFamily: 'monospace', fontSize: 12 }}>
+      <div>router location.pathname = <b>{loc.pathname}</b></div>
+      <div>window.location.pathname = <b>{window.location.pathname}</b></div>
+    </div>
+  );
+}
+
+function Home() {
+  return (
+    <div style={{ padding: 24 }}>
+      <h1>home</h1>
+      <p>if you see this, react-router matched the / route correctly.</p>
+      <Link to="/about">go to /about</Link>
+    </div>
+  );
+}
+
+function About() {
+  return (
+    <div style={{ padding: 24 }}>
+      <h1>about</h1>
+      <Link to="/">back home</Link>
+    </div>
+  );
+}
+
+function NoMatch() {
+  return (
+    <div style={{ padding: 24, background: '#fee', color: '#900' }}>
+      <h1>no route matched</h1>
+      <p>
+        BrowserRouter saw pathname <code>{window.location.pathname}</code> and
+        none of the app routes match. this is the bug.
+      </p>
+    </div>
+  );
+}
+
+export default function App() {
+  return (
+    <>
+      <DebugBar />
+      <Routes>
+        <Route path="/" element={<Home />} />
+        <Route path="/about" element={<About />} />
+        <Route path="*" element={<NoMatch />} />
+      </Routes>
+    </>
+  );
+}
+`,
+    };
+
+    const out = document.getElementById('output');
+    const frame = document.getElementById('frame');
+    const statusEl = document.getElementById('status');
+    const runBtn = document.getElementById('run');
+    const clearBtn = document.getElementById('clear');
+
+    function log(t, cls = 'stdout') {
+      const span = document.createElement('span');
+      span.className = cls;
+      span.textContent = t + '\n';
+      out.appendChild(span);
+      out.scrollTop = out.scrollHeight;
+    }
+    function setStatus(t, cls = '') { statusEl.textContent = t; statusEl.className = cls; }
+    clearBtn.addEventListener('click', () => { out.textContent = ''; });
+
+    runBtn.addEventListener('click', async () => {
+      runBtn.disabled = true;
+      frame.removeAttribute('src');
+      try {
+        log('booting nodepod (workdir=/app) ...', 'info');
+        setStatus('booting ...', 'warn');
+
+        let serverUrl = null;
+        const ready = new Promise((resolve) => {
+          window.__onReady = (url) => { serverUrl = url; resolve(url); };
+        });
+
+        const pod = await Nodepod.boot({
+          workdir: '/app',
+          watermark: false,
+          onServerReady: (port, url) => {
+            log(`[onServerReady] port=${port} url=${url}`, 'info');
+            window.__onReady(url);
+          },
+        });
+        log('booted.\n', 'info');
+
+        log('writing project files ...', 'info');
+        await Promise.all(
+          Object.entries(FILES).map(([p, c]) => pod.fs.writeFile(p, c))
+        );
+        log('done.\n', 'info');
+
+        log('--- npm install ---', 'title');
+        const install = await pod.spawn('npm', ['install']);
+        install.on('output', (t) => log(t.trimEnd(), 'stdout'));
+        install.on('error',  (t) => log(t.trimEnd(), 'stderr'));
+        const installRes = await install.completion;
+        if (installRes.exitCode !== 0) {
+          log(`install failed (exit=${installRes.exitCode})`, 'fail');
+          setStatus('install failed', 'fail');
+          return;
+        }
+        log('install done.\n', 'pass');
+
+        log('--- npm run dev ---', 'title');
+        setStatus('starting dev ...', 'warn');
+        const dev = await pod.spawn('npm', ['run', 'dev']);
+        dev.on('output', (t) => log(t.trimEnd(), 'stdout'));
+        dev.on('error',  (t) => log(t.trimEnd(), 'stderr'));
+
+        const url = await Promise.race([
+          ready,
+          new Promise((r) => setTimeout(() => r(null), 60000)),
+        ]);
+        if (!url) {
+          log('timeout waiting for dev server', 'fail');
+          setStatus('timeout', 'fail');
+          dev.kill();
+          return;
+        }
+
+        log(`\npointing iframe at ${url}`, 'info');
+        log(`BrowserRouter will see pathname = ${new URL(url).pathname}`, 'warn');
+        log(`expected: the red "no route matched" box renders`, 'warn');
+        setStatus('check the iframe', 'warn');
+        frame.src = url;
+      } catch (e) {
+        log(`\nuncaught: ${e?.stack || e}`, 'fail');
+        setStatus('uncaught', 'fail');
+      } finally {
+        runBtn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
