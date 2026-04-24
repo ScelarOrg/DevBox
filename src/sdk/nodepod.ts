@@ -44,6 +44,15 @@ function makeInstanceId(): string {
   return "pod" + rand;
 }
 
+// quote args before joining so the shell doesn't retokenize them.
+// without this, `sh -c 'mv /a/* /b/'` loses the body.
+function shellQuote(arg: string): string {
+  if (arg === "") return "''";
+  if (/^[A-Za-z0-9_\-./:=@%+,]+$/.test(arg)) return arg;
+  // single-quote it, escape any inner quotes the posix way
+  return "'" + arg.replace(/'/g, "'\\''") + "'";
+}
+
 export class Nodepod {
   readonly fs: NodepodFS;
 
@@ -363,7 +372,10 @@ export class Nodepod {
         isShell: false,
       });
     } else {
-      const fullCmd = args?.length ? `${cmd} ${args.join(" ")}` : cmd;
+      // quote everything so sh -c bodies survive the round-trip
+      const fullCmd = args?.length
+        ? `${shellQuote(cmd)} ${args.map(shellQuote).join(" ")}`
+        : cmd;
       handle.exec({
         type: "exec",
         filePath: "",

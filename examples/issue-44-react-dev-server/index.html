@@ -1,0 +1,484 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>nodepod - issue #44 react dev server</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: monospace; background: #1a1a2e; color: #e0e0e0; padding: 20px; line-height: 1.5; }
+    h1 { font-size: 18px; margin-bottom: 4px; color: #fff; }
+    p { font-size: 13px; color: #888; margin-bottom: 12px; max-width: 900px; }
+    a { color: #8ac4e6; }
+    code { background: #0d0d1a; padding: 2px 6px; border-radius: 3px; color: #a8e6a3; font-size: 12px; }
+    .layout { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .pane {
+      background: #0d0d1a; border: 1px solid #333; border-radius: 6px;
+      padding: 12px; display: flex; flex-direction: column; min-height: 560px;
+    }
+    .pane h2 { font-size: 13px; margin-bottom: 8px; color: #8ac4e6; }
+    #output {
+      flex: 1; white-space: pre-wrap; font-size: 12px; line-height: 1.55;
+      overflow-y: auto; max-height: 540px;
+    }
+    #frame { flex: 1; border: 1px solid #333; border-radius: 4px; background: #fff; min-height: 400px; }
+    #status {
+      font-size: 12px; padding: 6px 10px; border-radius: 3px;
+      background: #181830; color: #aaa; border: 1px solid #222; margin-bottom: 8px;
+    }
+    .stdout { color: #a8e6a3; }
+    .stderr { color: #e68a8a; }
+    .info { color: #8ac4e6; }
+    .dim { color: #666; }
+    .pass { color: #a8e6a3; font-weight: bold; }
+    .fail { color: #e68a8a; font-weight: bold; }
+    .warn { color: #e6c38a; }
+    .title { color: #c38ae6; font-weight: bold; }
+    .controls { display: flex; gap: 8px; margin-bottom: 12px; align-items: center; flex-wrap: wrap; }
+    button {
+      background: #2a2a4a; color: #e0e0e0; border: 1px solid #444;
+      padding: 6px 12px; border-radius: 4px; font-family: monospace; cursor: pointer;
+    }
+    button:hover { background: #3a3a5a; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    label { font-size: 12px; color: #aaa; }
+  </style>
+</head>
+<body>
+  <h1>nodepod - issue <a href="https://github.com/ScelarOrg/Nodepod/issues/44">#44</a> - react dev server</h1>
+  <p>
+    Reproduces the reporter's flow from the issue thread: boot nodepod with
+    <code>workdir: '/app'</code>, write a Vite 8 + React-TS project into the VFS
+    via <code>pod.fs.writeFile</code>, spawn <code>npm install</code>, then
+    spawn <code>npm run dev</code>, and point an iframe at the url surfaced by
+    <code>onServerReady</code>. The reporter says scaffolding with
+    <code>create-vite@7</code> works, but mounting a cloned repo and running
+    dev server inside it surfaces 503/504s through the SW proxy.
+  </p>
+
+  <div class="controls">
+    <button id="run-vite8">run vite 8 + react-ts</button>
+    <button id="run-vite7">run vite 7 + react-ts (known good)</button>
+    <button id="run-scaffold">scaffold via create-vite@7 (reporter's working path)</button>
+    <button id="clear">clear log</button>
+  </div>
+
+  <div class="layout">
+    <div class="pane">
+      <h2>log</h2>
+      <div id="output"></div>
+    </div>
+    <div class="pane">
+      <h2>preview iframe</h2>
+      <div id="status">idle</div>
+      <iframe id="frame" sandbox="allow-scripts allow-same-origin allow-forms allow-popups"></iframe>
+    </div>
+  </div>
+
+  <!-- project files, stripped-down version of create-vite@8 react-ts output.
+       stored in script tags so we can write them via pod.fs.writeFile after
+       boot (like the reporter does), not via Nodepod.boot({files}) -->
+
+  <script id="file-package-json-v8" type="text/plain">{
+  "name": "vite-react-ts-app",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^5.0.0",
+    "typescript": "~5.6.0",
+    "vite": "8.0.10"
+  }
+}
+</script>
+
+  <script id="file-package-json-v7" type="text/plain">{
+  "name": "vite-react-ts-app",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.5.0",
+    "typescript": "~5.6.0",
+    "vite": "7.3.1"
+  }
+}
+</script>
+
+  <script id="file-vite-config" type="text/plain">import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+
+export default defineConfig({
+  plugins: [react()],
+  server: {
+    host: '0.0.0.0',
+    port: 5173,
+    strictPort: true,
+  },
+});
+</script>
+
+  <script id="file-tsconfig" type="text/plain">{
+  "files": [],
+  "references": [
+    { "path": "./tsconfig.app.json" },
+    { "path": "./tsconfig.node.json" }
+  ]
+}
+</script>
+
+  <script id="file-tsconfig-app" type="text/plain">{
+  "compilerOptions": {
+    "target": "ES2020",
+    "useDefineForClassFields": true,
+    "lib": ["ES2020", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "skipLibCheck": true,
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "jsx": "react-jsx",
+    "strict": true
+  },
+  "include": ["src"]
+}
+</script>
+
+  <script id="file-tsconfig-node" type="text/plain">{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2023"],
+    "module": "ESNext",
+    "skipLibCheck": true,
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "strict": true
+  },
+  "include": ["vite.config.ts"]
+}
+</script>
+
+  <script id="file-index-html" type="text/plain"><!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>vite react ts app</title>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="module" src="/src/main.tsx"></script>
+</body>
+</html>
+</script>
+
+  <script id="file-main-tsx" type="text/plain">import { StrictMode } from 'react';
+import { createRoot } from 'react-dom/client';
+import App from './App.tsx';
+
+createRoot(document.getElementById('root')!).render(
+  <StrictMode>
+    <App />
+  </StrictMode>,
+);
+</script>
+
+  <script id="file-app-tsx" type="text/plain">import { useState } from 'react';
+
+function App() {
+  const [count, setCount] = useState(0);
+  return (
+    <div style={{ fontFamily: 'system-ui', padding: 24 }}>
+      <h1>Hello from Vite + React + TS inside nodepod</h1>
+      <p>If you see this, the dev server is reachable through the SW proxy.</p>
+      <button onClick={() => setCount((c) => c + 1)}>count is {count}</button>
+    </div>
+  );
+}
+
+export default App;
+</script>
+
+  <script id="file-vite-env-d-ts" type="text/plain">/// <reference types="vite/client" />
+</script>
+
+  <script type="module">
+    import { Nodepod } from "/dist/index.mjs";
+
+    const out = document.getElementById('output');
+    const frame = document.getElementById('frame');
+    const statusEl = document.getElementById('status');
+    const runV8Btn = document.getElementById('run-vite8');
+    const runV7Btn = document.getElementById('run-vite7');
+    const runScaffoldBtn = document.getElementById('run-scaffold');
+    const clearBtn = document.getElementById('clear');
+
+    function log(text, cls = 'stdout') {
+      const span = document.createElement('span');
+      span.className = cls;
+      span.textContent = text + '\n';
+      out.appendChild(span);
+      out.scrollTop = out.scrollHeight;
+    }
+    function setStatus(text, cls = '') {
+      statusEl.textContent = text;
+      statusEl.className = cls;
+    }
+    function readFile(id) { return document.getElementById(id).textContent; }
+
+    clearBtn.addEventListener('click', () => { out.textContent = ''; });
+
+    function disableButtons(disabled) {
+      runV8Btn.disabled = disabled;
+      runV7Btn.disabled = disabled;
+      runScaffoldBtn.disabled = disabled;
+    }
+
+    // mirror of reporter's mountFiles()
+    async function mountFiles(pod, files) {
+      const writes = [];
+      for (const [path, content] of Object.entries(files)) {
+        writes.push(pod.fs.writeFile(path, content));
+      }
+      await Promise.all(writes);
+    }
+
+    // mirror of reporter's runCommand()
+    async function runCommand(pod, command, args = []) {
+      const hasRootPath = args.some((a) => a.startsWith('/'));
+      const proc = await pod.spawn(command, args, {
+        cwd: hasRootPath ? '/' : pod.cwd,
+      });
+      proc.on('output', (t) => log(t.trimEnd(), 'stdout'));
+      proc.on('error', (t) => log(t.trimEnd(), 'stderr'));
+      return proc;
+    }
+
+    async function runMountedProject(pkgJsonId, label) {
+      disableButtons(true);
+      frame.removeAttribute('src');
+      setStatus('booting ...', 'warn');
+      try {
+        log(`=== ${label} ===`, 'title');
+
+        let serverUrl = null;
+        const serverReadyPromise = new Promise((resolve) => {
+          // resolve on first onServerReady, same as reporter's setup
+          window.__onServerReady = (url) => { serverUrl = url; resolve(url); };
+        });
+
+        log('booting nodepod (workdir=/app) ...', 'info');
+        const pod = await Nodepod.boot({
+          watermark: false,
+          workdir: '/app',
+          allowedFetchDomains: null,
+          onServerReady: (port, url) => {
+            log(`[onServerReady] port=${port} url=${url}`, 'info');
+            window.__onServerReady(url);
+          },
+        });
+        log('booted.\n', 'info');
+
+        log('writing project files via pod.fs.writeFile ...', 'info');
+        await mountFiles(pod, {
+          '/app/package.json':     readFile(pkgJsonId),
+          '/app/vite.config.ts':   readFile('file-vite-config'),
+          '/app/tsconfig.json':    readFile('file-tsconfig'),
+          '/app/tsconfig.app.json':readFile('file-tsconfig-app'),
+          '/app/tsconfig.node.json':readFile('file-tsconfig-node'),
+          '/app/index.html':       readFile('file-index-html'),
+          '/app/src/main.tsx':     readFile('file-main-tsx'),
+          '/app/src/App.tsx':      readFile('file-app-tsx'),
+          '/app/src/vite-env.d.ts':readFile('file-vite-env-d-ts'),
+        });
+        log('files mounted.\n', 'info');
+
+        log('--- npm install ---', 'title');
+        const installProc = await runCommand(pod, 'npm', ['install']);
+        const installRes = await installProc.completion;
+        if (installRes.exitCode !== 0) {
+          log(`npm install failed (exit=${installRes.exitCode})`, 'fail');
+          setStatus('install failed', 'fail');
+          return;
+        }
+        log('npm install done.\n', 'pass');
+
+        log('--- npm run dev ---', 'title');
+        setStatus('starting dev server ...', 'warn');
+        const devProc = await runCommand(pod, 'npm', ['run', 'dev']);
+
+        // race: onServerReady vs dev process exits vs 60s timeout
+        const timeoutMs = 60000;
+        const url = await Promise.race([
+          serverReadyPromise,
+          devProc.completion.then((res) => ({ __exited: true, res })),
+          new Promise((r) => setTimeout(() => r({ __timeout: true }), timeoutMs)),
+        ]);
+
+        if (url && url.__exited) {
+          log(`\ndev process exited before port was bound. exit=${url.res.exitCode}`, 'fail');
+          setStatus('dev exited early', 'fail');
+          return;
+        }
+        if (url && url.__timeout) {
+          log(`\ntimed out after ${timeoutMs}ms waiting for onServerReady`, 'fail');
+          setStatus('timeout', 'fail');
+          devProc.kill();
+          return;
+        }
+
+        log(`\nonServerReady fired with ${url}. probing via SW proxy ...`, 'info');
+        setStatus('probing ...', 'warn');
+
+        let ok = false;
+        let lastStatus = 0;
+        let lastStatusText = '';
+        const probeStart = performance.now();
+        while (performance.now() - probeStart < 30000) {
+          try {
+            const res = await fetch(url, { cache: 'no-store' });
+            lastStatus = res.status;
+            lastStatusText = res.statusText;
+            if (res.ok) { ok = true; break; }
+            log(`  -> ${res.status} ${res.statusText}`, res.status >= 500 ? 'fail' : 'warn');
+          } catch (e) {
+            log(`  -> fetch threw: ${e.message}`, 'fail');
+          }
+          await new Promise((r) => setTimeout(r, 1000));
+        }
+
+        if (ok) {
+          log(`\nPASS: dev server reachable. pointing iframe at ${url}`, 'pass');
+          setStatus('ready', 'pass');
+          frame.src = url;
+        } else {
+          log(
+            `\nFAIL: dev server never returned 200. last=${lastStatus} ${lastStatusText}. ` +
+            `this reproduces issue #44.`,
+            'fail'
+          );
+          setStatus(`FAIL ${lastStatus} ${lastStatusText}`, 'fail');
+          frame.src = url;
+        }
+      } catch (e) {
+        log(`\nuncaught: ${e?.stack || e}`, 'fail');
+        setStatus('uncaught', 'fail');
+      } finally {
+        disableButtons(false);
+      }
+    }
+
+    // reporter's "this works" path: scaffold via create-vite@7 then dev
+    async function runScaffoldPath() {
+      disableButtons(true);
+      frame.removeAttribute('src');
+      setStatus('booting ...', 'warn');
+      try {
+        log('=== create-vite@7 scaffold path (reporter says this works) ===', 'title');
+
+        let serverUrl = null;
+        const serverReadyPromise = new Promise((resolve) => {
+          window.__onServerReady = (url) => { serverUrl = url; resolve(url); };
+        });
+
+        log('booting nodepod (workdir=/app) ...', 'info');
+        const pod = await Nodepod.boot({
+          watermark: false,
+          workdir: '/app',
+          allowedFetchDomains: null,
+          onServerReady: (port, url) => {
+            log(`[onServerReady] port=${port} url=${url}`, 'info');
+            window.__onServerReady(url);
+          },
+        });
+        log('booted.\n', 'info');
+
+        log('--- npx create-vite@7 /tmp/scaffold --template react-ts ---', 'title');
+        const scaffoldProc = await runCommand(pod, 'npx', [
+          'create-vite@7', '/tmp/scaffold', '--template', 'react-ts',
+        ]);
+        const scaffoldRes = await scaffoldProc.completion;
+        if (scaffoldRes.exitCode !== 0) {
+          log(`scaffold failed (exit=${scaffoldRes.exitCode})`, 'fail');
+          setStatus('scaffold failed', 'fail');
+          return;
+        }
+        log('scaffold done.\n', 'pass');
+
+        log('--- mv /tmp/scaffold/* /app ---', 'title');
+        const mvProc = await runCommand(pod, 'sh', ['-c', 'mv /tmp/scaffold/* /app/ && mv /tmp/scaffold/.* /app/ 2>/dev/null; ls -la /app']);
+        await mvProc.completion;
+
+        log('--- npm install ---', 'title');
+        const installProc = await runCommand(pod, 'npm', ['install']);
+        const installRes = await installProc.completion;
+        if (installRes.exitCode !== 0) {
+          log(`npm install failed (exit=${installRes.exitCode})`, 'fail');
+          return;
+        }
+
+        log('--- npm run dev ---', 'title');
+        setStatus('starting dev server ...', 'warn');
+        const devProc = await runCommand(pod, 'npm', ['run', 'dev']);
+
+        const url = await Promise.race([
+          serverReadyPromise,
+          devProc.completion.then((res) => ({ __exited: true, res })),
+          new Promise((r) => setTimeout(() => r({ __timeout: true }), 90000)),
+        ]);
+
+        if (url && url.__exited) {
+          log(`\ndev process exited early. exit=${url.res.exitCode}`, 'fail');
+          setStatus('dev exited early', 'fail');
+          return;
+        }
+        if (url && url.__timeout) {
+          log('\ntimeout waiting for onServerReady', 'fail');
+          setStatus('timeout', 'fail');
+          devProc.kill();
+          return;
+        }
+
+        log(`\nonServerReady -> ${url}`, 'info');
+        frame.src = url;
+        setStatus('pointed at dev server', 'pass');
+      } catch (e) {
+        log(`\nuncaught: ${e?.stack || e}`, 'fail');
+        setStatus('uncaught', 'fail');
+      } finally {
+        disableButtons(false);
+      }
+    }
+
+    runV8Btn.addEventListener('click', () => runMountedProject('file-package-json-v8', 'vite 8.0.10 + react-ts (mounted files)'));
+    runV7Btn.addEventListener('click', () => runMountedProject('file-package-json-v7', 'vite 7.3.1 + react-ts (mounted files)'));
+    runScaffoldBtn.addEventListener('click', runScaffoldPath);
+  </script>
+</body>
+</html>

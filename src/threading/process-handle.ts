@@ -116,6 +116,8 @@ export class ProcessHandle extends EventEmitter {
       this._state = "exited";
       this._exitCode = exitCode;
       this.emit("exit", exitCode, stdout, stderr);
+      // kill the worker so late callbacks can't post back after exit
+      try { this.worker.terminate(); } catch { /* ignore */ }
     }
   }
 
@@ -178,6 +180,8 @@ export class ProcessHandle extends EventEmitter {
             this._state = "exited";
             this._exitCode = msg.exitCode;
             this.emit("exit", msg.exitCode, stdout, stderr);
+            // kill the worker so late callbacks can't post back after exit
+            try { this.worker.terminate(); } catch { /* ignore */ }
           }
           break;
         }

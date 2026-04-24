@@ -182,12 +182,13 @@ export async function transform(
 }
 
 export async function build(cfg: BundleConfig): Promise<BundleOutput> {
-  if (!engine) await initialize();
-  if (!engine) throw new Error("esbuild: engine not ready");
-
-  // keep event loop alive while building (Vite's dep optimizer is async)
+  // register before initialize() - the cdn import inside isn't tracked
+  // so the loop can drain mid-await if we do it the other way round
   const h = getRegistry().register("EsbuildOp");
   try {
+    if (!engine) await initialize();
+    if (!engine) throw new Error("esbuild: engine not ready");
+
     const volumePlugin = createVolumePlugin(cfg.external, cfg.platform, cfg.conditions);
     const allPlugins = [...(cfg.plugins || [])];
     // volume plugin goes last so other plugins' onLoad handlers run first
