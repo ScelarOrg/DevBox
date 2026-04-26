@@ -13,18 +13,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 9
-
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: pnpm
+          cache: npm
 
-      - run: pnpm install
-      - run: pnpm run build:lib
-      - run: pnpm test
+      - run: npm ci
+      - run: npm run build:lib
+      - run: npm test
 
   e2e:
     name: E2E Tests
@@ -32,16 +28,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 9
-
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: pnpm
+          cache: npm
 
-      - run: pnpm install
-      - run: pnpm run build:lib
+      - run: npm ci
+      - run: npm run build:lib
       - run: npx playwright install --with-deps chromium
-      - run: pnpm test:e2e
+      - run: npm run test:e2e
