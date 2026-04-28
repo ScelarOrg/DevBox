@@ -410,6 +410,23 @@ function handleFsProxy(
       };
     }
 
+    // flatten Dirent[] from readdirSync({withFileTypes:true}). Without this,
+    // JSON.stringify drops the prototype methods (isFile, isDirectory, ...) and
+    // the worker receives `[{name}, ...]` with no type info. Tailwind v4's
+    // @tailwindcss/oxide-wasm32-wasi calls readdir with withFileTypes during
+    // content scanning; missing isDirectory() throws inside the rust panic
+    // boundary, the rayon worker dies, the awaiting Promise never resolves,
+    // and Vite's HTTP handler hangs to 504. (issue #54)
+    if (type === "readdirSync" && Array.isArray(result) && result.length > 0 && typeof result[0] === "object" && result[0] !== null && typeof (result[0] as any).isFile === "function") {
+      result = (result as any[]).map((d) => ({
+        name: d.name,
+        parentPath: d.parentPath || d.path,
+        _isFile: typeof d.isFile === "function" ? d.isFile() : false,
+        _isDir: typeof d.isDirectory === "function" ? d.isDirectory() : false,
+        _isSymlink: typeof d.isSymbolicLink === "function" ? d.isSymbolicLink() : false,
+      }));
+    }
+
     // encode into the SAB
     const encoded = encodeValue(result);
     const resultType = getValueType(result);
@@ -955,7 +972,30 @@ const __fsStub = {
   existsSync(p) { try { __fsSyncCall('statSync', [p]); return true; } catch { return false; } },
   statSync(p) { return __makeStatObj(__fsSyncCall('statSync', [p])); },
   lstatSync(p) { return __makeStatObj(__fsSyncCall('lstatSync', [p])); },
-  readdirSync(p, opts) { return __fsSyncCall('readdirSync', [p, opts]) || []; },
+  readdirSync(p, opts) {
+    const result = __fsSyncCall('readdirSync', [p, opts]) || [];
+    // When opts.withFileTypes is set the main thread returns flattened Dirent
+    // descriptors -- objects with name, _isFile, _isDir, _isSymlink. We
+    // reconstruct full Dirent-shaped objects with the methods callers expect.
+    const wantTypes = opts && typeof opts === 'object' && opts.withFileTypes;
+    if (wantTypes && Array.isArray(result) && result.length && typeof result[0] === 'object') {
+      return result.map(function(d) {
+        return {
+          name: d.name,
+          parentPath: d.parentPath || p,
+          path: d.parentPath || p,
+          isFile: function() { return !!d._isFile; },
+          isDirectory: function() { return !!d._isDir; },
+          isSymbolicLink: function() { return !!d._isSymlink; },
+          isBlockDevice: function() { return false; },
+          isCharacterDevice: function() { return false; },
+          isFIFO: function() { return false; },
+          isSocket: function() { return false; },
+        };
+      });
+    }
+    return result;
+  },
   mkdirSync(p, opts) { return __fsSyncCall('mkdirSync', [p, opts]); },
   unlinkSync(p) { return __fsSyncCall('unlinkSync', [p]); },
   rmdirSync(p) { return __fsSyncCall('rmdirSync', [p]); },
@@ -1358,17 +1398,24 @@ const __wasiStub = { WASI: class WASI {
         const entry = self._fds.get(fd);
         if (!entry || !entry.path) { dv.setUint32(used, 0, true); return E.SUCCESS; }
         try {
-          const names = __fsStub.readdirSync(entry.path);
+          // Ask for Dirent objects so we can populate d_type accurately.
+          // d_type values per WASI: 3=DIRECTORY, 4=REGULAR_FILE, 7=SYMBOLIC_LINK.
+          const items = __fsStub.readdirSync(entry.path, { withFileTypes: true });
           let offset = 0;
           const cookieNum = Number(cookie);
-          for (let i = cookieNum; i < names.length && offset + 24 < buf_len; i++) {
-            const name = enc.encode(names[i]);
+          for (let i = cookieNum; i < items.length && offset + 24 < buf_len; i++) {
+            const item = items[i];
+            const itemName = (item && typeof item === 'object') ? item.name : item;
+            const isDir = item && typeof item.isDirectory === 'function' ? item.isDirectory() : false;
+            const isSym = item && typeof item.isSymbolicLink === 'function' ? item.isSymbolicLink() : false;
+            const dType = isDir ? 3 : (isSym ? 7 : 4);
+            const name = enc.encode(itemName);
             const recLen = 24 + name.length;
             if (offset + recLen > buf_len) break;
             dv.setBigUint64(buf + offset, BigInt(i + 1), true); // d_next
             dv.setBigUint64(buf + offset + 8, BigInt(0), true); // d_ino
             dv.setUint32(buf + offset + 16, name.length, true); // d_namlen
-            dv.setUint8(buf + offset + 20, 4); // d_type = regular file (best guess)
+            dv.setUint8(buf + offset + 20, dType); // d_type
             b.set(name, buf + offset + 24);
             offset += recLen;
           }
