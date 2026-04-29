@@ -511,10 +511,11 @@ self.addEventListener("fetch", (event) => {
 // to the main thread's request-proxy, which dispatches upgrade events on the
 // virtual HTTP server. Works with any framework/library, not specific to Vite.
 
-function getWsShimScript(instanceId) {
+function getWsShimScript(instanceId, serverPort) {
   const token = wsTokens.get(instanceId);
   const tokenStr = token ? JSON.stringify(token) : "null";
   const instanceIdStr = JSON.stringify(instanceId);
+  const portLiteral = Number.isFinite(serverPort) ? Number(serverPort) : 0;
   return `<script>
 (function() {
   if (window.__nodepodWsShim) return;
@@ -526,15 +527,10 @@ function getWsShimScript(instanceId) {
   var nextId = 0;
   var active = {};
 
-  // detect the virtual server port from the page URL. When loaded via
-  // /__preview__/{instanceId}/{port}/ or /__virtual__/{instanceId}/{port}/,
-  // use that port for WS connections instead of the literal port from the
-  // WS URL (which may be the host page's port, not the virtual server's).
-  var _previewPort = 0;
-  try {
-    var _m = location.pathname.match(/^\\/__(?:preview|virtual)__\\/(?:[A-Za-z0-9_-]*[A-Za-z_-][A-Za-z0-9_-]*\\/(\\d+)|(\\d+))/);
-    if (_m) _previewPort = parseInt(_m[1] || _m[2], 10);
-  } catch(e) {}
+  // virtual server port baked in by the SW. localhost ws connects from
+  // this iframe route here, cant be read from location.pathname because
+  // the location patch above already stripped the prefix
+  var _previewPort = ${portLiteral};
 
   function NodepodWS(url, protocols) {
     var parsed;
@@ -970,7 +966,7 @@ async function proxyToVirtualServer(request, instanceId, serverPort, path, origi
     const ct = respHeaders["content-type"] || respHeaders["Content-Type"] || "";
     if (ct.includes("text/html") && responseBody) {
       // location patch runs first so user scripts see the stripped URL
-      let injection = LOCATION_PATCH_SCRIPT + getWsShimScript(instanceId);
+      let injection = LOCATION_PATCH_SCRIPT + getWsShimScript(instanceId, serverPort);
       const previewScript = previewScripts.get(instanceId);
       if (previewScript) {
         injection += `<script>${previewScript}<` + `/script>`;
