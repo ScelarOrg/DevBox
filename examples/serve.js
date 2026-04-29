@@ -54,4 +54,5 @@ createServer((req, res) => {
   console.log(`  Shared FS attach:     http://localhost:${port}/examples/shared-fs-attach/`);
   console.log(`  SAB opt-out:          http://localhost:${port}/examples/sab-opt-out/`);
   console.log(`  Multi-boot race (#39):http://localhost:${port}/examples/multi-boot-race/`);
+  console.log(`  typebox 1.x (#56):    http://localhost:${port}/examples/issue-56-typebox-1x/`);
 });
