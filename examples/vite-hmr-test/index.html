@@ -1,0 +1,678 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>nodepod - vite HMR test</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: monospace; background: #1a1a2e; color: #e0e0e0; padding: 20px; line-height: 1.5; }
+    h1 { font-size: 18px; margin-bottom: 4px; color: #fff; }
+    p { font-size: 13px; color: #888; margin-bottom: 12px; max-width: 900px; }
+    a { color: #8ac4e6; }
+    code { background: #0d0d1a; padding: 2px 6px; border-radius: 3px; color: #a8e6a3; font-size: 12px; }
+    .layout { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .pane {
+      background: #0d0d1a; border: 1px solid #333; border-radius: 6px;
+      padding: 12px; display: flex; flex-direction: column; min-height: 600px;
+    }
+    .pane h2 { font-size: 13px; margin-bottom: 8px; color: #8ac4e6; }
+    #output {
+      flex: 1; white-space: pre-wrap; font-size: 12px; line-height: 1.55;
+      overflow-y: auto; max-height: 580px;
+    }
+    #frame { flex: 1; border: 1px solid #333; border-radius: 4px; background: #fff; min-height: 360px; }
+    #status {
+      font-size: 12px; padding: 6px 10px; border-radius: 3px;
+      background: #181830; color: #aaa; border: 1px solid #222; margin-bottom: 8px;
+    }
+    .stdout { color: #a8e6a3; }
+    .stderr { color: #e68a8a; }
+    .info { color: #8ac4e6; }
+    .dim { color: #666; }
+    .pass { color: #a8e6a3; font-weight: bold; }
+    .fail { color: #e68a8a; font-weight: bold; }
+    .warn { color: #e6c38a; }
+    .title { color: #c38ae6; font-weight: bold; }
+    .ws { color: #e6c38a; }
+    .hmr { color: #d8a8e6; }
+    .controls { display: flex; gap: 8px; margin-bottom: 12px; align-items: center; flex-wrap: wrap; }
+    button {
+      background: #2a2a4a; color: #e0e0e0; border: 1px solid #444;
+      padding: 6px 12px; border-radius: 4px; font-family: monospace; cursor: pointer;
+    }
+    button:hover { background: #3a3a5a; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .scoreboard {
+      display: grid; grid-template-columns: max-content 1fr; gap: 4px 12px;
+      margin-bottom: 8px; font-size: 12px;
+      padding: 8px 10px; background: #181830; border: 1px solid #222; border-radius: 4px;
+    }
+    .scoreboard .k { color: #888; }
+    .scoreboard .v { color: #fff; }
+    .scoreboard .v.ok   { color: #a8e6a3; }
+    .scoreboard .v.bad  { color: #e68a8a; }
+    .scoreboard .v.wait { color: #e6c38a; }
+  </style>
+</head>
+<body>
+  <h1>nodepod - vite HMR test</h1>
+  <p>
+    Repro for the <code>[vite] connecting...</code> hang reported after the
+    tailwind v4 fix shipped in <a href="https://github.com/ScelarOrg/Nodepod/pull/57">#57</a>.
+    The dev server now boots and renders, but Vite's HMR client never reaches
+    the dev server: the iframe shows <code>[vite] connecting...</code> in the
+    console and edits to source files don't propagate without a manual iframe
+    reload. This page boots a minimal Vite 8 + React-TS app inside nodepod,
+    intercepts <code>window.WebSocket</code> and Vite's HMR events from inside
+    the iframe, and posts them back via <code>postMessage</code> so we can see
+    exactly where the connection stalls.
+  </p>
+  <p>
+    The <code>edit App.tsx (test HMR)</code> button rewrites the heading inside
+    <code>/app/src/App.tsx</code> via <code>pod.fs.writeFile</code>. If HMR is
+    working, the new heading appears in the iframe within ~1s and the counter
+    keeps its current value. If HMR is broken, nothing changes until a manual
+    reload (and the counter resets when you do).
+  </p>
+
+  <div class="controls">
+    <button id="run">boot + run dev (vite 8 + react-ts)</button>
+    <button id="edit-app" disabled>edit App.tsx (test HMR)</button>
+    <button id="reload-frame" disabled>reload iframe (forces full reload)</button>
+    <button id="clear">clear log</button>
+  </div>
+
+  <div class="layout">
+    <div class="pane">
+      <h2>log</h2>
+      <div class="scoreboard">
+        <div class="k">vite client loaded:</div>     <div class="v wait" id="sb-client-loaded">waiting</div>
+        <div class="k">import.meta.hot:</div>         <div class="v wait" id="sb-hmr-available">waiting</div>
+        <div class="k">WebSocket(s) created:</div>    <div class="v wait" id="sb-ws-created">0</div>
+        <div class="k">WebSocket(s) opened:</div>     <div class="v wait" id="sb-ws-open">0</div>
+        <div class="k">last HMR event:</div>          <div class="v wait" id="sb-last-hmr">none</div>
+        <div class="k">HMR edit applied:</div>        <div class="v wait" id="sb-hmr-applied">no edit yet</div>
+      </div>
+      <div id="output"></div>
+    </div>
+    <div class="pane">
+      <h2>preview iframe</h2>
+      <div id="status">idle</div>
+      <iframe id="frame" sandbox="allow-scripts allow-same-origin allow-forms allow-popups"></iframe>
+    </div>
+  </div>
+
+  <!-- project files. mounted into /app via pod.fs.writeFile after boot -->
+
+  <script id="file-package-json" type="text/plain">{
+  "name": "vite-hmr-test",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^5.0.0",
+    "typescript": "~5.6.0",
+    "vite": "8.0.10"
+  }
+}
+</script>
+
+  <script id="file-vite-config" type="text/plain">import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+
+// no server.hmr override on purpose, we want the default vite path
+// which dials ws://<page-host>:<server.port>/. inside nodepod thats
+// ws://localhost:3333/, which the ws shim should redirect to port 5173
+export default defineConfig({
+  plugins: [react()],
+  server: {
+    host: '0.0.0.0',
+    port: 5173,
+    strictPort: true,
+  },
+});
+</script>
+
+  <script id="file-tsconfig" type="text/plain">{
+  "files": [],
+  "references": [
+    { "path": "./tsconfig.app.json" },
+    { "path": "./tsconfig.node.json" }
+  ]
+}
+</script>
+
+  <script id="file-tsconfig-app" type="text/plain">{
+  "compilerOptions": {
+    "target": "ES2020",
+    "useDefineForClassFields": true,
+    "lib": ["ES2020", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "skipLibCheck": true,
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "jsx": "react-jsx",
+    "strict": true
+  },
+  "include": ["src"]
+}
+</script>
+
+  <script id="file-tsconfig-node" type="text/plain">{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2023"],
+    "module": "ESNext",
+    "skipLibCheck": true,
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "strict": true
+  },
+  "include": ["vite.config.ts"]
+}
+</script>
+
+  <script id="file-vite-env-d-ts" type="text/plain">/// <reference types="vite/client" />
+</script>
+
+  <!-- index.html with a ws probe that runs before vite's client. wraps
+       whatever WebSocket is in scope (the SW already swapped in its shim)
+       and posts every event back to the host page -->
+  <script id="file-index-html" type="text/plain"><!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>vite hmr test (inside nodepod)</title>
+  <script>
+    (function () {
+      function send(kind, detail) {
+        try { window.parent.postMessage({ source: 'hmr-probe', kind, detail }, '*'); }
+        catch (e) { /* ignore */ }
+      }
+      send('probe-installed', {
+        href: location.href,
+        hasShim: !!window.__nodepodWsShim,
+        wsName: (window.WebSocket && window.WebSocket.name) || 'unknown'
+      });
+      var Native = window.WebSocket;
+      function Wrapped(url, protocols) {
+        send('ws:create', { url: String(url), proto: protocols ? String(protocols) : '' });
+        var ws = new Native(url, protocols);
+        ws.addEventListener('open',    function ()   { send('ws:open',    { url: String(url) }); });
+        ws.addEventListener('close',   function (e)  { send('ws:close',   { url: String(url), code: e.code, reason: e.reason }); });
+        ws.addEventListener('error',   function ()   { send('ws:error',   { url: String(url) }); });
+        ws.addEventListener('message', function (e)  {
+          var summary = '';
+          try {
+            if (typeof e.data === 'string') summary = e.data.slice(0, 200);
+            else if (e.data && e.data.byteLength != null) summary = '<binary ' + e.data.byteLength + 'B>';
+          } catch (_) {}
+          send('ws:message', { summary: summary });
+        });
+        return ws;
+      }
+      Wrapped.CONNECTING = 0; Wrapped.OPEN = 1; Wrapped.CLOSING = 2; Wrapped.CLOSED = 3;
+      Wrapped.prototype = Native.prototype;
+      window.WebSocket = Wrapped;
+    })();
+  <\/script>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="module" src="/src/main.tsx"><\/script>
+</body>
+</html>
+</script>
+
+  <script id="file-main-tsx" type="text/plain">import { StrictMode } from 'react';
+import { createRoot } from 'react-dom/client';
+import App from './App.tsx';
+
+// signals the host that vite + our app actually booted. if this never
+// fires, the dev server isnt reachable. if it fires but no ws:open
+// follows, thats the hmr connect bug
+try {
+  window.parent.postMessage({
+    source: 'hmr-app',
+    kind: 'main-loaded',
+    detail: { hasHot: !!(import.meta as any).hot }
+  }, '*');
+} catch (_) { /* */ }
+
+if ((import.meta as any).hot) {
+  const hot = (import.meta as any).hot;
+  // forward vite's own hmr events out to the host page
+  for (const evt of [
+    'vite:beforeUpdate',
+    'vite:afterUpdate',
+    'vite:beforeFullReload',
+    'vite:beforePrune',
+    'vite:invalidate',
+    'vite:error',
+    'vite:ws:connect',
+    'vite:ws:disconnect'
+  ]) {
+    hot.on(evt, (data: unknown) => {
+      try {
+        window.parent.postMessage({
+          source: 'hmr-app',
+          kind: 'vite-event',
+          detail: { event: evt, data }
+        }, '*');
+      } catch (_) { /* */ }
+    });
+  }
+}
+
+createRoot(document.getElementById('root')!).render(
+  <StrictMode>
+    <App />
+  </StrictMode>,
+);
+</script>
+
+  <script id="file-app-tsx" type="text/plain">import { useEffect, useState } from 'react';
+
+// the host rewrites the string between the START/END markers via
+// pod.fs.writeFile. real hmr keeps `count` intact, a full reload resets it
+const HMR_HEADING = /* HMR_HEADING_START */ 'original heading v0' /* HMR_HEADING_END */;
+
+function App() {
+  const [count, setCount] = useState(0);
+
+  useEffect(() => {
+    try {
+      window.parent.postMessage({
+        source: 'hmr-app',
+        kind: 'app-mounted',
+        detail: { heading: HMR_HEADING, hasHot: !!(import.meta as any).hot }
+      }, '*');
+    } catch (_) { /* */ }
+  }, []);
+
+  // re-post on every render so the host can tell hmr re-rendered vs full reload
+  try {
+    window.parent.postMessage({
+      source: 'hmr-app',
+      kind: 'render',
+      detail: { heading: HMR_HEADING, count }
+    }, '*');
+  } catch (_) { /* */ }
+
+  return (
+    <div style={{ fontFamily: 'system-ui', padding: 24, color: '#0f172a' }}>
+      <h1 style={{ color: '#0e7490', marginBottom: 8 }}>{HMR_HEADING}</h1>
+      <p style={{ color: '#475569', marginBottom: 16, maxWidth: 600 }}>
+        Click the counter, then press <code>edit App.tsx</code> in the host page.
+        If HMR is connected, the heading above changes within ~1s and the counter
+        below keeps its value. If HMR is broken, nothing changes until you reload.
+      </p>
+      <button
+        onClick={() => setCount((c) => c + 1)}
+        style={{
+          padding: '8px 16px', borderRadius: 4, border: '1px solid #0e7490',
+          background: '#0e7490', color: 'white', fontWeight: 600, cursor: 'pointer'
+        }}
+      >
+        count is {count}
+      </button>
+      <p style={{ marginTop: 16, fontSize: 12, color: '#64748b' }}>
+        import.meta.hot is {(import.meta as any).hot ? 'AVAILABLE' : 'MISSING'}.
+      </p>
+    </div>
+  );
+}
+
+export default App;
+</script>
+
+  <!-- host page logic -->
+  <script type="module">
+    import { Nodepod } from "/dist/index.mjs";
+
+    const out = document.getElementById('output');
+    const frame = document.getElementById('frame');
+    const statusEl = document.getElementById('status');
+    const runBtn = document.getElementById('run');
+    const editBtn = document.getElementById('edit-app');
+    const reloadBtn = document.getElementById('reload-frame');
+    const clearBtn = document.getElementById('clear');
+
+    const sb = {
+      clientLoaded: document.getElementById('sb-client-loaded'),
+      hmrAvailable: document.getElementById('sb-hmr-available'),
+      wsCreated:    document.getElementById('sb-ws-created'),
+      wsOpen:       document.getElementById('sb-ws-open'),
+      lastHmr:      document.getElementById('sb-last-hmr'),
+      hmrApplied:   document.getElementById('sb-hmr-applied'),
+    };
+    function setSb(el, text, kind /* 'ok' | 'bad' | 'wait' | '' */ ) {
+      el.textContent = text;
+      el.classList.remove('ok','bad','wait');
+      if (kind) el.classList.add(kind);
+    }
+
+    let pod = null;
+    let serverUrl = null;
+    let hmrCounters = { wsCreated: 0, wsOpen: 0 };
+    let editGen = 0;
+    let pendingEdit = null; // { gen, expectedHeading, dispatchedAt, applied, baselineCount }
+    let lastRenderCount = 0;
+
+    function log(text, cls = 'stdout') {
+      const span = document.createElement('span');
+      span.className = cls;
+      span.textContent = text + '\n';
+      out.appendChild(span);
+      out.scrollTop = out.scrollHeight;
+    }
+    function setStatus(text, cls = '') {
+      statusEl.textContent = text;
+      statusEl.className = cls;
+    }
+    function readFile(id) {
+      // text/plain blocks store their inner closing tag as <\/script> so the
+      // html parser doesnt close them early. restore the real closer here
+      return document.getElementById(id).textContent.replace(/<\\\/script>/g, '<' + '/script>');
+    }
+
+    clearBtn.addEventListener('click', () => { out.textContent = ''; });
+
+    async function mountFiles(pod, files) {
+      const writes = [];
+      for (const [path, content] of Object.entries(files)) {
+        writes.push(pod.fs.writeFile(path, content));
+      }
+      await Promise.all(writes);
+    }
+
+    async function runCommand(pod, command, args = []) {
+      const hasRootPath = args.some((a) => a.startsWith('/'));
+      const proc = await pod.spawn(command, args, {
+        cwd: hasRootPath ? '/' : pod.cwd,
+      });
+      proc.on('output', (t) => log(t.trimEnd(), 'stdout'));
+      proc.on('error', (t) => log(t.trimEnd(), 'stderr'));
+      return proc;
+    }
+
+    // taps the nodepod-ws bridge so we can read the actual ws-error message
+    // (the shim drops it before forwarding to WebSocket onerror)
+    try {
+      const wsBc = new BroadcastChannel('nodepod-ws');
+      wsBc.onmessage = (ev) => {
+        const d = ev.data;
+        if (!d || !d.kind) return;
+        if (d.kind === 'ws-connect') {
+          log(`[bc] ws-connect uid=${d.uid} port=${d.port} path=${d.path} proto=${d.protocols||'-'}`, 'dim');
+        } else if (d.kind === 'ws-error') {
+          log(`[bc] ws-error uid=${d.uid} message="${d.message || '<no message>'}"`, 'fail');
+        } else if (d.kind === 'ws-open') {
+          log(`[bc] ws-open uid=${d.uid}`, 'pass');
+        } else if (d.kind === 'ws-closed') {
+          log(`[bc] ws-closed uid=${d.uid} code=${d.code}`, 'dim');
+        }
+      };
+    } catch (e) {
+      log(`bc listener install failed: ${e?.message || e}`, 'stderr');
+    }
+
+    window.addEventListener('message', (ev) => {
+      const d = ev.data;
+      if (!d || (d.source !== 'hmr-probe' && d.source !== 'hmr-app')) return;
+
+      if (d.source === 'hmr-probe') {
+        if (d.kind === 'probe-installed') {
+          log(`[probe] installed (hasShim=${d.detail.hasShim} wsName=${d.detail.wsName})`, 'info');
+        } else if (d.kind === 'ws:create') {
+          hmrCounters.wsCreated++;
+          setSb(sb.wsCreated, String(hmrCounters.wsCreated), 'wait');
+          log(`[ws] new WebSocket(${d.detail.url}) proto=${d.detail.proto || '-'}`, 'ws');
+        } else if (d.kind === 'ws:open') {
+          hmrCounters.wsOpen++;
+          setSb(sb.wsOpen, String(hmrCounters.wsOpen), 'ok');
+          log(`[ws] OPEN ${d.detail.url}`, 'pass');
+        } else if (d.kind === 'ws:close') {
+          log(`[ws] CLOSE code=${d.detail.code} reason=${d.detail.reason || '-'} (${d.detail.url})`, 'fail');
+        } else if (d.kind === 'ws:error') {
+          log(`[ws] ERROR (${d.detail.url})`, 'fail');
+        } else if (d.kind === 'ws:message') {
+          log(`[ws] msg: ${d.detail.summary}`, 'dim');
+        }
+        return;
+      }
+
+      if (d.kind === 'main-loaded') {
+        setSb(sb.clientLoaded, 'yes', 'ok');
+        setSb(sb.hmrAvailable, d.detail.hasHot ? 'yes' : 'no',
+              d.detail.hasHot ? 'ok' : 'bad');
+        log(`[app] main.tsx loaded. import.meta.hot=${d.detail.hasHot}`,
+            d.detail.hasHot ? 'pass' : 'fail');
+      } else if (d.kind === 'app-mounted') {
+        log(`[app] App mounted, heading="${d.detail.heading}"`, 'info');
+      } else if (d.kind === 'render') {
+        lastRenderCount = d.detail.count;
+        if (pendingEdit && d.detail.heading === pendingEdit.expectedHeading) {
+          const dt = (performance.now() - pendingEdit.dispatchedAt).toFixed(0);
+          // real hmr keeps the counter. a vite-give-up reload also delivers
+          // the new heading but resets count to 0, so compare against baseline
+          if (pendingEdit.baselineCount > 0 && d.detail.count === 0) {
+            setSb(sb.hmrApplied, `RELOAD (count reset ${pendingEdit.baselineCount}->0)`, 'bad');
+            log(`[hmr] FAIL: heading changed but count reset (${pendingEdit.baselineCount} -> 0). that's a full reload, not HMR.`, 'fail');
+          } else if (d.detail.count >= pendingEdit.baselineCount) {
+            setSb(sb.hmrApplied, `yes (in ${dt}ms, count preserved=${d.detail.count})`, 'ok');
+            log(`[hmr] PASS: edit gen=${pendingEdit.gen} applied in ${dt}ms, count=${d.detail.count} preserved`, 'pass');
+          } else {
+            setSb(sb.hmrApplied, `partial (count ${pendingEdit.baselineCount}->${d.detail.count})`, 'bad');
+            log(`[hmr] FAIL: heading changed but count went backwards (${pendingEdit.baselineCount} -> ${d.detail.count}).`, 'fail');
+          }
+          pendingEdit.applied = true;
+          pendingEdit = null;
+        }
+      } else if (d.kind === 'vite-event') {
+        setSb(sb.lastHmr, d.detail.event, 'ok');
+        log(`[hmr] ${d.detail.event}`, 'hmr');
+      }
+    });
+
+    async function bootAndRun() {
+      runBtn.disabled = true;
+      editBtn.disabled = true;
+      reloadBtn.disabled = true;
+      frame.removeAttribute('src');
+      setStatus('booting ...', 'warn');
+      hmrCounters = { wsCreated: 0, wsOpen: 0 };
+      setSb(sb.clientLoaded, 'waiting', 'wait');
+      setSb(sb.hmrAvailable, 'waiting', 'wait');
+      setSb(sb.wsCreated, '0', 'wait');
+      setSb(sb.wsOpen, '0', 'wait');
+      setSb(sb.lastHmr, 'none', 'wait');
+      setSb(sb.hmrApplied, 'no edit yet', 'wait');
+
+      try {
+        log('=== boot Vite 8 + React-TS, watch HMR connection ===', 'title');
+
+        let resolveServerReady;
+        const serverReadyPromise = new Promise((r) => { resolveServerReady = r; });
+
+        log('booting nodepod (workdir=/app) ...', 'info');
+        pod = await Nodepod.boot({
+          watermark: false,
+          workdir: '/app',
+          allowedFetchDomains: null,
+          onServerReady: (port, url) => {
+            log(`[onServerReady] port=${port} url=${url}`, 'info');
+            resolveServerReady(url);
+          },
+        });
+        log('booted.\n', 'info');
+
+        log('writing project files ...', 'info');
+        await mountFiles(pod, {
+          '/app/package.json':       readFile('file-package-json'),
+          '/app/vite.config.ts':     readFile('file-vite-config'),
+          '/app/tsconfig.json':      readFile('file-tsconfig'),
+          '/app/tsconfig.app.json':  readFile('file-tsconfig-app'),
+          '/app/tsconfig.node.json': readFile('file-tsconfig-node'),
+          '/app/index.html':         readFile('file-index-html'),
+          '/app/src/main.tsx':       readFile('file-main-tsx'),
+          '/app/src/App.tsx':        readFile('file-app-tsx'),
+          '/app/src/vite-env.d.ts':  readFile('file-vite-env-d-ts'),
+        });
+        log('files mounted.\n', 'info');
+
+        log('--- npm install ---', 'title');
+        const installProc = await runCommand(pod, 'npm', ['install']);
+        const installRes = await installProc.completion;
+        if (installRes.exitCode !== 0) {
+          log(`npm install failed (exit=${installRes.exitCode})`, 'fail');
+          setStatus('install failed', 'fail');
+          return;
+        }
+        log('npm install done.\n', 'pass');
+
+        log('--- npm run dev ---', 'title');
+        setStatus('starting dev server ...', 'warn');
+        const devProc = await runCommand(pod, 'npm', ['run', 'dev']);
+
+        const url = await Promise.race([
+          serverReadyPromise,
+          devProc.completion.then((res) => ({ __exited: true, res })),
+          new Promise((r) => setTimeout(() => r({ __timeout: true }), 90000)),
+        ]);
+
+        if (url && url.__exited) {
+          log(`dev process exited before port was bound. exit=${url.res.exitCode}`, 'fail');
+          setStatus('dev exited early', 'fail');
+          return;
+        }
+        if (url && url.__timeout) {
+          log('timed out waiting for onServerReady', 'fail');
+          setStatus('timeout', 'fail');
+          devProc.kill();
+          return;
+        }
+
+        serverUrl = url;
+        log(`\nonServerReady -> ${url}. probing index ...`, 'info');
+        setStatus('probing ...', 'warn');
+
+        // sanity probe before pointing the iframe at it. if this fails its
+        // a different bug than hmr (probably regression on the tailwind v4 fix)
+        let ok = false;
+        const probeStart = performance.now();
+        while (performance.now() - probeStart < 30000) {
+          try {
+            const res = await fetch(url, { cache: 'no-store' });
+            if (res.ok) { ok = true; break; }
+            log(`  -> ${res.status} ${res.statusText}`, res.status >= 500 ? 'fail' : 'warn');
+          } catch (e) {
+            log(`  -> fetch threw: ${e.message}`, 'fail');
+          }
+          await new Promise((r) => setTimeout(r, 1000));
+        }
+
+        if (!ok) {
+          log('index probe failed -- different bug than HMR. stopping.', 'fail');
+          setStatus('FAIL (index unreachable)', 'fail');
+          return;
+        }
+
+        log('index reachable. pointing iframe at dev server.', 'pass');
+        log('watch the scoreboard for ws:open / vite:ws:connect.', 'info');
+        log('if no ws:open arrives within 10s, the [vite] connecting hang is reproduced.', 'warn');
+        setStatus('ready (watching HMR ws...)', 'pass');
+        frame.src = url;
+        editBtn.disabled = false;
+        reloadBtn.disabled = false;
+
+        // 10s timer, if no ws:open by then the hmr bug reproduced
+        setTimeout(() => {
+          if (hmrCounters.wsOpen === 0) {
+            log('\n*** HMR ws never opened within 10s -- bug reproduced ***', 'fail');
+            setStatus('HMR DEAD (no ws open)', 'fail');
+          }
+        }, 10000);
+
+      } catch (e) {
+        log(`uncaught: ${e?.stack || e}`, 'fail');
+        setStatus('uncaught', 'fail');
+      } finally {
+        runBtn.disabled = false;
+      }
+    }
+
+    async function editAppTsx() {
+      if (!pod) return;
+      editBtn.disabled = true;
+      try {
+        editGen++;
+        const newHeading = `edited via HMR v${editGen} (${new Date().toLocaleTimeString()})`;
+        const original = readFile('file-app-tsx');
+        const updated = original.replace(
+          /\/\* HMR_HEADING_START \*\/[\s\S]*?\/\* HMR_HEADING_END \*\//,
+          `/* HMR_HEADING_START */ '${newHeading}' /* HMR_HEADING_END */`
+        );
+        if (updated === original) {
+          log('edit failed: heading marker not found in App.tsx source', 'fail');
+          return;
+        }
+        log(`\n--- editing /app/src/App.tsx (gen=${editGen}) -> "${newHeading}" ---`, 'title');
+        setSb(sb.hmrApplied, `dispatched gen=${editGen}, waiting...`, 'wait');
+
+        pendingEdit = {
+          gen: editGen,
+          expectedHeading: newHeading,
+          dispatchedAt: performance.now(),
+          applied: false,
+          baselineCount: lastRenderCount,
+        };
+        if (lastRenderCount === 0) {
+          log('TIP: click the counter at least once before testing edit -- otherwise we cannot distinguish HMR from a full reload.', 'warn');
+        }
+
+        await pod.fs.writeFile('/app/src/App.tsx', updated);
+        log('write complete. watching for HMR render...', 'info');
+
+        // 5s is generous for hmr, anything slower means it didnt connect
+        setTimeout(() => {
+          if (pendingEdit && pendingEdit.gen === editGen && !pendingEdit.applied) {
+            const dt = (performance.now() - pendingEdit.dispatchedAt).toFixed(0);
+            setSb(sb.hmrApplied, `NO (no HMR render after ${dt}ms)`, 'bad');
+            log(`*** HMR DID NOT APPLY edit gen=${editGen} after ${dt}ms ***`, 'fail');
+            log('   reload the iframe to pick up the change manually.', 'dim');
+          }
+        }, 5000);
+      } catch (e) {
+        log(`edit failed: ${e?.stack || e}`, 'fail');
+      } finally {
+        editBtn.disabled = false;
+      }
+    }
+
+    runBtn.addEventListener('click', bootAndRun);
+    editBtn.addEventListener('click', editAppTsx);
+    reloadBtn.addEventListener('click', () => {
+      if (serverUrl) frame.src = serverUrl;
+    });
+  </script>
+</body>
+</html>
