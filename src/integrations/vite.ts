@@ -15,6 +15,8 @@ import { swResponseHeaders, DEFAULT_SW_PATH } from "./shared/headers";
 export interface NodepodVitePluginOptions {
   /** Path to serve the SW from. Same origin as the page, must end in .js. Defaults to /__sw__.js. */
   path?: string;
+  /** Git mode. `'native'` uses real Git Smart HTTP protocol (CORS proxy auto-configured). Defaults to `'api'` (GitHub REST API). */
+  git?: 'api' | 'native';
 }
 
 export default function nodepod(
@@ -24,8 +26,48 @@ export default function nodepod(
   // Rollup asset names are relative to outDir, so drop the leading slash.
   const assetFileName = swPath.replace(/^\/+/, "");
 
+  const gitProxyPath = opts.git === "native" ? "/__nodepod_git_proxy__" : undefined;
+
   return {
     name: "nodepod",
+    config() {
+      if (!gitProxyPath) return;
+
+      // Resolve Nodepod's crypto polyfill for isomorphic-git.
+      // isomorphic-git does require('crypto').createHash which doesn't exist in browser.
+      let cryptoPath = "";
+      try {
+        const nodepodMain = require.resolve("@scelar/nodepod");
+        cryptoPath = nodepodMain.replace(/\/dist\/.*/, "/src/polyfills/crypto.ts");
+      } catch { /* isomorphic-git will fail with createHash error */ }
+
+      return {
+        resolve: {
+          alias: cryptoPath ? { crypto: cryptoPath } : {},
+        },
+        optimizeDeps: {
+          esbuildOptions: {
+            plugins: cryptoPath ? [{
+              name: "nodepod-crypto-shim",
+              setup(build: any) {
+                build.onResolve({ filter: /^crypto$/ }, () => ({
+                  path: cryptoPath,
+                }));
+              },
+            }] : [],
+          },
+        },
+        server: {
+          proxy: {
+            [gitProxyPath]: {
+              target: "https://github.com",
+              changeOrigin: true,
+              rewrite: (path: string) => path.replace(new RegExp(`^${gitProxyPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\/github\\.com`), ""),
+            },
+          },
+        },
+      };
+    },
     configureServer(server) {
       // Match on the path alone so the SDK's `?v=${Date.now()}` cache-buster
       // still hits this handler.

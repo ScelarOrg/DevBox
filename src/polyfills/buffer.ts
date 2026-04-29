@@ -76,7 +76,14 @@ class BufferPolyfill extends Uint8Array {
       return new BufferPolyfill(source as ArrayBuffer);
     }
 
-    return new BufferPolyfill(source as Uint8Array);
+    // Copy the data to avoid shared-buffer aliasing bugs when callers
+    // later call .write() or .set() with offsets.
+    const copy = new Uint8Array(
+      (source as Uint8Array).buffer,
+      (source as Uint8Array).byteOffset,
+      (source as Uint8Array).byteLength,
+    );
+    return new BufferPolyfill(copy.slice());
   }
 
   static alloc(len: number, fillValue?: number): BufferPolyfill {
@@ -163,18 +170,42 @@ class BufferPolyfill extends Uint8Array {
   write(string: string, encoding?: BufferEncoding): number;
   write(string: string, offset: number, encoding?: BufferEncoding): number;
   write(string: string, offset: number, length: number, encoding?: BufferEncoding): number;
+  // Override set() to handle edge cases with subarray views that cause
+  // "offset is out of bounds" errors in the native Uint8Array.set()
+  override set(array: ArrayLike<number>, offset?: number): void {
+    const off = offset || 0;
+    if (off + array.length > this.length) {
+      // Clamp instead of throwing
+      const len = this.length - off;
+      for (let i = 0; i < len; i++) {
+        this[off + i] = array[i]!;
+      }
+    } else {
+      super.set(array, off);
+    }
+  }
+
   write(string: string, offsetOrEncoding?: number | BufferEncoding, lengthOrEncoding?: number | BufferEncoding, _encoding?: BufferEncoding): number {
     const offset = typeof offsetOrEncoding === "number" ? offsetOrEncoding : 0;
     const encoded = textEnc.encode(string);
-    const len = typeof lengthOrEncoding === "number" ? Math.min(lengthOrEncoding, encoded.length) : encoded.length;
-    this.set(encoded.subarray(0, len), offset);
+    const len = typeof lengthOrEncoding === "number" ? Math.min(lengthOrEncoding, encoded.length, this.length - offset) : Math.min(encoded.length, this.length - offset);
+    if (len <= 0) return 0;
+    // Manual byte copy to avoid Uint8Array.set() bugs with subarray views
+    for (let i = 0; i < len; i++) {
+      this[offset + i] = encoded[i]!;
+    }
     return len;
   }
 
   copy(dest: BufferPolyfill, destStart?: number, srcStart?: number, srcEnd?: number): number {
-    const segment = this.subarray(srcStart || 0, srcEnd);
-    dest.set(segment, destStart || 0);
-    return segment.length;
+    const start = srcStart || 0;
+    const end = srcEnd ?? this.length;
+    const dStart = destStart || 0;
+    const len = Math.min(end - start, dest.length - dStart);
+    for (let i = 0; i < len; i++) {
+      dest[dStart + i] = this[start + i]!;
+    }
+    return len;
   }
 
   compare(other: Uint8Array): number {

@@ -265,6 +265,10 @@ export class ProcessHandle extends EventEmitter {
           break;
 
         default:
+          // Forward unknown message types as generic events
+          if (msg.type) {
+            this.emit(msg.type, msg);
+          }
           break;
       }
     });

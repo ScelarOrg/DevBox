@@ -35,5 +35,8 @@ pnpm-debug.log*
 # Test coverage
 coverage/
 
+# Test results
+test-results/
+
 # Local research / planning notes (Claude Code scratch)
 memory/

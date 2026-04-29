@@ -6,6 +6,7 @@ export default defineConfig({
   plugins: [wasm(), topLevelAwait()],
   test: {
     include: ["src/**/*.test.ts"],
+    exclude: ["src/__tests__/e2e/**"],
     benchmark: {
       include: ["src/**/*.bench.ts"],
     },

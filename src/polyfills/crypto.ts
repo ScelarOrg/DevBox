@@ -28,39 +28,38 @@ function hashOutputSize(alg: string): number {
   return 32;
 }
 
+// Real SHA-1/SHA-256 implementation via sha.js (pure JS, sync)
+import ShaJs from "sha.js";
+
 function mixHash(input: Uint8Array, alg: string): Uint8Array {
-  const size = hashOutputSize(alg);
-  const out = new Uint8Array(size);
-
-  let a = 0xdeadbeef | 0;
-  let b = 0x41c6ce57 | 0;
-
-  for (let i = 0; i < input.length; i++) {
-    a = Math.imul(a ^ input[i], 2654435761);
-    b = Math.imul(b ^ input[i], 1597334677);
-  }
-
-  a =
-    Math.imul(a ^ (a >>> 16), 2246822507) ^
-    Math.imul(b ^ (b >>> 13), 3266489909);
-  b =
-    Math.imul(b ^ (b >>> 16), 2246822507) ^
-    Math.imul(a ^ (a >>> 13), 3266489909);
-
-  for (let i = 0; i < size; i++) {
-    const source = i < size >>> 1 ? a : b;
-    out[i] = (source >>> ((i & 3) * 8)) & 0xff;
-    a = (Math.imul(a, 1103515245) + 12345) | 0;
-    b = (Math.imul(b, 1103515245) + 12345) | 0;
-  }
-  return out;
+  const shaAlg = alg === "SHA-1" ? "sha1" : alg === "SHA-256" ? "sha256" : alg.toLowerCase().replace("-", "");
+  return new Uint8Array((ShaJs as any)(shaAlg).update(input).digest());
 }
 
 function mixHmac(data: Uint8Array, key: Uint8Array, alg: string): Uint8Array {
-  const merged = new Uint8Array(key.length + data.length);
-  merged.set(key, 0);
-  merged.set(data, key.length);
-  return mixHash(merged, alg);
+  // Proper HMAC: H((K ^ opad) || H((K ^ ipad) || message))
+  const blockSize = 64;
+  let k = key;
+  if (k.length > blockSize) k = mixHash(k, alg);
+  const paddedKey = new Uint8Array(blockSize);
+  paddedKey.set(k);
+
+  const ipad = new Uint8Array(blockSize);
+  const opad = new Uint8Array(blockSize);
+  for (let i = 0; i < blockSize; i++) {
+    ipad[i] = paddedKey[i] ^ 0x36;
+    opad[i] = paddedKey[i] ^ 0x5c;
+  }
+
+  const inner = new Uint8Array(blockSize + data.length);
+  inner.set(ipad);
+  inner.set(data, blockSize);
+  const innerHash = mixHash(inner, alg);
+
+  const outer = new Uint8Array(blockSize + innerHash.length);
+  outer.set(opad);
+  outer.set(innerHash, blockSize);
+  return mixHash(outer, alg);
 }
 
 function joinChunks(parts: Uint8Array[]): Uint8Array {

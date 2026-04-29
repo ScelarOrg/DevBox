@@ -39,6 +39,15 @@ export interface NodepodOptions {
   /** domains allowed through the cors proxy. merged with built-in defaults
    *  (npm, github, esm.sh etc). pass null to allow everything */
   allowedFetchDomains?: string[] | null;
+  /** Git clone mode. `'native'` uses real Git Smart HTTP protocol via isomorphic-git.
+   *  `'api'` uses GitHub REST API (default). When `'native'`, set `gitCorsProxy` to the proxy path. */
+  git?: 'api' | 'native';
+  /** CORS proxy base URL for git native mode (e.g. "http://localhost:5180/__nodepod_git_proxy__"). */
+  gitCorsProxy?: string;
+  /** Override GitHub API base URL (for testing). Defaults to "https://api.github.com". */
+  gitApiBase?: string;
+  /** Override raw.githubusercontent.com base URL (for testing). Defaults to "https://raw.githubusercontent.com". */
+  gitRawBase?: string;
 }
 
 /* ---- Terminal ---- */

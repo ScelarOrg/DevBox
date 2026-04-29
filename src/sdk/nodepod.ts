@@ -1,4 +1,5 @@
 import { MemoryVolume } from "../memory-volume";
+import { GitShim } from "../packages/git-shim";
 import { DependencyInstaller } from "../packages/installer";
 import {
   RequestProxy,
@@ -341,6 +342,15 @@ export class Nodepod {
         }
       }
     }
+
+    // Set up git shim (always registered — 'api' is the default)
+    const gitShim = new GitShim({
+      mode: opts.git === "native" ? "native" : "api",
+      corsProxy: opts.gitCorsProxy,
+      apiBase: opts.gitApiBase,
+      rawBase: opts.gitRawBase,
+    });
+    gitShim.attach(volume, nodepod.processManager);
 
     return nodepod;
   }

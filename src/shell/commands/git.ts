@@ -8,6 +8,7 @@ import { VERSIONS } from "../../constants/config";
 import { proxiedFetch } from "../../cross-origin";
 import * as pathModule from "../../polyfills/path";
 import { createHash } from "../../polyfills/crypto";
+import { requestGitClone } from "../../packages/git-shim/worker-rpc";
 
 /* ------------------------------------------------------------------ */
 /*  ANSI helpers                                                       */
@@ -717,16 +718,18 @@ class GitRepo {
 
 async function githubApi(
   path: string,
-  token: string,
+  token: string | null,
   method = "GET",
   body?: any,
 ): Promise<{ ok: boolean; status: number; data: any }> {
   const url = `https://api.github.com${path}`;
   const headers: Record<string, string> = {
     Accept: "application/vnd.github.v3+json",
-    Authorization: `token ${token}`,
     "User-Agent": "nodepod-git",
   };
+  if (token) {
+    headers.Authorization = `token ${token}`;
+  }
   if (body) headers["Content-Type"] = "application/json";
 
   const resp = await proxiedFetch(url, {
@@ -1771,87 +1774,28 @@ async function gitClone(args: string[], ctx: ShellContext): Promise<ShellResult>
     return fail(`fatal: repository '${url}' is not a GitHub URL\n`, 128);
   }
 
-  const token = requireToken(ctx.env);
-  if (!token) {
-    return fail("fatal: authentication required. Set GITHUB_TOKEN environment variable.\n", 128);
-  }
-
   let targetDir = nonFlags[1] ?? gh.repo;
   if (!targetDir.startsWith("/")) targetDir = pathModule.resolve(ctx.cwd, targetDir);
 
-  const repoInfo = await githubApi(`/repos/${gh.owner}/${gh.repo}`, token);
-  if (!repoInfo.ok) {
-    if (repoInfo.status === 404) return fail(`fatal: repository '${url}' not found\n`, 128);
-    return fail(`fatal: GitHub API error: ${repoInfo.status} ${repoInfo.data?.message ?? ""}\n`, 128);
-  }
-  const defaultBranch = repoInfo.data.default_branch ?? "main";
-  if (branch === "main" && defaultBranch !== "main") branch = defaultBranch;
+  const token = requireToken(ctx.env);
 
-  const refResp = await githubApi(`/repos/${gh.owner}/${gh.repo}/git/ref/heads/${branch}`, token);
-  if (!refResp.ok) {
-    return fail(`fatal: Remote branch '${branch}' not found\n`, 128);
-  }
-  const commitSha = refResp.data.object.sha;
-
-  const commitResp = await githubApi(`/repos/${gh.owner}/${gh.repo}/git/commits/${commitSha}`, token);
-  if (!commitResp.ok) return fail(`fatal: could not fetch commit\n`, 128);
-  const treeSha = commitResp.data.tree.sha;
-
-  const treeResp = await githubApi(`/repos/${gh.owner}/${gh.repo}/git/trees/${treeSha}?recursive=1`, token);
-  if (!treeResp.ok) return fail(`fatal: could not fetch tree\n`, 128);
-
-  if (!ctx.volume.existsSync(targetDir)) ctx.volume.mkdirSync(targetDir, { recursive: true });
-
-  let fileCount = 0;
-  const blobs: Array<{ path: string; sha: string }> = [];
-  for (const item of treeResp.data.tree) {
-    if (item.type === "blob") {
-      blobs.push({ path: item.path, sha: item.sha });
-    }
-  }
-
-  const BATCH_SIZE = 10;
-  for (let i = 0; i < blobs.length; i += BATCH_SIZE) {
-    const batch = blobs.slice(i, i + BATCH_SIZE);
-    const results = await Promise.all(
-      batch.map((b) => githubApi(`/repos/${gh.owner}/${gh.repo}/git/blobs/${b.sha}`, token)),
-    );
-    for (let j = 0; j < batch.length; j++) {
-      const blobResp = results[j];
-      if (!blobResp.ok) continue;
-      const filePath = targetDir + "/" + batch[j].path;
-      const dir = filePath.substring(0, filePath.lastIndexOf("/"));
-      if (dir && !ctx.volume.existsSync(dir)) ctx.volume.mkdirSync(dir, { recursive: true });
-      let content: string;
-      if (blobResp.data.encoding === "base64") {
-        content = atob(blobResp.data.content.replace(/\n/g, ""));
-      } else {
-        content = blobResp.data.content;
+  const write = (text: string) => {
+    try {
+      if (typeof postMessage === "function") {
+        (postMessage as any)({ type: "stdout", data: text });
       }
-      ctx.volume.writeFileSync(filePath, content);
-      fileCount++;
-    }
+    } catch { /* not in worker */ }
+  };
+
+  write(`Cloning into '${targetDir.split("/").pop()}'...\n`);
+
+  try {
+    const result = await requestGitClone(url, targetDir, branch, token, write);
+    write(`\nReceiving objects: 100% (${result.fileCount}/${result.fileCount}), done.\n`);
+    return ok("");
+  } catch (e: any) {
+    return fail(`fatal: ${e.message}\n`, 128);
   }
-
-  const initResult = gitInit([], { ...ctx, cwd: targetDir });
-
-  const clonedRepo = new GitRepo(ctx.volume, targetDir, targetDir + "/.git");
-  clonedRepo.setConfigValue("remote.origin.url", url);
-  clonedRepo.setConfigValue("remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*");
-  clonedRepo.setConfigValue("branch." + branch + ".remote", "origin");
-  clonedRepo.setConfigValue("branch." + branch + ".merge", "refs/heads/" + branch);
-
-  clonedRepo.setHEAD("ref: refs/heads/" + branch);
-
-  clonedRepo.walkWorkTree(targetDir, "", (relPath, content) => {
-    clonedRepo.addToIndex(relPath, content);
-  });
-  const entries = clonedRepo.readIndex();
-  const treeHash = clonedRepo.buildTree(entries);
-  const cloneCommitHash = clonedRepo.createCommit(`Clone of ${url}`, null, treeHash);
-  clonedRepo.updateBranchRef(branch, cloneCommitHash);
-
-  return ok(`Cloning into '${nonFlags[1] ?? gh.repo}'...\nremote: Enumerating objects: ${fileCount}\nReceiving objects: 100% (${fileCount}/${fileCount}), done.\n`);
 }
 
 async function gitPush(args: string[], ctx: ShellContext): Promise<ShellResult> {
