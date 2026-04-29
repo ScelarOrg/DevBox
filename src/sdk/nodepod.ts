@@ -19,6 +19,7 @@ import { NodepodFS } from "./nodepod-fs";
 import { NodepodProcess } from "./nodepod-process";
 import { NodepodTerminal } from "./nodepod-terminal";
 import { getCompletions } from "../shell/shell-completions";
+import { parse as parseShell } from "../shell/shell-parser";
 import { builtins as shellBuiltins } from "../shell/shell-builtins";
 import { ProcessManager } from "../threading/process-manager";
 import { setAllowedDomains } from "../cross-origin";
@@ -53,6 +54,23 @@ function shellQuote(arg: string): string {
   if (/^[A-Za-z0-9_\-./:=@%+,]+$/.test(arg)) return arg;
   // single-quote it, escape any inner quotes the posix way
   return "'" + arg.replace(/'/g, "'\\''") + "'";
+}
+
+function parseSimpleCommand(
+  input: string,
+  env: Record<string, string>,
+): { name: string; args: string[] } | null {
+  const ast = parseShell(input, env);
+  if (ast.entries.length !== 1 || ast.entries[0].next) return null;
+
+  const pipeline = ast.entries[0].pipeline;
+  if (pipeline.commands.length !== 1) return null;
+
+  const command = pipeline.commands[0];
+  if (command.redirects.length || command.args.length === 0) return null;
+
+  const [name, ...args] = command.args;
+  return { name, args };
 }
 
 export class Nodepod {
@@ -430,6 +448,8 @@ export class Nodepod {
   createTerminal(opts: TerminalOptions): NodepodTerminal {
     const terminal = new NodepodTerminal(opts);
     terminal.setCwd(this._cwd);
+    const customCommands = opts.customCommands ?? {};
+    const customCommandNames = Object.keys(customCommands);
 
     let activeAbort: AbortController | null = null;
     let currentSendStdin: ((data: string) => void) | null = null;
@@ -521,6 +541,31 @@ export class Nodepod {
             wroteNewline = true;
             terminal.write("\r\n");
           }
+        }
+
+        const simpleCommand = parseSimpleCommand(cmd, this._env);
+        if (simpleCommand && customCommands[simpleCommand.name]) {
+          try {
+            const output = customCommands[simpleCommand.name](
+              terminal.getCwd(),
+              simpleCommand.args,
+            );
+            if (output) {
+              ensureNewline();
+              terminal._writeOutput(output);
+            }
+          } catch (err) {
+            ensureNewline();
+            const message = err instanceof Error ? err.message : String(err);
+            terminal._writeOutput(`${simpleCommand.name}: ${message}\n`, true);
+          } finally {
+            if (activeAbort === myAbort) activeAbort = null;
+            currentSendStdin = null;
+            if (!wroteNewline) terminal.write("\r\n");
+            terminal._setRunning(false);
+            terminal._writePrompt();
+          }
+          return;
         }
 
         // Ensure persistent shell worker is running
@@ -637,7 +682,9 @@ export class Nodepod {
         activeAbort = ac;
       },
       getCompletions: (line: string, cursorPos: number, cwd: string) =>
-        getCompletions(line, cursorPos, cwd, this._volume, shellBuiltins.keys()),
+        getCompletions(line, cursorPos, cwd, this._volume, shellBuiltins.keys(), {
+          extraCommands: customCommandNames,
+        }),
       onResize: forwardResize,
     });
 

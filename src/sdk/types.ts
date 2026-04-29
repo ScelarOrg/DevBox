@@ -76,6 +76,7 @@ export interface TerminalOptions {
   fontSize?: number;
   fontFamily?: string;
   prompt?: (cwd: string) => string;
+  customCommands?: Record<string, (cwd: string, args: string[]) => string>;
 }
 
 /* ---- Filesystem ---- */
