@@ -271,83 +271,30 @@ Worker.prototype.getHeapSnapshot = function getHeapSnapshot(): Promise<unknown> 
   return Promise.resolve({});
 };
 
-// direct onmessage/onerror/onexit setters. napi-rs's .wasi.cjs loaders set
-// `worker.onmessage = fn` browser-style; emnapi's child-thread Node mode
-// installs `worker.on('message', data => worker.onmessage?.({data}))` as a
-// trampoline that dispatches to onmessage from inside its EE listener.
+// direct onmessage/onerror/onexit setters, napi-rs .wasi.cjs loaders use worker.onmessage = ... instead of .on('message', ...)
 //
-// Two patterns to support without breaking the other:
-//
-//   A) emnapi-trampoline (older napi-rs / emnapi child-thread Node mode):
-//      user code does both `worker.on('message', ...)` AND `worker.onmessage = ...`.
-//      The on('message') listener already calls worker.onmessage on every
-//      message. If our setter ALSO auto-attaches a listener, each message
-//      fires onmessage twice -- catastrophic for 'spawn-thread' (TLS
-//      corruption, "current thread handle already set").
-//
-//   B) bare-onmessage (newer napi-rs wasm-runtime, e.g. @tailwindcss/oxide-
-//      wasm32-wasi v4.x): user code ONLY does `worker.onmessage = fn`. There
-//      is NO trampoline. If our setter doesn't connect to message events,
-//      onmessage NEVER fires and every fs-proxy message is silently dropped,
-//      oxide's WASM scanner hangs at 30s SAB timeouts and returns 0
-//      candidates. (Issue #54 v4.)
-//
-// Resolution: the setter conditionally attaches a listener -- only when
-// there is no existing 'message' EventEmitter listener at the moment of
-// assignment. With the trampoline already attached, count > 0 → no auto
-// attach (case A). Without trampoline, count === 0 → auto attach (case B).
+// CRITICAL: the onmessage setter must NOT add an EventEmitter listener
+// emnapi (ENVIRONMENT_IS_NODE=true) already calls worker.on('message', data => worker.onmessage?.({data}))
+// if this setter ALSO added a listener, each message would fire twice. for 'spawn-thread' that means
+// duplicate workers calling wasi_thread_start with the same startArg, then TLS corruption / "current thread handle already set"
+// fix: setter just stores the handler, emnapi's explicit on('message') dispatches exactly once
 {
   const _onmessageSym = Symbol("onmessage");
-  const _onmessageListenerSym = Symbol("onmessage-listener");
   Object.defineProperty(Worker.prototype, "onmessage", {
     get() { return this[_onmessageSym] ?? null; },
     set(fn: Function | null) {
-      // Tear down the previously-installed auto-listener (if any), so a
-      // re-assignment of onmessage doesn't accumulate listeners.
-      if (this[_onmessageListenerSym]) {
-        this.off("message", this[_onmessageListenerSym]);
-        this[_onmessageListenerSym] = null;
-      }
       this[_onmessageSym] = fn;
-      if (!fn) return;
-      // If a trampoline (or any other) listener is already on 'message', do
-      // not auto-attach -- it will dispatch to our stored handler. Otherwise
-      // the user is using bare-onmessage; we must dispatch ourselves.
-      if (this.listenerCount("message") === 0) {
-        const auto = (data: unknown) => {
-          const handler = this[_onmessageSym];
-          if (typeof handler === "function") {
-            try { handler.call(this, { data }); } catch (err) { /* match Worker.onmessage browser semantics: swallow handler errors here, the 'error' event is for fatal worker faults */ console.error("[worker] onmessage handler threw:", err); }
-          }
-        };
-        this[_onmessageListenerSym] = auto;
-        this.on("message", auto);
-      }
+      // do NOT add as EventEmitter listener, emnapi's worker.on('message') already calls worker.onmessage()
     },
     configurable: true,
   });
 
   const _onerrorSym = Symbol("onerror");
-  const _onerrorListenerSym = Symbol("onerror-listener");
   Object.defineProperty(Worker.prototype, "onerror", {
     get() { return this[_onerrorSym] ?? null; },
     set(fn: Function | null) {
-      if (this[_onerrorListenerSym]) {
-        this.off("error", this[_onerrorListenerSym]);
-        this[_onerrorListenerSym] = null;
-      }
       this[_onerrorSym] = fn;
-      if (!fn) return;
-      if (this.listenerCount("error") === 0) {
-        const auto = (err: unknown) => {
-          const handler = this[_onerrorSym];
-          if (typeof handler === "function") {
-            try { handler.call(this, err); } catch (e) { console.error("[worker] onerror handler threw:", e); }
-          }
-        };
-        this[_onerrorListenerSym] = auto;
-        this.on("error", auto);
-      }
+      // same as onmessage, do NOT add as EventEmitter listener
     },
     configurable: true,
   });

@@ -33,6 +33,8 @@ import { NodepodFSClient } from "./nodepod-fs-client";
 import { SyncChannelController } from "../threading/sync-channel";
 import { MemoryHandler } from "../memory-handler";
 import { openSnapshotCache } from "../persistence/idb-cache";
+import { handleFsProxy } from "../helpers/napi-wasm-worker";
+import { buildFileSystemBridge } from "../polyfills/fs";
 
 // short url-safe id. always starts with a letter so it can't be confused
 // with a port number in /__virtual__/{id}/{port}
@@ -73,6 +75,7 @@ export class Nodepod {
   private _unwatchVFS: (() => void) | null = null;
   private _handler: MemoryHandler;
   private _sabEnabled: boolean;
+  private _wasiFsChannel: BroadcastChannel | null = null;
 
   /* ---- Construction (use Nodepod.boot()) ---- */
 
@@ -212,6 +215,28 @@ export class Nodepod {
     handler.startMonitoring();
     const volume = new MemoryVolume(handler);
 
+    // fs bridge for napi-rs WASI workers (tailwind v4 oxide, rolldown, etc).
+    // they call fs from inside a Web Worker which would normally route
+    // through the spawned process, but that process is often in sync WASM
+    // and cant drain its message queue. listen on the same channel here
+    // (browser tab is idle) and service the request against MemoryVolume.
+    let wasiFsChannel: BroadcastChannel | null = null;
+    if (typeof BroadcastChannel !== "undefined") {
+      try {
+        const tabFsBridge = buildFileSystemBridge(volume, () => "/");
+        wasiFsChannel = new BroadcastChannel("nodepod-wasi-fs");
+        wasiFsChannel.onmessage = (e: MessageEvent) => {
+          const data = e.data;
+          if (!data || typeof data !== "object" || !data.__fs__) return;
+          handleFsProxy(data.__fs__, tabFsBridge);
+        };
+      } catch (err) {
+        if (typeof console !== "undefined") {
+          console.warn("[Nodepod] WASI fs broadcast bridge setup failed:", err);
+        }
+      }
+    }
+
     // Open IDB snapshot cache for faster re-boots (opt-out via enableSnapshotCache: false)
     let snapshotCache = null;
     if (opts.enableSnapshotCache !== false) {
@@ -244,6 +269,7 @@ export class Nodepod {
       sabEnabled,
       makeInstanceId(),
     );
+    nodepod._wasiFsChannel = wasiFsChannel;
 
     if (opts.files) {
       for (const [path, content] of Object.entries(opts.files)) {
@@ -684,6 +710,10 @@ export class Nodepod {
       this._proxy.detach(this.instanceId);
     } catch {
       /* */
+    }
+    if (this._wasiFsChannel) {
+      try { this._wasiFsChannel.close(); } catch { /* */ }
+      this._wasiFsChannel = null;
     }
     this._processManager.teardown();
     this._volume.dispose();

@@ -298,17 +298,12 @@ function createRealWebWorker(
 
   // blob URL + real Web Worker
   let realWorker: globalThis.Worker;
-  const workerSpawnT0 = Date.now();
   try {
-    const counter = ((globalThis as any).__nodepodWasiWorkerCounter ||= { spawned: 0, errors: 0 });
-    counter.spawned++;
-    console.log(`[wasi-bridge] spawning WASI worker #${counter.spawned} threadId=${self.threadId} script=${scriptPath}`);
     const blob = new Blob([bundleSource], { type: "application/javascript" });
     const blobUrl = URL.createObjectURL(blob);
     realWorker = new globalThis.Worker(blobUrl, { name: `napi-wasi-${self.threadId}` });
     // revoke after worker has had time to start
     setTimeout(() => URL.revokeObjectURL(blobUrl), 5000);
-    console.log(`[wasi-bridge] WASI worker #${counter.spawned} (threadId=${self.threadId}) constructed in ${Date.now() - workerSpawnT0}ms`);
   } catch (err: any) {
     queueMicrotask(() =>
       self.emit(
@@ -319,16 +314,7 @@ function createRealWebWorker(
     return;
   }
 
-  // bridge: real Web Worker <-> Node.js Worker API.
-  //
-  // emnapi's child-thread delegation posts {type: 'spawn-thread', ...} (or
-  // similar) when WASM calls wasi.thread-spawn. nodepod's PatchedWorker -- the
-  // user-visible Worker handler -- needs to receive that and create a child
-  // Worker. We log non-__fs__ messages here once per type so we can see the
-  // emnapi protocol traffic when something hangs (issue #54 v4: oxide's
-  // rayon thread pool can't init because spawn-thread messages aren't
-  // routed correctly).
-  const _seenMsgTypes = new Set<string>();
+  // bridge: real Web Worker <-> Node.js Worker API
   realWorker.onmessage = (e: MessageEvent) => {
     const data = e.data;
 
@@ -337,19 +323,6 @@ function createRealWebWorker(
       handleFsProxy(data.__fs__, fsBridge);
       return;
     }
-
-    // First-occurrence log of every message type so we can see what emnapi
-    // is sending. Subsequent occurrences are silent to keep the log readable.
-    try {
-      const t = data && typeof data === "object"
-        ? (data.type || data.__emnapi__?.type || "(no-type-field)")
-        : "(non-object)";
-      if (!_seenMsgTypes.has(t)) {
-        _seenMsgTypes.add(t);
-        const keys = data && typeof data === "object" ? Object.keys(data).slice(0, 8).join(",") : "";
-        console.log(`[wasi-bridge] first message of type=${t} keys=${keys}`);
-      }
-    } catch { /* ignore */ }
 
     self.emit("message", data);
   };
@@ -399,28 +372,15 @@ function createRealWebWorker(
   });
 }
 
-// handles __fs__ messages from WASI workers.
-//
-// We always time each call and log SLOW ones (>100ms) and FAILED ones.
-// In a healthy bridge every op is sub-millisecond -- anything slower means
-// the worker is wasting time waiting on a single op (probably a 30s SAB
-// timeout firing on the worker side, but main responded fine; still useful
-// to surface). issue #54 v4 case: 60s scan = ~2 SAB timeouts.
-function handleFsProxy(
+// handles __fs__ messages from WASI workers. exported so Nodepod.boot can
+// subscribe to the broadcast channel and service the same protocol from the
+// browser tab when the spawned process is busy in sync WASM
+export function handleFsProxy(
   req: { sab: Int32Array; type: string; payload: any[] },
   fsBridge: any,
 ): void {
   const { sab, type, payload } = req;
   const maxPayload = sab.buffer.byteLength - 16; // minus 16-byte header
-
-  const t0 = Date.now();
-  const argSummary = (() => {
-    try {
-      const a = payload && payload[0];
-      if (typeof a === "string") return a.length > 200 ? a.slice(0, 200) + "..." : a;
-      return JSON.stringify(a);
-    } catch { return "<arg>"; }
-  })();
 
   try {
     const fn = fsBridge[type];
@@ -453,13 +413,9 @@ function handleFsProxy(
       };
     }
 
-    // flatten Dirent[] from readdirSync({withFileTypes:true}). Without this,
-    // JSON.stringify drops the prototype methods (isFile, isDirectory, ...) and
-    // the worker receives `[{name}, ...]` with no type info. Tailwind v4's
-    // @tailwindcss/oxide-wasm32-wasi calls readdir with withFileTypes during
-    // content scanning; missing isDirectory() throws inside the rust panic
-    // boundary, the rayon worker dies, the awaiting Promise never resolves,
-    // and Vite's HTTP handler hangs to 504. (issue #54)
+    // flatten Dirent[] from readdirSync({withFileTypes:true}). structured
+    // clone strips the prototype methods so the worker would otherwise get
+    // [{name}, ...] with no type info, and rust readdir handlers panic.
     if (type === "readdirSync" && Array.isArray(result) && result.length > 0 && typeof result[0] === "object" && result[0] !== null && typeof (result[0] as any).isFile === "function") {
       result = (result as any[]).map((d) => ({
         name: d.name,
@@ -482,19 +438,6 @@ function handleFsProxy(
     payloadView.set(encoded.subarray(0, writeLen));
 
     Atomics.store(sab, 0, 0); // success
-    // Count every successful bridge call so we can see whether oxide is
-    // making fs ops during a slow scan window (issue #54 v4: no bridge calls
-    // during 60s scan = oxide stuck inside WASM, no fs calls means a deeper
-    // issue than fs polyfill correctness).
-    const __counter = (globalThis as any).__nodepodFsBridgeCounter || ((globalThis as any).__nodepodFsBridgeCounter = { count: 0, slow: 0, fail: 0 });
-    __counter.count++;
-    {
-      const dt = Date.now() - t0;
-      if (dt > 100) {
-        __counter.slow++;
-        try { console.log(`[wasi-bridge] SLOW ${dt}ms ${type}(${argSummary})`); } catch {}
-      }
-    }
   } catch (err: any) {
     const errMsg = err?.message || String(err);
     const errCode = err?.code || "";
@@ -508,14 +451,6 @@ function handleFsProxy(
     payloadView.set(encoded.subarray(0, writeLen));
 
     Atomics.store(sab, 0, 1); // error
-    // Log all FS bridge errors -- a bridge call rejecting ALWAYS matters,
-    // and oxide silently swallows them which masked the real failure here.
-    const __counter = (globalThis as any).__nodepodFsBridgeCounter || ((globalThis as any).__nodepodFsBridgeCounter = { count: 0, slow: 0, fail: 0 });
-    __counter.fail++;
-    {
-      const dt = Date.now() - t0;
-      try { console.log(`[wasi-bridge] FAIL ${dt}ms ${type}(${argSummary}) -> ${errMsg}`); } catch {}
-    }
   } finally {
     Atomics.notify(sab, 0);
   }
@@ -915,16 +850,30 @@ __pathStub.posix = __pathStub;
 //   [3] = reserved
 const __FS_DEFAULT_SAB = 16 + 65536; // 16 header + 64KB payload (enough for most ops)
 
+// fs proxy goes through BroadcastChannel direct to the browser tab so we
+// dont deadlock when the spawned process is busy in sync WASM (oxide.scan
+// etc). unref the channel because BroadcastChannel pins the event loop.
+const __wasiFsBC = (typeof BroadcastChannel !== 'undefined') ? new BroadcastChannel('nodepod-wasi-fs') : null;
+if (__wasiFsBC && typeof __wasiFsBC.unref === 'function') {
+  try { __wasiFsBC.unref(); } catch {}
+}
+
 function __fsSyncCall(type, args, sabSize) {
   const size = sabSize || __FS_DEFAULT_SAB;
   const sab = new SharedArrayBuffer(size);
   const ctrl = new Int32Array(sab, 0, 4);
   Atomics.store(ctrl, 0, -1); // pending
 
-  // Post request to main thread (use native postMessage to avoid infinite recursion)
-  __nativePostMessage({ __fs__: { sab: ctrl, type: type, payload: args || [] } });
+  const message = { __fs__: { sab: ctrl, type: type, payload: args || [] } };
 
-  // Block until main thread responds
+  if (__wasiFsBC) {
+    __wasiFsBC.postMessage(message);
+  } else {
+    // fallback for environments without BroadcastChannel. only works when
+    // the parent process isnt blocked.
+    __nativePostMessage(message);
+  }
+
   const result = Atomics.wait(ctrl, 0, -1, 30000); // 30s timeout
   if (result === 'timed-out') {
     throw Object.assign(new Error('fs.' + type + ' timed out (30s)'), { code: 'ETIMEDOUT' });

@@ -560,15 +560,13 @@ export const WASI = function WASI(this: any, options?: WASIOptions) {
         }
       } else if (entry.kind === FdKind.PreopenDir) {
         filetype = FILETYPE_DIRECTORY;
-        // Fetch ino so directory entries also get unique identities. Walkers
-        // that follow_links use (dev,ino) for cycle detection and would
-        // collapse multiple opened-directory fds otherwise.
+        // unique ino so walkdir with follow_links doesnt collapse opened dirs
         if (fs && entry.path) {
           try {
             const stat = fs.statSync(entry.path);
             if (stat.ino) ino = BigInt(stat.ino);
             if (stat.nlink) nlink = BigInt(stat.nlink);
-          } catch { /* ignore */ }
+          } catch {}
         }
       }
 
@@ -792,18 +790,14 @@ export const WASI = function WASI(this: any, options?: WASIOptions) {
           const nameBytes = encoder.encode(name);
 
           // dirent: u64 d_next, u64 d_ino, u32 d_namlen, u8 d_type, then name.
-          // Stop cleanly when we can't fit the next FULL entry; the caller
-          // (Rust std::fs::ReadDir) refills with cookie = last d_next written.
-          // No partial-header padding -- that confuses Rust's iterator on the
-          // refill path.
+          // stop on the first entry that wont fit, the caller (rust ReadDir)
+          // refills with cookie = last d_next written. dont write partial
+          // headers, that confuses the iterator on the refill path.
           if (offset + 24 + nameBytes.length > end) break;
 
           dv.setBigUint64(offset, BigInt(i + 1), true); // d_next
 
-          // Use real ino from stat. Walkers using `walkdir` with
-          // follow_links(true) deduplicate by (dev, ino); shared inos collapse
-          // sibling entries as a "cycle". MemoryVolume._inoFor() returns
-          // unique-per-path inos for this reason.
+          // real ino from stat, see MemoryVolume._inoFor for why
           let dtype = FILETYPE_REGULAR_FILE;
           let dino = BigInt(i + 1);
           try {
@@ -811,9 +805,7 @@ export const WASI = function WASI(this: any, options?: WASIOptions) {
             if (st.isDirectory()) dtype = FILETYPE_DIRECTORY;
             else if (st.isSymbolicLink()) dtype = FILETYPE_SYMBOLIC_LINK;
             if (st.ino) dino = BigInt(st.ino);
-          } catch {
-            /* ignore - default to regular file with cookie-based ino */
-          }
+          } catch {}
           dv.setBigUint64(offset + 8, dino, true); // d_ino
           dv.setUint32(offset + 16, nameBytes.length, true); // d_namlen
           dv.setUint8(offset + 20, dtype); // d_type

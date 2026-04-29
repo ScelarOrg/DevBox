@@ -37,11 +37,10 @@ export function join(...fragments: string[]): string {
   return normalize(combined);
 }
 
-// nodepod's URL polyfill auto-roots relative URLs at "http://localhost" so
-// jiti / tailwindcss config loaders end up handing us strings like
-// "http://localhost/app/tailwind.config.js" via path.resolve(). If we treat
-// those as relative we'd produce nonsense like "/app/http://localhost/...".
-// Strip the scheme/origin to recover the real pathname (issue #54).
+// our URL polyfill auto-roots relative URLs at "http://localhost", so
+// jiti / tailwindcss config loaders end up passing strings like
+// "http://localhost/app/tailwind.config.js" into path.resolve. without
+// stripping we'd produce "/app/http://localhost/..." nonsense.
 const URL_SCHEME_RE = /^[a-z][a-z0-9+\-.]*:/i;
 
 function stripUrlScheme(seg: string): string {
@@ -52,7 +51,7 @@ function stripUrlScheme(seg: string): string {
       const decoded = decodeURIComponent(u.pathname);
       return decoded || seg;
     }
-  } catch { /* not parseable, leave alone */ }
+  } catch {}
   return seg;
 }
 
@@ -84,26 +83,21 @@ export function resolve(...segments: string[]): string {
 export function isAbsolute(targetPath: string): boolean {
   if (!targetPath) return false;
   if (targetPath.charAt(0) === '/') return true;
-  // Stringified URLs (file:, http://localhost/..., etc.) refer to absolute
-  // resources -- don't let callers treat them as relative.
+  // file:/http:/https: stringified URLs are absolute resources, not relative
   if (URL_SCHEME_RE.test(targetPath)) {
     try {
       const u = new globalThis.URL(targetPath);
       if (u.protocol === 'file:' || u.protocol === 'http:' || u.protocol === 'https:') return true;
-    } catch { /* not a URL, fall through */ }
+    } catch {}
   }
   return false;
 }
 
-// Node.js path.posix.dirname does NOT normalize before slicing -- it finds
-// the last meaningful slash (skipping trailing ones) and returns the
-// substring before it. We previously called normalize() first, which stripped
-// `.` segments from `./src/**/*.js` and produced `src/**` instead of
-// `./src/**`. That corrupts callers like glob-parent (used by Tailwind and
-// many other libraries) that depend on byte-accurate prefix preservation:
-// they then do `pattern.substr(base.length)` and get a shifted glob like
-// `rc/**/*.js` instead of `**/*.js`. (This was the actual root cause of
-// issue #54's "no utility classes detected" symptom.)
+// match node's path.posix.dirname: walk back to the last meaningful slash
+// and return everything before it, never normalize first. previously we
+// called normalize() up front which dropped leading "./" and broke
+// glob-parent (used by tailwind, fast-glob etc) which relies on the byte
+// length of the base to slice the glob suffix.
 export function dirname(targetPath: string): string {
   const len = targetPath ? targetPath.length : 0;
   if (len === 0) return '.';
@@ -127,18 +121,17 @@ export function dirname(targetPath: string): string {
   return targetPath.substring(0, end);
 }
 
-// Same lesson as dirname: do not normalize before slicing. We need the
-// LITERAL last segment, not a canonicalised version.
+// same as dirname: dont normalize, slice the literal last segment
 export function basename(targetPath: string, suffix?: string): string {
   const len = targetPath ? targetPath.length : 0;
   if (len === 0) return '';
 
-  // Skip trailing slashes
+  // skip trailing slashes
   let end = len;
   while (end > 0 && targetPath.charAt(end - 1) === '/') end--;
   if (end === 0) return '';
 
-  // Find the last slash before `end`
+  // find the last slash before `end`
   let start = 0;
   for (let i = end - 1; i >= 0; i--) {
     if (targetPath.charAt(i) === '/') { start = i + 1; break; }

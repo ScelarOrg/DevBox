@@ -177,11 +177,9 @@ export class MemoryVolume {
   private tree: VolumeNode;
   private textEncoder = new TextEncoder();
   private textDecoder = new TextDecoder();
-  // Per-path inode assignment so stat results have unique ino values.
-  // walkdir's `follow_links(true)` (used by Tailwind v4 / Oxide) tracks
-  // visited (dev,ino) pairs to break symlink cycles. With ino=0 for every
-  // file, every entry collides and gets dropped as "already visited",
-  // causing the scanner to read no source files (issue #54).
+  // unique ino per path. rust walkdir with follow_links(true) tracks visited
+  // (dev,ino) pairs to break cycles, so ino=0 for everything makes it drop
+  // every file as "already visited".
   private _inos = new Map<string, number>();
   private _nextIno = 1;
   private _inoFor(path: string): number {

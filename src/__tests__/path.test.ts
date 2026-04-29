@@ -55,9 +55,8 @@ describe("path.resolve", () => {
     expect(path.resolve("/foo", "bar", "..", "baz")).toBe("/foo/baz");
   });
 
-  // issue #54: jiti / tailwindcss config loaders pass URL-stringified paths
-  // back into path.resolve(). Without scheme stripping these become nonsense
-  // like "/app/http://localhost/app/tailwind.config.js".
+  // jiti / tailwind config loaders pass URL-strings back into path.resolve.
+  // without scheme stripping these become "/app/http://localhost/..." nonsense
   it("treats http://localhost-rooted URLs as absolute pathnames", () => {
     expect(path.resolve("/app", "http://localhost/app/tailwind.config.js")).toBe(
       "/app/tailwind.config.js",
@@ -75,21 +74,6 @@ describe("path.resolve", () => {
   });
 });
 
-describe("path.isAbsolute", () => {
-  it("treats /-rooted paths as absolute", () => {
-    expect(path.isAbsolute("/foo")).toBe(true);
-  });
-
-  it("treats relative paths as not absolute", () => {
-    expect(path.isAbsolute("foo/bar")).toBe(false);
-  });
-
-  it("treats stringified file/http URLs as absolute", () => {
-    expect(path.isAbsolute("file:///foo")).toBe(true);
-    expect(path.isAbsolute("http://localhost/foo")).toBe(true);
-  });
-});
-
 describe("path.dirname", () => {
   it("returns parent directory", () => {
     expect(path.dirname("/foo/bar.txt")).toBe("/foo");
@@ -103,12 +87,9 @@ describe("path.dirname", () => {
     expect(path.dirname("file.txt")).toBe(".");
   });
 
-  // issue #54 root-cause regression tests: glob-parent (used by tailwindcss
-  // and many other libs) iteratively dirnames a glob pattern to find its
-  // static base. it relies on byte-accurate prefix preservation -- if we
-  // normalize before slicing, the leading `./` gets stripped and downstream
-  // `pattern.substr(base.length)` produces a shifted glob like `rc/**/*.js`
-  // instead of `**/*.js`.
+  // glob-parent (used by tailwind, fast-glob etc) walks dirname to find the
+  // static base of a glob and slices the suffix by the base byte length. if
+  // we normalize first the leading "./" goes away and the slice is off by 2.
   it("preserves leading ./ in relative paths (glob-parent contract)", () => {
     expect(path.dirname("./src/**/*.js")).toBe("./src/**");
     expect(path.dirname("./src/**")).toBe("./src");
@@ -189,6 +170,11 @@ describe("path.isAbsolute", () => {
     expect(path.isAbsolute("foo")).toBe(false);
     expect(path.isAbsolute("./foo")).toBe(false);
     expect(path.isAbsolute("../foo")).toBe(false);
+  });
+
+  it("treats stringified file/http URLs as absolute", () => {
+    expect(path.isAbsolute("file:///foo")).toBe(true);
+    expect(path.isAbsolute("http://localhost/foo")).toBe(true);
   });
 });
 

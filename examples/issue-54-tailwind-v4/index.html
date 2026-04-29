@@ -471,15 +471,17 @@ export default App;
         }
         log('npm install done.\n', 'pass');
 
-        // diagnostic probe: invoke @tailwindcss/oxide's Scanner directly with
-        // the same source-detection oxide uses internally. this isolates
-        // whether oxide can see App.tsx's classes at all, before vite gets
-        // involved. each experiment prints its wall-clock duration so we can
-        // see whether oxide is fast (matches native node) or hanging on a
-        // wasi syscall path.
+        // diagnostic probe, opt-in via window.__nodepodTailwindV4Probe = true
+        // in devtools before clicking. exercises oxide Scanner.scan directly
+        // so we can isolate oxide vs vite issues without the full dev server.
+        const enableV4Probe = !!(window).__nodepodTailwindV4Probe;
         log('--- diagnostic: probing tailwind v4 oxide scanner ---', 'title');
+        if (!enableV4Probe) {
+          log('(probe disabled; set window.__nodepodTailwindV4Probe = true to enable)', 'dim');
+        }
         const diagStart = performance.now();
         try {
+          if (!enableV4Probe) throw new Error('probe disabled');
           const probeScript = [
             "const fs = require('fs');",
             "const path = require('path');",
@@ -545,31 +547,33 @@ export default App;
             "  if (!oxide) return;",
             "  console.log('  exports=' + Object.keys(oxide).join(','));",
             "  if (typeof oxide.Scanner !== 'function') { console.log('Scanner not exported'); return; }",
-            "  // experiment 0a: skip JS wrapper (just delegates to napi-rs),",
-            "  // dump the actual @tailwindcss/oxide-wasm32-wasi entry which",
-            "  // is what runs the WASM. that's where the bug lives.",
-            "  console.log('--- experiment 0a: oxide-wasm32-wasi entry structure ---');",
+            "  // dumps wasi-worker.mjs and the napi-rs runtime entry so we can",
+            "  // see what the worker bootstrap actually does.",
+            "  console.log('--- experiment 0a: wasi-worker.mjs structure ---');",
             "  try {",
-            "    const wasiEntry = require.resolve('@tailwindcss/oxide-wasm32-wasi');",
-            "    console.log('  resolved to: ' + wasiEntry);",
-            "    const main = fs.readFileSync(wasiEntry, 'utf8');",
+            "    const workerPath = '/app/node_modules/@tailwindcss/oxide-wasm32-wasi/wasi-worker.mjs';",
+            "    const main = fs.readFileSync(workerPath, 'utf8');",
             "    console.log('  size: ' + main.length + ' bytes');",
-            "    // dump first 3000 chars",
-            "    console.log('  head:\\n' + main.slice(0, 3000));",
-            "    // also dump indicator of where Scanner.scan implementation is",
-            "    const scanIdx = main.indexOf('Scanner');",
-            "    if (scanIdx > 0) console.log('  Scanner around offset ' + scanIdx + ': ' + main.slice(scanIdx, scanIdx + 600));",
-            "    // hunt for sources/scan logic",
-            "    for (const needle of ['scan(', 'sources', 'walkdir', 'thread', 'spawn']) {",
-            "      const i = main.indexOf(needle);",
-            "      if (i >= 0) console.log('  found \"' + needle + '\" at ' + i + ': ' + JSON.stringify(main.slice(Math.max(0, i - 80), i + 150)));",
-            "    }",
+            "    console.log('  full source:\\n' + main);",
             "  } catch (e) { console.log('  exp0a threw: ' + e.message); }",
+            "  console.log('');",
+            "  console.log('--- experiment 0b: @napi-rs/wasm-runtime main entry ---');",
+            "  try {",
+            "    const wasmRuntime = require.resolve('@napi-rs/wasm-runtime');",
+            "    console.log('  resolved: ' + wasmRuntime);",
+            "    const src = fs.readFileSync(wasmRuntime, 'utf8');",
+            "    console.log('  size: ' + src.length + ' bytes');",
+            "    // hunt for instantiateNapiModuleSync, postMessage to worker",
+            "    for (const needle of ['instantiateNapiModuleSync', 'postMessage', 'onCreateWorker', 'load', 'loaded', 'createOnMessage', 'spawnWorker']) {",
+            "      const i = src.indexOf(needle);",
+            "      if (i >= 0) console.log('  \"' + needle + '\" at ' + i + ': ' + JSON.stringify(src.slice(Math.max(0, i-100), i+250)));",
+            "    }",
+            "  } catch (e) { console.log('  exp0b threw: ' + e.message); }",
+            "  console.log('');",
             "",
             "  // experiment 1: explicit absolute base + broad pattern, mirrors what",
             "  // @tailwindcss/vite hands oxide for auto-detected sources.",
             "  fsCallLog.length = 0;",
-            "  if (globalThis.__nodepodFsBridgeCounter) globalThis.__nodepodFsBridgeCounter.count = globalThis.__nodepodFsBridgeCounter.fail = globalThis.__nodepodFsBridgeCounter.slow = 0;",
             "  const s1 = tick('exp1 new Scanner({base:/app, pattern:**/*})', () => new oxide.Scanner({ sources: [{ base: '/app', pattern: '**/*', negated: false }] }));",
             "  if (s1) {",
             "    const c1 = tick('exp1 .scan()', () => s1.scan());",
@@ -579,13 +583,10 @@ export default App;
             "      const stringify = (c) => typeof c === 'string' ? c : (c.candidate || c.name || '');",
             "      console.log('  exp1 contains min-h-screen=' + c1.some(c => stringify(c).includes('min-h-screen')) + '  contains text-cyan-300=' + c1.some(c => stringify(c).includes('cyan-300')));",
             "    }",
-            "    if (globalThis.__nodepodFsBridgeCounter) console.log('  exp1 FS BRIDGE total=' + globalThis.__nodepodFsBridgeCounter.count + ' slow=' + globalThis.__nodepodFsBridgeCounter.slow + ' fail=' + globalThis.__nodepodFsBridgeCounter.fail);",
-            "    else console.log('  exp1 FS BRIDGE counter not initialized (no bridge calls happened)');",
             "    dumpFsLog('exp1');",
             "  }",
             "  // experiment 2: scoped to /app/src so we exclude node_modules entirely",
             "  fsCallLog.length = 0;",
-            "  if (globalThis.__nodepodFsBridgeCounter) globalThis.__nodepodFsBridgeCounter.count = globalThis.__nodepodFsBridgeCounter.fail = globalThis.__nodepodFsBridgeCounter.slow = 0;",
             "  const s2 = tick('exp2 new Scanner({base:/app/src, pattern:**/*})', () => new oxide.Scanner({ sources: [{ base: '/app/src', pattern: '**/*', negated: false }] }));",
             "  if (s2) {",
             "    const c2 = tick('exp2 .scan()', () => s2.scan());",
@@ -593,8 +594,6 @@ export default App;
             "      console.log('  exp2 candidates: ' + c2.length);",
             "      console.log('  exp2 sample (first 20): ' + JSON.stringify(c2.slice(0, 20)));",
             "    }",
-            "    if (globalThis.__nodepodFsBridgeCounter) console.log('  exp2 FS BRIDGE total=' + globalThis.__nodepodFsBridgeCounter.count + ' slow=' + globalThis.__nodepodFsBridgeCounter.slow + ' fail=' + globalThis.__nodepodFsBridgeCounter.fail);",
-            "    else console.log('  exp2 FS BRIDGE counter not initialized (no bridge calls happened)');",
             "    dumpFsLog('exp2 (only 4 files in /app/src, baseline)');",
             "  }",
             "  // experiment 3: pass App.tsx directly (single file pattern)",
@@ -606,7 +605,7 @@ export default App;
             "      console.log('  exp3 sample (first 20): ' + JSON.stringify(c3.slice(0, 20)));",
             "    }",
             "  }",
-            "  // experiment 4: ad-hoc -- pass file content directly via scanFiles",
+            "  // experiment 4: pass file content directly via scanFiles",
             "  if (typeof oxide.scanFiles === 'function') {",
             "    const apptsxContent = fs.readFileSync('/app/src/App.tsx', 'utf8');",
             "    const c4 = tick('exp4 oxide.scanFiles([{content,extension:tsx}])', () => oxide.scanFiles([{ content: apptsxContent, extension: 'tsx' }]));",
@@ -618,7 +617,10 @@ export default App;
             "    console.log('experiment 4 skipped: oxide.scanFiles not exported');",
             "  }",
             "  console.log('--- v4 oxide diagnostic total: ' + (Date.now() - t_total) + 'ms ---');",
-            "})();",
+            "  // force-exit, the WASI worker keeps a loop ref alive even after",
+            "  // oxide unrefs it (BroadcastChannel inside the worker etc).",
+            "  process.exit(0);",
+            "})().catch((e) => { console.error('probe IIFE threw:', e); process.exit(1); });",
             "",
           ].join('\n');
           await pod.fs.writeFile('/app/__nodepod_v4_probe.cjs', probeScript);
@@ -627,7 +629,7 @@ export default App;
           probeProc.on('error', (t) => log(t.trimEnd(), 'stderr'));
           await probeProc.completion;
         } catch (e) {
-          log('v4 probe failed: ' + e.message, 'stderr');
+          if (e.message !== 'probe disabled') log('v4 probe failed: ' + e.message, 'stderr');
         }
         const diagDur = ((performance.now() - diagStart) / 1000).toFixed(1);
         log(`--- diagnostic finished in ${diagDur}s (wall-clock from spawn to exit) ---`, 'info');
