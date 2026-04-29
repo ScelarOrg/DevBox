@@ -4,6 +4,8 @@
 import { EventEmitter } from "../polyfills/events";
 import type { MemoryVolume } from "../memory-volume";
 import { ProcessHandle } from "./process-handle";
+import { buildFileSystemBridge } from "../polyfills/fs";
+import { handleFsProxy } from "../helpers/napi-wasm-worker";
 import type {
   SpawnConfig,
   ProcessInfo,
@@ -105,6 +107,28 @@ export class ProcessManager extends EventEmitter {
     this._processes.set(pid, handle);
     this._wireHandleEvents(handle);
 
+    // pool of fs proxy MessagePorts for the spawned process to hand out to
+    // its WASI workers. one port per worker, tab side handles each. chrome
+    // drops BroadcastChannel delivery from blob workers so we cant rely on
+    // that as the only route (#54 follow-up).
+    const wasiFsPorts: MessagePort[] = [];
+    const transferPorts: MessagePort[] = [];
+    {
+      const tabFsBridge = buildFileSystemBridge(this._volume, () => "/");
+      const POOL_SIZE = 16;
+      for (let i = 0; i < POOL_SIZE; i++) {
+        const ch = new MessageChannel();
+        ch.port1.onmessage = (e: MessageEvent) => {
+          const data = e.data;
+          if (!data || typeof data !== "object" || !data.__fs__) return;
+          handleFsProxy(data.__fs__, tabFsBridge);
+        };
+        ch.port1.start();
+        transferPorts.push(ch.port2);
+        wasiFsPorts.push(ch.port2);
+      }
+    }
+
     const initMsg: MainToWorker_Init = {
       type: "init",
       pid,
@@ -113,8 +137,9 @@ export class ProcessManager extends EventEmitter {
       snapshot: spawnConfig.snapshot,
       sharedBuffer: spawnConfig.sharedBuffer,
       syncBuffer: spawnConfig.syncBuffer,
+      wasiFsPorts,
     };
-    handle.init(initMsg);
+    handle.init(initMsg, transferPorts);
 
     this.emit("spawn", pid, config.command, config.args);
     return handle;

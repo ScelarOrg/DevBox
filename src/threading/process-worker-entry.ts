@@ -188,6 +188,14 @@ function handleInit(msg: MainToWorker_Init): void {
   // if main had SAB off, neither buffer was sent
   _sabEnabled = !!msg.syncBuffer;
 
+  // fs proxy ports from the tab, hand them to napi-wasm-worker for WASI
+  // workers to grab when they spawn. chrome BC workaround (#54 follow-up)
+  if (msg.wasiFsPorts && msg.wasiFsPorts.length > 0) {
+    import("../helpers/napi-wasm-worker").then((m) => {
+      m.setWasiFsPortPool(msg.wasiFsPorts!);
+    }).catch(() => {});
+  }
+
   _initialized = true;
   post({ type: "ready", pid: _pid });
 }
