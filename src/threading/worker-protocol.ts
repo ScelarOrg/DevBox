@@ -25,6 +25,9 @@ export interface MainToWorker_Init {
   snapshot: VFSBinarySnapshot;
   sharedBuffer?: SharedArrayBuffer;
   syncBuffer?: SharedArrayBuffer;
+  // tab-side fs proxy ports, one per WASI worker the spawned process will
+  // create. chrome BC workaround (see process-manager spawn). #54 follow-up
+  wasiFsPorts?: MessagePort[];
 }
 
 export interface MainToWorker_Exec {

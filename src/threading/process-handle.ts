@@ -70,11 +70,12 @@ export class ProcessHandle extends EventEmitter {
     this.worker.postMessage(msg, transfer ?? []);
   }
 
-  init(initMsg: MainToWorker_Init): void {
+  init(initMsg: MainToWorker_Init, extraTransfer?: Transferable[]): void {
     const transfer: Transferable[] = [];
     if (initMsg.snapshot.data.byteLength > 0) {
       transfer.push(initMsg.snapshot.data);
     }
+    if (extraTransfer) transfer.push(...extraTransfer);
     this.postMessage(initMsg, transfer);
   }
 

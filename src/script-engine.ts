@@ -94,7 +94,7 @@ import * as seaPolyfill from "./polyfills/sea";
 import * as sqlitePolyfill from "./polyfills/sqlite";
 import * as quicPolyfill from "./polyfills/quic";
 import * as lightningcssPolyfill from "./polyfills/lightningcss";
-import { createNapiWorkerFactory, isNapiWasiWorkerScript } from "./helpers/napi-wasm-worker";
+import { createNapiWorkerFactory, isNapiWasiWorkerScript, prewarmWasiPool } from "./helpers/napi-wasm-worker";
 import {
   promises as streamPromises,
   Readable,
@@ -2135,6 +2135,9 @@ export class ScriptEngine {
       threadPoolPolyfill.setWorkerConstructorOverride((self, script, opts) => {
         workerFactory.call(self, script, opts);
       });
+      // prewarm now while the parent thread is free. chrome wont schedule
+      // child workers spawned from a parent thats about to Atomics.wait
+      try { prewarmWasiPool(); } catch (err) { _nativeConsole.warn("[Nodepod] WASI pool prewarm failed:", err); }
     }
 
     // Intercept fetch() for file:// URLs — serve from VFS instead of network.

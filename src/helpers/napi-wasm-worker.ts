@@ -159,6 +159,75 @@ try {
 
 let _nextWasiThreadId = 100;
 
+// chrome silently drops `new Worker()` if the parent web worker is about to
+// enter Atomics.wait (tailwind oxide does this back to back in
+// instantiateNapiModuleSync). pre-spawn empty workers while the spawned
+// process boots so theyre already running before anyone blocks, then inject
+// the actual bundle via importScripts when napi-rs needs one.
+const _wasiPool: globalThis.Worker[] = [];
+const _WASI_POOL_TARGET = 8;
+let _poolPreambleUrl: string | null = null;
+
+function getPoolPreambleUrl(): string {
+  if (_poolPreambleUrl) return _poolPreambleUrl;
+  const src = `
+    self.onmessage = function(e) {
+      var d = e && e.data;
+      if (d && d.__nodepod_init_bundle__) {
+        var url = d.bundleUrl;
+        // stash transferred fs port for the bundle preamble to pick up
+        if (d.fsPort) {
+          globalThis.__nodepodWasiFsPort = d.fsPort;
+          try { d.fsPort.start(); } catch (_) {}
+        }
+        try {
+          self.onmessage = null;
+          importScripts(url);
+        } catch (err) {
+          try { self.postMessage({ __nodepod_pool_err__: String(err && err.message || err) }); } catch (_) {}
+        }
+      }
+    };
+  `;
+  const blob = new Blob([src], { type: "application/javascript" });
+  _poolPreambleUrl = URL.createObjectURL(blob);
+  return _poolPreambleUrl;
+}
+
+function refillPool(): void {
+  while (_wasiPool.length < _WASI_POOL_TARGET) {
+    try {
+      _wasiPool.push(new globalThis.Worker(getPoolPreambleUrl(), { name: "wasi-pool" }));
+    } catch {
+      break;
+    }
+  }
+}
+
+function pullFromPool(): globalThis.Worker | null {
+  if (_wasiPool.length < _WASI_POOL_TARGET / 2) {
+    queueMicrotask(refillPool);
+  }
+  return _wasiPool.shift() ?? null;
+}
+
+// call early in spawned-process boot, before anything blocks
+export function prewarmWasiPool(): void {
+  refillPool();
+}
+
+// MessagePort pool from the tab. each port is a 1:1 fs proxy channel for one
+// WASI worker. sidesteps chrome dropping BroadcastChannel messages from blob
+// workers, and works when the parent is in sync wasm (oxide.scan).
+const _wasiFsPortPool: MessagePort[] = [];
+export function setWasiFsPortPool(ports: MessagePort[]): void {
+  _wasiFsPortPool.length = 0;
+  for (const p of ports) _wasiFsPortPool.push(p);
+}
+function pullFsPort(): MessagePort | null {
+  return _wasiFsPortPool.shift() ?? null;
+}
+
 /**
  * makes a PatchedWorker constructor that spawns real browser Web Workers for
  * napi-rs WASI scripts, falling back to the standard fork-based worker otherwise
@@ -296,42 +365,61 @@ function createRealWebWorker(
     }
   }
 
-  // blob URL + real Web Worker
   let realWorker: globalThis.Worker;
+  let blobUrl: string;
   try {
     const blob = new Blob([bundleSource], { type: "application/javascript" });
-    const blobUrl = URL.createObjectURL(blob);
-    realWorker = new globalThis.Worker(blobUrl, { name: `napi-wasi-${self.threadId}` });
-    // revoke after worker has had time to start
-    setTimeout(() => URL.revokeObjectURL(blobUrl), 5000);
+    blobUrl = URL.createObjectURL(blob);
   } catch (err: any) {
     queueMicrotask(() =>
-      self.emit(
-        "error",
-        new Error(`Failed to create WASI Web Worker: ${err.message}`),
-      ),
+      self.emit("error", new Error(`Failed to build WASI bundle: ${err.message}`)),
     );
     return;
   }
 
-  // bridge: real Web Worker <-> Node.js Worker API
+  const pooled = pullFromPool();
+  if (pooled) {
+    realWorker = pooled;
+    const fsPort = pullFsPort();
+    try {
+      const initMsg: any = { __nodepod_init_bundle__: true, bundleUrl: blobUrl };
+      if (fsPort) {
+        initMsg.fsPort = fsPort;
+        realWorker.postMessage(initMsg, [fsPort]);
+      } else {
+        realWorker.postMessage(initMsg);
+      }
+    } catch { /* ignore */ }
+    setTimeout(() => URL.revokeObjectURL(blobUrl), 5000);
+  } else {
+    // pool empty, direct spawn. hits the chrome quirk if parent is about to
+    // block but at least non-blocking cases still work.
+    try {
+      realWorker = new globalThis.Worker(blobUrl, { name: `napi-wasi-${self.threadId}` });
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 5000);
+    } catch (err: any) {
+      queueMicrotask(() =>
+        self.emit(
+          "error",
+          new Error(`Failed to create WASI Web Worker: ${err.message}`),
+        ),
+      );
+      return;
+    }
+  }
+
   realWorker.onmessage = (e: MessageEvent) => {
     const data = e.data;
-
-    // __fs__ protocol: fs proxy requests from the worker
     if (data && typeof data === "object" && data.__fs__) {
       handleFsProxy(data.__fs__, fsBridge);
       return;
     }
-
     self.emit("message", data);
   };
 
   realWorker.onerror = (e: ErrorEvent) => {
     self.emit("error", new Error(e.message || "Worker error"));
-    // web workers don't emit exit, so on an unhandled error close the
-    // handle ourselves and fake exit code 1 to match node. otherwise a
-    // crashed wasi worker leaks the loop ref forever.
+    // web workers dont emit exit, fake one so the loop ref isnt leaked
     if (!self._terminated) {
       (self._elHandle as Handle | null)?.close();
       self._elHandle = null;
@@ -359,10 +447,11 @@ function createRealWebWorker(
     if (!self._terminated) (self._elHandle as Handle | null)?.ref();
     return self;
   };
-  self.unref = () => {
-    (self._elHandle as Handle | null)?.unref();
-    return self;
-  };
+  // napi-rs's wasi.cjs calls worker.unref() to mirror node behavior where the
+  // http server keeps the loop alive. in nodepod the spawned process loop
+  // would drain before vite even binds, so we ignore unref. terminate/onExit
+  // still close the handle so the loop drains once the worker is done.
+  self.unref = () => self;
 
   // start reffed like Node.js does
   self._elHandle = getRegistry().register("Worker");
@@ -850,9 +939,11 @@ __pathStub.posix = __pathStub;
 //   [3] = reserved
 const __FS_DEFAULT_SAB = 16 + 65536; // 16 header + 64KB payload (enough for most ops)
 
-// fs proxy goes through BroadcastChannel direct to the browser tab so we
-// dont deadlock when the spawned process is busy in sync WASM (oxide.scan
-// etc). unref the channel because BroadcastChannel pins the event loop.
+// fs proxy: try dedicated MessagePort first (transferred from tab via the pool
+// init message, direct 1:1 channel, works in chrome where BC from blob workers
+// is broken). fall through to BC (firefox path) and parent postMessage (works
+// when parent isnt in sync wasm). first one to flip the SAB status wins.
+const __wasiFsPort = globalThis.__nodepodWasiFsPort || null;
 const __wasiFsBC = (typeof BroadcastChannel !== 'undefined') ? new BroadcastChannel('nodepod-wasi-fs') : null;
 if (__wasiFsBC && typeof __wasiFsBC.unref === 'function') {
   try { __wasiFsBC.unref(); } catch {}
@@ -866,13 +957,13 @@ function __fsSyncCall(type, args, sabSize) {
 
   const message = { __fs__: { sab: ctrl, type: type, payload: args || [] } };
 
-  if (__wasiFsBC) {
-    __wasiFsBC.postMessage(message);
-  } else {
-    // fallback for environments without BroadcastChannel. only works when
-    // the parent process isnt blocked.
-    __nativePostMessage(message);
+  if (__wasiFsPort) {
+    try { __wasiFsPort.postMessage(message); } catch {}
   }
+  if (__wasiFsBC) {
+    try { __wasiFsBC.postMessage(message); } catch {}
+  }
+  __nativePostMessage(message);
 
   const result = Atomics.wait(ctrl, 0, -1, 30000); // 30s timeout
   if (result === 'timed-out') {
