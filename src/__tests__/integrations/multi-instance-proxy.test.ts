@@ -180,6 +180,68 @@ describe("RequestProxy multi-instance", () => {
     });
   });
 
+  describe("WebSocket upgrade instance isolation", () => {
+    function makeUpgradableServer(label: string) {
+      const upgrades: Array<{ path: string }> = [];
+      return {
+        label,
+        upgrades,
+        listening: true,
+        address: () => ({ port: 0, address: "0.0.0.0", family: "IPv4" }),
+        async dispatchRequest(method: string, url: string) {
+          return {
+            statusCode: 200,
+            statusMessage: "OK",
+            headers: { "x-server": label },
+            body: Buffer.from(`${label}:${method} ${url}`),
+          };
+        },
+        dispatchUpgrade(path: string, _headers: Record<string, string>) {
+          upgrades.push({ path });
+          const socket = new EventEmitter() as any;
+          socket.write = () => true;
+          return { req: { headers: {} }, socket };
+        },
+      };
+    }
+
+    it("WS connect for instance A does not hit instance B on the same port", () => {
+      const pm1 = new FakeProcessManager();
+      const pm2 = new FakeProcessManager();
+      proxy.attach("pod-aaa", pm1);
+      proxy.attach("pod-bbb", pm2);
+
+      const serverA = makeUpgradableServer("A");
+      const serverB = makeUpgradableServer("B");
+      proxy.register("pod-aaa", serverA as any, 3000);
+      proxy.register("pod-bbb", serverB as any, 3000);
+
+      (proxy as any)._handleWsConnect("pod-aaa", "uid-a", 3000, "/ws");
+      expect(serverA.upgrades).toEqual([{ path: "/ws" }]);
+      expect(serverB.upgrades).toEqual([]);
+      expect(pm1.wsUpgrades).toEqual([]);
+      expect(pm2.wsUpgrades).toEqual([]);
+
+      (proxy as any)._handleWsConnect("pod-bbb", "uid-b", 3000, "/ws");
+      expect(serverB.upgrades).toEqual([{ path: "/ws" }]);
+      expect(serverA.upgrades).toHaveLength(1);
+    });
+
+    it("falls back to the instance processManager when registry server cannot upgrade", () => {
+      const pm1 = new FakeProcessManager();
+      const pm2 = new FakeProcessManager();
+      proxy.attach("pod-aaa", pm1);
+      proxy.attach("pod-bbb", pm2);
+      proxy.register("pod-aaa", makeServer("A"), 3000);
+      proxy.register("pod-bbb", makeServer("B"), 3000);
+
+      (proxy as any)._handleWsConnect("pod-aaa", "uid-a", 3000, "/ws");
+      expect(pm1.wsUpgrades).toHaveLength(1);
+      expect(pm1.wsUpgrades[0][0]).toBe(3000);
+      expect(pm2.wsUpgrades).toHaveLength(0);
+    });
+  });
+
   describe("legacy single-tenant API", () => {
     it("setProcessManager + register(server, port) routes to DEFAULT_INSTANCE", async () => {
       const pm = new FakeProcessManager();

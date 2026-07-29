@@ -147,6 +147,23 @@ const snapshot = await nodepod.snapshot();
 await nodepod.restore(snapshot);
 ```
 
+## Headless mode
+
+Same runtime (VFS, shell, npm, spawn, HTTP) without terminal/preview UI.
+Works in the browser and in Node/Bun.
+
+```typescript
+// Browser — Web Workers; Service Worker off by default
+import { Nodepod } from '@scelar/nodepod';
+const pod = await Nodepod.boot({ headless: true });
+const res = await pod.request(3000, { path: '/' });
+
+// Node / Bun — worker_threads + localhost HTTP ingress
+import { Nodepod } from '@scelar/nodepod/headless';
+const pod = await Nodepod.boot();
+await fetch(pod.port(3000)!); // http://127.0.0.1:<ingress>/__virtual__/...
+```
+
 ## API
 
 ### `Nodepod.boot(options?)`
@@ -156,8 +173,10 @@ await nodepod.restore(snapshot);
 | `files` | `Record<string, string \| Uint8Array>` | Initial files |
 | `workdir` | `string` | Working directory (default `"/"`) |
 | `env` | `Record<string, string>` | Environment variables |
+| `headless` | `boolean` | No UI required; defaults SW/watermark off. Implied by `@scelar/nodepod/headless` |
 | `swUrl` | `string` | Service Worker URL for preview iframes |
-| `watermark` | `boolean` | Show nodepod badge in previews (default `true`) |
+| `serviceWorker` | `boolean` | Register SW (default on in browser UI mode; off in headless) |
+| `watermark` | `boolean` | Show nodepod badge in previews (default `true`, off in headless) |
 | `onServerReady` | `(port, url) => void` | Called when a virtual server starts |
 | `allowedFetchDomains` | `string[] \| null` | Extra CORS proxy domains. `null` = allow all |
 | `spawnSnapshot` | `"lean" \| "full"` | Worker filesystem snapshot mode. Defaults to memory-efficient `"lean"` with SharedArrayBuffer and transparently falls back to `"full"` without it |
@@ -172,6 +191,7 @@ await nodepod.restore(snapshot);
 | `spawn(cmd, args?, opts?)` | Run a command |
 | `packages.install(name, version?, flags?)` | Install an npm package |
 | `createTerminal(opts)` | Create an xterm.js terminal |
+| `request(port, init?)` | Programmatic HTTP to a virtual server (no SW required) |
 | `fs.readFile(path, enc?)` | Read a file |
 | `fs.writeFile(path, data)` | Write a file |
 | `fs.readdir(path)` | List directory |
@@ -181,7 +201,7 @@ await nodepod.restore(snapshot);
 | `snapshot()` | Capture filesystem state |
 | `restore(snapshot)` | Restore from snapshot |
 | `proxy.handleRequest(port, method, url, headers, body?)` | Send a request to a virtual server |
-| `port(num)` | Get preview URL for a port |
+| `port(num)` | Get preview / ingress URL for a port |
 | `setPreviewScript(js)` | Inject JS into preview iframes |
 | `clearPreviewScript()` | Remove injected script |
 | `inspect` | Opt-in live-DOM, layout, console, error, a11y, and best-effort screenshot inspection for an attached preview iframe |

@@ -104,10 +104,42 @@ export function defineConfig<T>(config: T): T {
   return config;
 }
 
-// falls back to acorn-jsx if plain acorn fails (e.g. JSX in source)
+// Rollup/Rolldown PARSE_ERROR shape so Vite's ssrTransform can format it.
+function toParseError(err: unknown, filename?: string): Error {
+  const e = err as {
+    message?: string;
+    pos?: number;
+    loc?: { line: number; column: number };
+  };
+  const out = new Error(e?.message || String(err)) as Error & {
+    code: string;
+    pos?: number;
+    loc?: { line: number; column: number; file?: string };
+  };
+  out.code = "PARSE_ERROR";
+  if (typeof e?.pos === "number") out.pos = e.pos;
+  if (e?.loc) {
+    out.loc = { ...e.loc, file: filename };
+  }
+  return out;
+}
+
+type ParseAstOpts = {
+  allowReturnOutsideFunction?: boolean;
+  jsx?: boolean;
+  // rolldown ParserOptions — accepted and ignored (acorn has no lang switch)
+  lang?: string;
+  preserveParens?: boolean;
+  signal?: AbortSignal;
+} | null;
+
+// falls back to acorn-jsx if plain acorn fails (e.g. JSX in source).
+// signature matches both rollup/parseAst and rolldown/parseAst:
+//   parseAst(source, options?, filename?)
 export function parseAst(
   source: string,
-  opts?: { allowReturnOutsideFunction?: boolean; jsx?: boolean },
+  opts?: ParseAstOpts,
+  filename?: string,
 ): unknown {
   const parseOpts = {
     ecmaVersion: "latest" as const,
@@ -116,29 +148,26 @@ export function parseAst(
     locations: true,
   };
 
-  if (opts?.jsx) {
-    return acornJsxParser.parse(source, parseOpts);
-  }
-
   try {
-    return acorn.parse(source, parseOpts);
-  } catch {
-    return acornJsxParser.parse(source, parseOpts);
+    if (opts?.jsx || opts?.lang === "jsx" || opts?.lang === "tsx") {
+      return acornJsxParser.parse(source, parseOpts);
+    }
+    try {
+      return acorn.parse(source, parseOpts);
+    } catch {
+      return acornJsxParser.parse(source, parseOpts);
+    }
+  } catch (err) {
+    throw toParseError(err, filename);
   }
 }
 
 export async function parseAstAsync(
   source: string,
-  opts?: {
-    allowReturnOutsideFunction?: boolean;
-    jsx?: boolean;
-    signal?: AbortSignal;
-  },
+  opts?: ParseAstOpts,
+  filename?: string,
 ): Promise<unknown> {
-  return parseAst(source, {
-    allowReturnOutsideFunction: opts?.allowReturnOutsideFunction,
-    jsx: opts?.jsx,
-  });
+  return parseAst(source, opts, filename);
 }
 
 // prevents "unsupported platform" error when Rollup probes for native bindings

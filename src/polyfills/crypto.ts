@@ -1,5 +1,6 @@
 // Crypto polyfill using Web Crypto API with synchronous fallbacks
 
+import { scrypt as nobleScrypt } from "@noble/hashes/scrypt";
 import { Buffer } from "./buffer";
 import { EventEmitter } from "./events";
 import { digestSync, hmacSync } from "./sync-digest";
@@ -53,6 +54,13 @@ function formatOutput(raw: Uint8Array, enc?: string): string | Buffer {
   return Buffer.from(raw);
 }
 
+function toUpdateChunk(input: string | Buffer | Uint8Array, enc?: string): Buffer {
+  if (typeof input === "string") {
+    return Buffer.from(input, (enc as BufferEncoding) || "utf8");
+  }
+  return Buffer.from(input);
+}
+
 export function randomBytes(count: number): Buffer {
   const arr = new Uint8Array(count);
   crypto.getRandomValues(arr);
@@ -66,6 +74,11 @@ export function randomFillSync(
 ): Uint8Array | Buffer {
   const off = start || 0;
   const len = size !== undefined ? size : target.length - off;
+  if (off < 0 || len < 0 || off + len > target.length) {
+    throw new RangeError(
+      `The value of "offset" (${off}) + "size" (${len}) is out of range. It must be >= 0 && <= ${target.length}.`,
+    );
+  }
   const view = new Uint8Array(target.buffer, target.byteOffset + off, len);
   crypto.getRandomValues(view);
   return target;
@@ -110,13 +123,7 @@ Hash.prototype.update = function update(input: string | Buffer | Uint8Array, enc
   if (input == null) {
     throw new TypeError('The "data" argument must be of type string or an instance of Buffer, TypedArray, or DataView. Received ' + String(input));
   }
-  let chunk: Buffer;
-  if (typeof input === "string") {
-    chunk = enc === "base64" ? Buffer.from(atob(input)) : Buffer.from(input);
-  } else {
-    chunk = Buffer.from(input);
-  }
-  this._parts.push(chunk);
+  this._parts.push(toUpdateChunk(input, enc));
   return this;
 };
 
@@ -165,12 +172,11 @@ export const Hmac = function Hmac(this: any, alg: string, secret: string | Buffe
   this._parts = [];
 } as unknown as HmacConstructor;
 
-Hmac.prototype.update = function update(input: string | Buffer | Uint8Array, _enc?: string): any {
+Hmac.prototype.update = function update(input: string | Buffer | Uint8Array, enc?: string): any {
   if (input == null) {
     throw new TypeError('The "data" argument must be of type string or an instance of Buffer, TypedArray, or DataView. Received ' + String(input));
   }
-  const chunk = typeof input === "string" ? Buffer.from(input) : input;
-  this._parts.push(chunk);
+  this._parts.push(toUpdateChunk(input, enc));
   return this;
 };
 
@@ -282,18 +288,33 @@ export function pbkdf2Sync(
   return Buffer.from(derived.slice(0, keyLen));
 }
 
+export interface ScryptOptions {
+  N?: number;
+  r?: number;
+  p?: number;
+  maxmem?: number;
+}
+
 export function scrypt(
   password: BinaryInput,
   salt: BinaryInput,
   keyLen: number,
-  _opts: unknown,
-  cb: (err: Error | null, key: Buffer) => void,
+  opts: ScryptOptions | undefined | ((err: Error | null, key: Buffer) => void),
+  cb?: (err: Error | null, key: Buffer) => void,
 ): void {
+  let options: ScryptOptions | undefined;
+  let callback: (err: Error | null, key: Buffer) => void;
+  if (typeof opts === "function") {
+    callback = opts;
+  } else {
+    options = opts;
+    callback = cb!;
+  }
   try {
-    const result = scryptSync(password, salt, keyLen);
-    setTimeout(() => cb(null, result), 0);
+    const result = scryptSync(password, salt, keyLen, options);
+    setTimeout(() => callback(null, result), 0);
   } catch (e) {
-    setTimeout(() => cb(e as Error, Buffer.alloc(0)), 0);
+    setTimeout(() => callback(e as Error, Buffer.alloc(0)), 0);
   }
 }
 
@@ -301,9 +322,23 @@ export function scryptSync(
   password: BinaryInput,
   salt: BinaryInput,
   keyLen: number,
-  _opts?: unknown,
+  opts?: ScryptOptions,
 ): Buffer {
-  return pbkdf2Sync(password, salt, 16384, keyLen, "sha256");
+  const pw =
+    typeof password === "string" ? new TextEncoder().encode(password) : new Uint8Array(password);
+  const saltBytes =
+    typeof salt === "string" ? new TextEncoder().encode(salt) : new Uint8Array(salt);
+  const N = opts?.N ?? 16384;
+  const r = opts?.r ?? 8;
+  const p = opts?.p ?? 1;
+  const out = nobleScrypt(pw, saltBytes, {
+    N,
+    r,
+    p,
+    dkLen: keyLen,
+    maxmem: opts?.maxmem,
+  });
+  return Buffer.from(out);
 }
 
 type KeyMaterial =
@@ -551,7 +586,7 @@ Object.defineProperty(KeyObject.prototype, "asymmetricKeyType", {
 Object.defineProperty(KeyObject.prototype, "symmetricKeySize", {
   get: function (this: any) {
     if (this._kind !== "secret") return undefined;
-    return this._data instanceof Uint8Array ? this._data.length * 8 : undefined;
+    return this._data instanceof Uint8Array ? this._data.length : undefined;
   },
   configurable: true,
 });
@@ -581,14 +616,21 @@ export function timingSafeEqual(
   a: Buffer | Uint8Array,
   b: Buffer | Uint8Array,
 ): boolean {
-  if (a.length !== b.length) return false;
+  if (a.length !== b.length) {
+    const err = new RangeError(
+      "Input buffers must have the same byte length",
+    ) as RangeError & { code?: string };
+    err.code = "ERR_CRYPTO_TIMING_SAFE_EQUAL_LENGTH";
+    throw err;
+  }
   let diff = 0;
   for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
   return diff === 0;
 }
 
 export function getCiphers(): string[] {
-  return ["aes-128-cbc", "aes-256-cbc", "aes-128-gcm", "aes-256-gcm"];
+  // createCipheriv/createDecipheriv are unsupported — do not advertise AES
+  return [];
 }
 
 export function getHashes(): string[] {
@@ -612,50 +654,117 @@ export function generateKeySync(
 }
 
 export function generateKeyPairSync(
-  type: string,
-  options?: {
+  _type: string,
+  _options?: {
     modulusLength?: number;
     namedCurve?: string;
     publicKeyEncoding?: { type?: string; format?: string };
     privateKeyEncoding?: { type?: string; format?: string };
   },
 ): { publicKey: KeyObject | string; privateKey: KeyObject | string } {
-  const size = (options?.modulusLength || 2048) / 8;
-  const privBytes = randomBytes(size);
-  const pubBytes = randomBytes(size);
-  const privKey = new KeyObject("private", privBytes, type);
-  const pubKey = new KeyObject("public", pubBytes, type);
+  throw new Error(
+    "crypto.generateKeyPairSync is not supported in the browser polyfill (no RSA/EC key generation)",
+  );
+}
 
-  const pubEnc = options?.publicKeyEncoding;
-  const privEnc = options?.privateKeyEncoding;
+function bytesToBigInt(bytes: Uint8Array): bigint {
+  let val = 0n;
+  for (let i = 0; i < bytes.length; i++) val = (val << 8n) | BigInt(bytes[i]);
+  return val;
+}
 
-  return {
-    publicKey:
-      pubEnc?.format === "pem"
-        ? `-----BEGIN PUBLIC KEY-----\n${btoa(String.fromCharCode(...pubBytes))}\n-----END PUBLIC KEY-----`
-        : pubKey,
-    privateKey:
-      privEnc?.format === "pem"
-        ? `-----BEGIN PRIVATE KEY-----\n${btoa(String.fromCharCode(...privBytes))}\n-----END PRIVATE KEY-----`
-        : privKey,
-  };
+function bigIntToBytes(n: bigint, size?: number): Buffer {
+  if (n < 0n) throw new Error("negative bigint");
+  let hex = n.toString(16);
+  if (hex.length % 2) hex = "0" + hex;
+  let buf = Buffer.from(hex, "hex");
+  if (size !== undefined) {
+    if (buf.length > size) buf = buf.subarray(buf.length - size);
+    else if (buf.length < size) {
+      const padded = Buffer.alloc(size);
+      buf.copy(padded, size - buf.length);
+      buf = padded;
+    }
+  }
+  return buf;
+}
+
+function modPow(base: bigint, exp: bigint, mod: bigint): bigint {
+  let result = 1n;
+  let b = base % mod;
+  let e = exp;
+  while (e > 0n) {
+    if (e & 1n) result = (result * b) % mod;
+    b = (b * b) % mod;
+    e >>= 1n;
+  }
+  return result;
+}
+
+/** Miller–Rabin probable-prime test (deterministic for sizes we generate). */
+function isProbablePrime(n: bigint, rounds = 16): boolean {
+  if (n < 2n) return false;
+  if (n === 2n || n === 3n) return true;
+  if ((n & 1n) === 0n) return false;
+  const small = [3n, 5n, 7n, 11n, 13n, 17n, 19n, 23n, 29n, 31n];
+  for (const p of small) {
+    if (n === p) return true;
+    if (n % p === 0n) return false;
+  }
+  let d = n - 1n;
+  let s = 0;
+  while ((d & 1n) === 0n) {
+    d >>= 1n;
+    s++;
+  }
+  const nBits = n.toString(16).length * 4;
+  for (let i = 0; i < rounds; i++) {
+    let a: bigint;
+    do {
+      const rb = randomBytes(Math.ceil(nBits / 8) + 1);
+      a = bytesToBigInt(rb) % (n - 3n) + 2n;
+    } while (a < 2n || a >= n - 1n);
+    let x = modPow(a, d, n);
+    if (x === 1n || x === n - 1n) continue;
+    let cont = false;
+    for (let r = 1; r < s; r++) {
+      x = modPow(x, 2n, n);
+      if (x === n - 1n) {
+        cont = true;
+        break;
+      }
+    }
+    if (!cont) return false;
+  }
+  return true;
+}
+
+function randomOddBigInt(bits: number): bigint {
+  const byteLen = Math.ceil(bits / 8);
+  const bytes = randomBytes(byteLen);
+  bytes[0]! |= 0x80;
+  if (bits % 8 !== 0) {
+    bytes[0]! &= (1 << (bits % 8)) - 1;
+    bytes[0]! |= 1 << ((bits % 8) - 1);
+  }
+  bytes[bytes.length - 1]! |= 0x01;
+  return bytesToBigInt(bytes);
 }
 
 export function generatePrimeSync(
   size: number,
-  _options?: { bigint?: boolean; safe?: boolean },
+  options?: { bigint?: boolean; safe?: boolean },
 ): Buffer | bigint {
-  const bytes = randomBytes(Math.ceil(size / 8));
-  bytes[0] |= 0x80;
-  bytes[bytes.length - 1] |= 0x01;
-  if (_options?.bigint) {
-    let val = BigInt(0);
-    for (let i = 0; i < bytes.length; i++) {
-      val = (val << BigInt(8)) | BigInt(bytes[i]);
-    }
-    return val;
+  if (size < 2) throw new RangeError("size must be at least 2");
+  const safe = !!options?.safe;
+  for (;;) {
+    const candidate = randomOddBigInt(size);
+    if (!isProbablePrime(candidate)) continue;
+    // safe prime: p and (p-1)/2 are both prime
+    if (safe && !isProbablePrime((candidate - 1n) / 2n)) continue;
+    if (options?.bigint) return candidate;
+    return bigIntToBytes(candidate, Math.ceil(size / 8));
   }
-  return bytes;
 }
 
 export function generatePrime(
@@ -671,15 +780,36 @@ export function generatePrime(
   }
 }
 
-export function checkPrimeSync(_candidate: Buffer | bigint): boolean {
-  return true; // stub
+export function checkPrimeSync(
+  candidate: Buffer | bigint,
+  options?: { checks?: number },
+): boolean {
+  const n =
+    typeof candidate === "bigint" ? candidate : bytesToBigInt(new Uint8Array(candidate));
+  return isProbablePrime(n, options?.checks ?? 16);
 }
 
 export function checkPrime(
   candidate: Buffer | bigint,
-  cb: (err: Error | null, result: boolean) => void,
+  optionsOrCb?:
+    | { checks?: number }
+    | ((err: Error | null, result: boolean) => void),
+  cb?: (err: Error | null, result: boolean) => void,
 ): void {
-  setTimeout(() => cb(null, checkPrimeSync(candidate)), 0);
+  let options: { checks?: number } | undefined;
+  let callback: (err: Error | null, result: boolean) => void;
+  if (typeof optionsOrCb === "function") {
+    callback = optionsOrCb;
+  } else {
+    options = optionsOrCb;
+    callback = cb!;
+  }
+  try {
+    const result = checkPrimeSync(candidate, options);
+    setTimeout(() => callback(null, result), 0);
+  } catch (e) {
+    setTimeout(() => callback(e as Error, false), 0);
+  }
 }
 
 export function randomFill(
@@ -698,8 +828,11 @@ export function randomFill(
     offset = offsetOrCb;
     if (typeof sizeOrCb === "function") {
       callback = sizeOrCb;
+      size = buf.length - offset;
     } else if (sizeOrCb !== undefined) {
       size = sizeOrCb;
+    } else {
+      size = buf.length - offset;
     }
   }
 
@@ -756,35 +889,146 @@ export function hkdf(
   }
 }
 
-export function getDiffieHellman(_groupName: string): any {
-  return {
-    generateKeys: () => randomBytes(256),
-    computeSecret: (_other: Buffer) => randomBytes(32),
-    getPrime: () => randomBytes(256),
-    getGenerator: () => Buffer.from([2]),
-    getPublicKey: () => randomBytes(256),
-    getPrivateKey: () => randomBytes(256),
-    setPublicKey: () => {},
-    setPrivateKey: () => {},
+/** Well-known MODP primes (hex) from RFC 2409 / RFC 3526. */
+const DH_GROUPS: Record<string, { prime: string; generator: number }> = {
+  modp1: {
+    // 768-bit
+    prime:
+      "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74" +
+      "020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F1437" +
+      "4FE1356D6D51C245E485B576625E7EC6F44C42E9A63A3620FFFFFFFFFFFFFFFF",
+    generator: 2,
+  },
+  modp2: {
+    // 1024-bit
+    prime:
+      "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74" +
+      "020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F1437" +
+      "4FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7ED" +
+      "EE386BFB5A899FA5AE9F24117C4B1FE649286651ECE65381FFFFFFFFFFFFFFFF",
+    generator: 2,
+  },
+  modp5: {
+    // 1536-bit
+    prime:
+      "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74" +
+      "020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F1437" +
+      "4FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7ED" +
+      "EE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF05" +
+      "98DA48361C55D39A69163FA8FD24CF5F83655D23DCA3AD961C62F356208552BB" +
+      "9ED529077096966D670C354E4ABC9804F1746C08CA237327FFFFFFFFFFFFFFFF",
+    generator: 2,
+  },
+  modp14: {
+    // 2048-bit
+    prime:
+      "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74" +
+      "020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F1437" +
+      "4FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7ED" +
+      "EE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF05" +
+      "98DA48361C55D39A69163FA8FD24CF5F83655D23DCA3AD961C62F356208552BB" +
+      "9ED529077096966D670C354E4ABC9804F1746C08CA18217C32905E462E36CE3B" +
+      "E39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9DE2BCBF695581718" +
+      "3995497CEA956AE515D2261898FA051015728E5A8AACAA68FFFFFFFFFFFFFFFF",
+    generator: 2,
+  },
+};
+
+function makeDiffieHellman(prime: bigint, generator: bigint): any {
+  const primeBytes = bigIntToBytes(prime);
+  let priv: bigint | null = null;
+  let pub: bigint | null = null;
+
+  const dh: any = {
+    generateKeys(encoding?: string) {
+      const bits = primeBytes.length * 8;
+      do {
+        priv = bytesToBigInt(randomBytes(Math.ceil(bits / 8)));
+      } while (priv <= 1n || priv >= prime - 1n);
+      pub = modPow(generator, priv, prime);
+      const out = bigIntToBytes(pub, primeBytes.length);
+      return encoding === "hex" ? out.toString("hex") : out;
+    },
+    computeSecret(other: Buffer | Uint8Array | string, inEnc?: string, outEnc?: string) {
+      if (priv === null) throw new Error("No private key; call generateKeys() or setPrivateKey() first");
+      const otherBytes =
+        typeof other === "string"
+          ? Buffer.from(other, (inEnc as BufferEncoding) || "hex")
+          : Buffer.from(other);
+      const peer = bytesToBigInt(otherBytes);
+      const secret = modPow(peer, priv, prime);
+      const out = bigIntToBytes(secret, primeBytes.length);
+      return outEnc === "hex" ? out.toString("hex") : out;
+    },
+    getPrime(encoding?: string) {
+      return encoding === "hex" ? primeBytes.toString("hex") : Buffer.from(primeBytes);
+    },
+    getGenerator(encoding?: string) {
+      const g = bigIntToBytes(generator);
+      return encoding === "hex" ? g.toString("hex") : g;
+    },
+    getPublicKey(encoding?: string) {
+      if (pub === null) throw new Error("No public key");
+      const out = bigIntToBytes(pub, primeBytes.length);
+      return encoding === "hex" ? out.toString("hex") : out;
+    },
+    getPrivateKey(encoding?: string) {
+      if (priv === null) throw new Error("No private key");
+      const out = bigIntToBytes(priv);
+      return encoding === "hex" ? out.toString("hex") : out;
+    },
+    setPublicKey(key: Buffer | Uint8Array | string, encoding?: string) {
+      const bytes =
+        typeof key === "string" ? Buffer.from(key, (encoding as BufferEncoding) || "hex") : Buffer.from(key);
+      pub = bytesToBigInt(bytes);
+    },
+    setPrivateKey(key: Buffer | Uint8Array | string, encoding?: string) {
+      const bytes =
+        typeof key === "string" ? Buffer.from(key, (encoding as BufferEncoding) || "hex") : Buffer.from(key);
+      priv = bytesToBigInt(bytes);
+      pub = modPow(generator, priv, prime);
+    },
   };
+  return dh;
+}
+
+export function getDiffieHellman(groupName: string): any {
+  const group = DH_GROUPS[groupName.toLowerCase()];
+  if (!group) {
+    throw new Error(`Unknown Diffie-Hellman group: ${groupName}`);
+  }
+  return makeDiffieHellman(BigInt("0x" + group.prime), BigInt(group.generator));
 }
 
 export function createDiffieHellman(
-  _sizeOrPrime: number | Buffer,
-  _generator?: number | Buffer,
+  sizeOrPrime: number | Buffer,
+  generator?: number | Buffer,
 ): any {
-  return getDiffieHellman("modp14");
+  if (typeof sizeOrPrime === "number") {
+    // Generate a prime of the given bit size (expensive for large sizes)
+    const prime = generatePrimeSync(sizeOrPrime, { bigint: true }) as bigint;
+    const g =
+      generator === undefined
+        ? 2n
+        : typeof generator === "number"
+          ? BigInt(generator)
+          : bytesToBigInt(Buffer.from(generator));
+    return makeDiffieHellman(prime, g);
+  }
+  const prime = bytesToBigInt(Buffer.from(sizeOrPrime));
+  const g =
+    generator === undefined
+      ? 2n
+      : typeof generator === "number"
+        ? BigInt(generator)
+        : bytesToBigInt(Buffer.from(generator));
+  return makeDiffieHellman(prime, g);
 }
 
 export function createECDH(_curveName: string): any {
-  return {
-    generateKeys: (_enc?: string, _fmt?: string) => randomBytes(65),
-    computeSecret: (_other: Buffer) => randomBytes(32),
-    getPublicKey: (_enc?: string, _fmt?: string) => randomBytes(65),
-    getPrivateKey: (_enc?: string) => randomBytes(32),
-    setPublicKey: () => {},
-    setPrivateKey: () => {},
-  };
+  throw new Error(
+    "crypto.createECDH is not supported in the browser polyfill (no elliptic-curve implementation)",
+  );
 }
 
 export function getCurves(): string[] {

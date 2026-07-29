@@ -336,7 +336,83 @@ export const promises = {
       }
     }),
 
-  setInterval: setInterval,
+  // Node's timers/promises.setInterval returns an async iterable that yields
+  // on each tick (optionally a fixed value). AbortSignal stops the loop.
+  setInterval: (ms?: number, value?: unknown, opts?: { signal?: AbortSignal }) => {
+    const delay = normalizeDelay(ms ?? 0);
+    const signal = opts?.signal;
+    return {
+      [Symbol.asyncIterator](): AsyncIterator<unknown> {
+        let timer: TimeoutLike | null = null;
+        let pending: {
+          resolve: (r: IteratorResult<unknown>) => void;
+          reject: (e: unknown) => void;
+        } | null = null;
+        let done = false;
+
+        const finish = (err?: unknown) => {
+          done = true;
+          if (timer) {
+            clearInterval(timer);
+            timer = null;
+          }
+          if (pending) {
+            const p = pending;
+            pending = null;
+            if (err) p.reject(err);
+            else p.resolve({ value: undefined, done: true });
+          }
+        };
+
+        if (signal) {
+          if (signal.aborted) {
+            return {
+              next: () =>
+                Promise.reject(
+                  new DOMException("The operation was aborted", "AbortError"),
+                ),
+              return: () => Promise.resolve({ value: undefined, done: true }),
+            };
+          }
+          signal.addEventListener(
+            "abort",
+            () => {
+              finish(new DOMException("The operation was aborted", "AbortError"));
+            },
+            { once: true },
+          );
+        }
+
+        timer = setInterval(() => {
+          if (pending) {
+            const p = pending;
+            pending = null;
+            p.resolve({ value, done: false });
+          }
+        }, delay);
+
+        return {
+          next() {
+            if (done) {
+              return Promise.resolve({ value: undefined, done: true });
+            }
+            if (signal?.aborted) {
+              return Promise.reject(
+                new DOMException("The operation was aborted", "AbortError"),
+              );
+            }
+            return new Promise((resolve, reject) => {
+              pending = { resolve, reject };
+            });
+          },
+          return() {
+            finish();
+            return Promise.resolve({ value: undefined, done: true });
+          },
+        };
+      },
+    };
+  },
 
   // routes through the real check-phase queue so ordering matches setImmediate
   setImmediate: (value?: unknown, opts?: { signal?: AbortSignal }) =>

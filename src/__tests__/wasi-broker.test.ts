@@ -1,8 +1,13 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { EventEmitter } from "../polyfills/events";
 import { MemoryVolume } from "../memory-volume";
 import { ProcessManager } from "../threading/process-manager";
 import { buildFileSystemBridge } from "../polyfills/fs";
+import {
+  createBrowserHost,
+  resetRuntimeHost,
+  setRuntimeHost,
+} from "../host";
 
 class FakeWorker {
   static instances: FakeWorker[] = [];
@@ -23,6 +28,9 @@ class FakeWorker {
     this.terminated = true;
   }
 
+  addEventListener(): void {}
+  removeEventListener(): void {}
+
   emitMessage(data: unknown): void {
     this.onmessage?.({ data } as MessageEvent);
   }
@@ -38,9 +46,15 @@ class FakeProcessHandle extends EventEmitter {
   }
 }
 
+beforeEach(() => {
+  resetRuntimeHost();
+  setRuntimeHost(createBrowserHost());
+});
+
 afterEach(() => {
   vi.useRealTimers();
   vi.unstubAllGlobals();
+  resetRuntimeHost();
   FakeWorker.instances = [];
 });
 

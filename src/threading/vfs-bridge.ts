@@ -10,7 +10,7 @@ const VFS_CHUNK_SIZE = 4 * 1024 * 1024; // 4MB
 
 export class VFSBridge {
   private _volume: MemoryVolume;
-  private _broadcaster: ((path: string, content: ArrayBuffer | null, excludePid: number) => void) | null = null;
+  private _broadcaster: ((path: string, content: ArrayBuffer | null, isDirectory: boolean, excludePid: number) => void) | null = null;
   private _sharedVFS: SharedVFSController | null = null;
   // suppressed during handleWorkerWrite/Mkdir/Delete to prevent double-broadcasting
   private _suppressWatch = false;
@@ -20,7 +20,7 @@ export class VFSBridge {
     this._volume = volume;
   }
 
-  setBroadcaster(fn: (path: string, content: ArrayBuffer | null, excludePid: number) => void): void {
+  setBroadcaster(fn: (path: string, content: ArrayBuffer | null, isDirectory: boolean, excludePid: number) => void): void {
     this._broadcaster = fn;
   }
 
@@ -268,10 +268,10 @@ export class VFSBridge {
     }
   }
 
-  broadcastChange(path: string, content: ArrayBuffer | null, excludePid: number): void {
+  broadcastChange(path: string, content: ArrayBuffer | null, isDirectory: boolean, excludePid: number): void {
     if (isInternalVfsPath(path)) return;
     if (this._broadcaster) {
-      this._broadcaster(path, content, excludePid);
+      this._broadcaster(path, content, isDirectory, excludePid);
     }
   }
 
@@ -290,18 +290,18 @@ export class VFSBridge {
         if (this._volume.existsSync(absPath)) {
           const stat = this._volume.statSync(absPath);
           if (stat.isDirectory()) {
-            this.broadcastChange(absPath, new ArrayBuffer(0), -1);
+            this.broadcastChange(absPath, new ArrayBuffer(0), true, -1);
             if (this._sharedVFS) this._sharedVFSWriteDirectory(absPath);
           } else {
             const data = this._volume.readFileSync(absPath);
             // fresh ArrayBuffer copy — VFS nodes may store SAB-backed Uint8Arrays when written from WASM threads, and SAB isn't transferable via postMessage
             const buffer = new ArrayBuffer(data.byteLength);
             new Uint8Array(buffer).set(data);
-            this.broadcastChange(absPath, buffer, -1);
+            this.broadcastChange(absPath, buffer, false, -1);
             if (this._sharedVFS) this._sharedVFSWrite(absPath, data);
           }
         } else {
-          this.broadcastChange(absPath, null, -1);
+          this.broadcastChange(absPath, null, false, -1);
           if (this._sharedVFS) this._sharedVFS.deleteFile(absPath);
         }
       } catch (e) {

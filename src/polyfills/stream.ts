@@ -321,7 +321,10 @@ Readable.prototype.read = function read(amount?: number): any {
     return item;
   }
 
-  if (amount === undefined || amount === 0) {
+  // Node: read(0) returns null and does not consume the buffer
+  if (amount === 0) return null;
+
+  if (amount === undefined) {
     const combined = Buffer.concat(this._queue as Uint8Array[]);
     this._readableByteLength = 0;
     this._queue.length = 0;
@@ -374,23 +377,41 @@ Readable.prototype.isPaused = function isPaused(): boolean {
 
 Readable.prototype.pipe = function pipe(target: any): any {
   const self = this;
-  self.on("data", function onData(chunk: unknown) {
+  const onData = function onData(chunk: unknown) {
     const needDrain = !target.write(chunk);
     if (needDrain) {
       self.pause();
       target.once("drain", function onDrain() { self.resume(); });
     }
-  });
-  self.on("end", function onEnd() {
+  };
+  const onEnd = function onEnd() {
     target.end();
-  });
+  };
+  self.on("data", onData);
+  self.on("end", onEnd);
+  if (!self._pipeDests) self._pipeDests = [];
+  self._pipeDests.push({ dest: target, onData, onEnd });
   self.resume();
   return target;
 };
 
-Readable.prototype.unpipe = function unpipe(_target?: any): any {
-  this.removeAllListeners("data");
-  this.removeAllListeners("end");
+Readable.prototype.unpipe = function unpipe(target?: any): any {
+  const dests: Array<{ dest: any; onData: Function; onEnd: Function }> =
+    this._pipeDests || [];
+  if (target) {
+    const idx = dests.findIndex((d: any) => d.dest === target);
+    if (idx !== -1) {
+      this.removeListener("data", dests[idx].onData as any);
+      this.removeListener("end", dests[idx].onEnd as any);
+      dests.splice(idx, 1);
+    }
+  } else {
+    for (const d of dests) {
+      this.removeListener("data", d.onData as any);
+      this.removeListener("end", d.onEnd as any);
+    }
+    this._pipeDests = [];
+  }
   return this;
 };
 
@@ -758,9 +779,11 @@ Writable.prototype.write = function write(
   const encoding = typeof encOrCb === "string" ? encOrCb : "utf8";
   const callback = typeof encOrCb === "function" ? encOrCb : cb;
 
-  const bytes = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
-  this._parts.push(bytes);
-  this._writableByteLength += bufferByteLength(bytes);
+  const stored =
+    !this._objectMode && typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+  this._parts.push(stored);
+  const size = this._objectMode ? 1 : bufferByteLength(stored);
+  this._writableByteLength += size;
 
   if (this._corked > 0) {
     this._corkedWrites.push({ chunk, encoding, callback });
@@ -768,7 +791,7 @@ Writable.prototype.write = function write(
   }
 
   this._write(chunk, encoding, (err: Error | null | undefined) => {
-    this._writableByteLength -= bufferByteLength(bytes);
+    this._writableByteLength -= size;
     if (callback) callback(err);
     if (this.writableNeedDrain && this._writableByteLength < this._highWaterMark) {
       this.writableNeedDrain = false;
@@ -1087,9 +1110,13 @@ Duplex.prototype.write = function write(
   if (this._writeClosed) return false;
   const encoding = typeof encOrCb === "string" ? encOrCb : "utf8";
   const callback = typeof encOrCb === "function" ? encOrCb : cb;
-  const bytes = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
-  this._writeParts.push(bytes);
-  this._writableByteLen += bufferByteLength(bytes);
+  const stored =
+    !this._writeObjectMode && typeof chunk === "string"
+      ? Buffer.from(chunk)
+      : chunk;
+  this._writeParts.push(stored);
+  const size = this._writeObjectMode ? 1 : bufferByteLength(stored);
+  this._writableByteLen += size;
 
   if (this._duplexCorked > 0) {
     this._duplexCorkedWrites.push({ chunk, encoding, callback });
@@ -1097,7 +1124,7 @@ Duplex.prototype.write = function write(
   }
 
   this._write(chunk, encoding, (err: Error | null | undefined) => {
-    this._writableByteLen -= bufferByteLength(bytes);
+    this._writableByteLen -= size;
     if (callback) callback(err);
     if (this.writableNeedDrain && this._writableByteLen < this._writeHighWaterMark) {
       this.writableNeedDrain = false;
@@ -1282,8 +1309,11 @@ PassThrough.prototype.write = function write(
   encOrCb?: string | ((err?: Error | null) => void),
   cb?: (err?: Error | null) => void,
 ): boolean {
-  const bytes = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
-  this.push(bytes);
+  const stored =
+    !this._writeObjectMode && !this._objectMode && typeof chunk === "string"
+      ? Buffer.from(chunk)
+      : chunk;
+  this.push(stored);
   const callback = typeof encOrCb === "function" ? encOrCb : cb;
   if (callback) queueMicrotask(() => callback(null));
   return true;
@@ -1352,7 +1382,7 @@ Transform.prototype._final = function _final(
       callback(err);
       return;
     }
-    if (output) self.push(output);
+    if (output !== undefined && output !== null) self.push(output);
     finish();
   });
 };
@@ -1362,16 +1392,19 @@ Transform.prototype.write = function write(
   encOrCb?: string | ((err?: Error | null) => void),
   cb?: (err?: Error | null) => void,
 ): boolean {
-  const bytes = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+  const stored =
+    !this._writeObjectMode && !this._objectMode && typeof chunk === "string"
+      ? Buffer.from(chunk)
+      : chunk;
   const encoding = typeof encOrCb === "string" ? encOrCb : "utf8";
   const callback = typeof encOrCb === "function" ? encOrCb : cb;
 
-  this._transform(bytes, encoding, (err: Error | null | undefined, output: any) => {
+  this._transform(stored, encoding, (err: Error | null | undefined, output: any) => {
     if (err) {
       if (callback) callback(err);
       return;
     }
-    if (output) this.push(output);
+    if (output !== undefined && output !== null) this.push(output);
     if (callback) callback(null);
   });
   return true;
@@ -1382,14 +1415,29 @@ Transform.prototype.end = function end(
   encOrCb?: any,
   cb?: () => void,
 ): any {
+  // Write trailing chunk before flush so buffer-until-flush codecs see all data
+  let endCb = cb;
+  if (chunkOrCb !== undefined && typeof chunkOrCb !== "function") {
+    const encoding = typeof encOrCb === "string" ? encOrCb : undefined;
+    if (typeof encOrCb === "function") endCb = encOrCb;
+    this.write(chunkOrCb, encoding as any);
+    chunkOrCb = endCb;
+    encOrCb = undefined;
+    endCb = undefined;
+  } else if (typeof chunkOrCb === "function") {
+    endCb = chunkOrCb;
+  } else if (typeof encOrCb === "function") {
+    endCb = encOrCb;
+  }
+
   // flush eagerly so data reaches the pipe destination before _final's microtask
   if (!this._flushed) {
     this._flushed = true;
     this._flush((_err: Error | null | undefined, output: any) => {
-      if (output) this.push(output);
+      if (output !== undefined && output !== null) this.push(output);
     });
   }
-  return Duplex.prototype.end.call(this, chunkOrCb, encOrCb, cb);
+  return Duplex.prototype.end.call(this, endCb || chunkOrCb);
 };
 
 // Stream (base class)
@@ -1628,8 +1676,60 @@ StreamAny.promises = promises;
 StreamAny.getDefaultHighWaterMark = getDefaultHighWaterMark;
 StreamAny.setDefaultHighWaterMark = setDefaultHighWaterMark;
 
-export function compose(..._streams: unknown[]): Duplex {
-  return new PassThrough() as unknown as Duplex;
+export function compose(...streams: unknown[]): Duplex {
+  if (streams.length === 0) {
+    return new PassThrough() as unknown as Duplex;
+  }
+
+  for (const s of streams) {
+    if (!s || typeof (s as any).pipe !== "function") {
+      throw new TypeError("stream.compose: all arguments must be duplex/transform streams");
+    }
+  }
+
+  // Wire stream0 → stream1 → … → streamN
+  for (let i = 0; i < streams.length - 1; i++) {
+    (streams[i] as any).pipe(streams[i + 1] as any);
+  }
+
+  const first = streams[0] as any;
+  const last = streams[streams.length - 1] as any;
+
+  const outer = new Duplex({
+    write(chunk: any, enc: string, cb: (err?: Error | null) => void) {
+      try {
+        const ok = first.write(chunk, enc);
+        if (ok === false) first.once("drain", () => cb());
+        else queueMicrotask(() => cb());
+      } catch (e) {
+        cb(e as Error);
+      }
+    },
+    final(cb: (err?: Error | null) => void) {
+      try {
+        first.end();
+        queueMicrotask(() => cb());
+      } catch (e) {
+        cb(e as Error);
+      }
+    },
+    read() {},
+  }) as Duplex;
+
+  last.on("data", (chunk: any) => {
+    (outer as any).push(chunk);
+  });
+  last.on("end", () => {
+    (outer as any).push(null);
+  });
+  last.on("error", (err: Error) => {
+    (outer as any).destroy?.(err);
+  });
+  first.on("error", (err: Error) => {
+    (outer as any).destroy?.(err);
+  });
+
+  return outer;
 }
 
 export function isReadable(stream: unknown): boolean {

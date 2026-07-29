@@ -1,5 +1,6 @@
 // Utility helpers: format, inspect, inherits, promisify, deprecate, type checks, etc.
 
+import { Buffer } from "./buffer";
 
 export function format(template: unknown, ...values: unknown[]): string {
   if (typeof template !== "string") {
@@ -57,8 +58,8 @@ export function inspect(
 
     const kind = typeof val;
     if (kind === "string") return `'${val}'`;
-    if (kind === "number" || kind === "boolean" || kind === "bigint")
-      return String(val);
+    if (kind === "number" || kind === "boolean") return String(val);
+    if (kind === "bigint") return `${val as bigint}n`;
     if (kind === "symbol") return (val as symbol).toString();
     if (kind === "function") {
       const fname = (val as Function).name || "anonymous";
@@ -167,30 +168,119 @@ export function callbackify<T>(
 }
 
 export function isDeepStrictEqual(a: unknown, b: unknown): boolean {
-  if (a === b) return true;
+  return deepStrictEqualInner(a, b, new WeakMap());
+}
+
+function deepStrictEqualInner(
+  a: unknown,
+  b: unknown,
+  seen: WeakMap<object, WeakSet<object>>,
+): boolean {
+  if (Object.is(a, b)) return true;
   if (a === null || b === null) return false;
   if (typeof a !== typeof b) return false;
 
-  if (typeof a === "object") {
-    if (Array.isArray(a) && Array.isArray(b)) {
-      if (a.length !== b.length) return false;
-      return a.every((item, i) => isDeepStrictEqual(item, b[i]));
-    }
-    if (Array.isArray(a) !== Array.isArray(b)) return false;
+  if (typeof a !== "object" || typeof b !== "object") {
+    return false;
+  }
 
-    const keysA = Object.keys(a as object);
-    const keysB = Object.keys(b as object);
-    if (keysA.length !== keysB.length) return false;
+  const objA = a as object;
+  const objB = b as object;
 
-    return keysA.every((k) =>
-      isDeepStrictEqual(
-        (a as Record<string, unknown>)[k],
-        (b as Record<string, unknown>)[k],
-      ),
+  const seenB = seen.get(objA);
+  if (seenB?.has(objB)) return true;
+  if (!seenB) seen.set(objA, new WeakSet([objB]));
+  else seenB.add(objB);
+
+  if (a instanceof Date && b instanceof Date) {
+    return a.getTime() === b.getTime();
+  }
+  if (a instanceof RegExp && b instanceof RegExp) {
+    return a.source === b.source && a.flags === b.flags;
+  }
+  if (a instanceof Error && b instanceof Error) {
+    return (
+      a.name === b.name &&
+      a.message === b.message &&
+      deepStrictEqualInner(a.cause, b.cause, seen)
     );
   }
 
-  return false;
+  if (ArrayBuffer.isView(a) && ArrayBuffer.isView(b)) {
+    if (a.constructor !== b.constructor) return false;
+    const bytesA = new Uint8Array(a.buffer, a.byteOffset, a.byteLength);
+    const bytesB = new Uint8Array(b.buffer, b.byteOffset, b.byteLength);
+    if (bytesA.length !== bytesB.length) return false;
+    for (let i = 0; i < bytesA.length; i++) {
+      if (bytesA[i] !== bytesB[i]) return false;
+    }
+    return true;
+  }
+
+  if (a instanceof ArrayBuffer && b instanceof ArrayBuffer) {
+    if (a.byteLength !== b.byteLength) return false;
+    const bytesA = new Uint8Array(a);
+    const bytesB = new Uint8Array(b);
+    for (let i = 0; i < bytesA.length; i++) {
+      if (bytesA[i] !== bytesB[i]) return false;
+    }
+    return true;
+  }
+
+  if (a instanceof Map && b instanceof Map) {
+    if (a.size !== b.size) return false;
+    for (const [key, val] of a) {
+      if (!b.has(key)) return false;
+      if (!deepStrictEqualInner(val, b.get(key), seen)) return false;
+    }
+    return true;
+  }
+
+  if (a instanceof Set && b instanceof Set) {
+    if (a.size !== b.size) return false;
+    for (const item of a) {
+      let found = false;
+      for (const other of b) {
+        if (deepStrictEqualInner(item, other, seen)) {
+          found = true;
+          break;
+        }
+      }
+      if (!found) return false;
+    }
+    return true;
+  }
+
+  if (Array.isArray(a) && Array.isArray(b)) {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) {
+      if (!deepStrictEqualInner(a[i], b[i], seen)) return false;
+    }
+    return true;
+  }
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+
+  const protoA = Object.getPrototypeOf(a);
+  const protoB = Object.getPrototypeOf(b);
+  if (protoA !== protoB) return false;
+
+  const keysA = Reflect.ownKeys(objA);
+  const keysB = Reflect.ownKeys(objB);
+  if (keysA.length !== keysB.length) return false;
+
+  for (const key of keysA) {
+    if (!Object.prototype.hasOwnProperty.call(objB, key)) return false;
+    if (
+      !deepStrictEqualInner(
+        (objA as Record<PropertyKey, unknown>)[key],
+        (objB as Record<PropertyKey, unknown>)[key],
+        seen,
+      )
+    ) {
+      return false;
+    }
+  }
+  return true;
 }
 
 export function isArray(val: unknown): val is unknown[] {
@@ -233,10 +323,14 @@ export function isPrimitive(val: unknown): boolean {
   return val === null || (typeof val !== "object" && typeof val !== "function");
 }
 export function isBuffer(val: unknown): boolean {
-  return val instanceof Uint8Array;
+  return Buffer.isBuffer(val);
 }
 export function isPromise(val: unknown): val is Promise<unknown> {
-  return val instanceof Promise;
+  return (
+    typeof val === "object" &&
+    val !== null &&
+    typeof (val as Promise<unknown>).then === "function"
+  );
 }
 
 // returns a logger when NODE_DEBUG includes the given section
@@ -263,22 +357,136 @@ export function stripVTControlCharacters(text: string): string {
   );
 }
 
+function isTypedArray(val: unknown): val is ArrayBufferView {
+  return ArrayBuffer.isView(val) && !(val instanceof DataView);
+}
+
+function isUint8Array(val: unknown): val is Uint8Array {
+  return val instanceof Uint8Array;
+}
+
+function isArrayBuffer(val: unknown): val is ArrayBuffer {
+  return val instanceof ArrayBuffer;
+}
+
+function isDataView(val: unknown): val is DataView {
+  return val instanceof DataView;
+}
+
+function isAnyArrayBuffer(val: unknown): boolean {
+  return (
+    val instanceof ArrayBuffer ||
+    (typeof SharedArrayBuffer !== "undefined" && val instanceof SharedArrayBuffer)
+  );
+}
+
+function isMap(val: unknown): val is Map<unknown, unknown> {
+  return val instanceof Map;
+}
+
+function isSet(val: unknown): val is Set<unknown> {
+  return val instanceof Set;
+}
+
+function isBooleanObject(val: unknown): boolean {
+  return (
+    typeof val === "object" &&
+    val !== null &&
+    Object.prototype.toString.call(val) === "[object Boolean]"
+  );
+}
+
+function isNumberObject(val: unknown): boolean {
+  return (
+    typeof val === "object" &&
+    val !== null &&
+    Object.prototype.toString.call(val) === "[object Number]"
+  );
+}
+
+function isStringObject(val: unknown): boolean {
+  return (
+    typeof val === "object" &&
+    val !== null &&
+    Object.prototype.toString.call(val) === "[object String]"
+  );
+}
+
+function isSymbolObject(val: unknown): boolean {
+  return (
+    typeof val === "object" &&
+    val !== null &&
+    Object.prototype.toString.call(val) === "[object Symbol]"
+  );
+}
+
+function isBoxedPrimitive(val: unknown): boolean {
+  return (
+    isBooleanObject(val) ||
+    isNumberObject(val) ||
+    isStringObject(val) ||
+    isSymbolObject(val) ||
+    (typeof val === "object" &&
+      val !== null &&
+      Object.prototype.toString.call(val) === "[object BigInt]")
+  );
+}
+
+function isAsyncFunction(val: unknown): boolean {
+  return Object.prototype.toString.call(val) === "[object AsyncFunction]";
+}
+
+function isGeneratorFunction(val: unknown): boolean {
+  return Object.prototype.toString.call(val) === "[object GeneratorFunction]";
+}
+
+function isGeneratorObject(val: unknown): boolean {
+  return Object.prototype.toString.call(val) === "[object Generator]";
+}
+
+function isNativeError(val: unknown): val is Error {
+  return (
+    val instanceof Error ||
+    (typeof val === "object" &&
+      val !== null &&
+      Object.prototype.toString.call(val).endsWith("Error]"))
+  );
+}
+
+function isProxy(val: unknown): boolean {
+  try {
+    // Best-effort: only detectable via Proxy revocable / no reliable runtime check.
+    // Match Node's util.types.isProxy when unavailable by returning false.
+    void val;
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 export const types = {
-  isArray,
-  isBoolean,
-  isNull,
-  isNullOrUndefined,
-  isNumber,
-  isString,
-  isUndefined,
-  isRegExp,
-  isObject,
   isDate,
-  isError,
-  isFunction,
-  isPrimitive,
-  isBuffer,
+  isRegExp,
+  isNativeError,
+  isError: isNativeError,
+  isMap,
+  isSet,
   isPromise,
+  isTypedArray,
+  isUint8Array,
+  isArrayBuffer,
+  isDataView,
+  isAnyArrayBuffer,
+  isBoxedPrimitive,
+  isBooleanObject,
+  isNumberObject,
+  isStringObject,
+  isSymbolObject,
+  isAsyncFunction,
+  isGeneratorFunction,
+  isGeneratorObject,
+  isProxy,
+  isBuffer,
 };
 
 // styleText (Node.js 21.7+)

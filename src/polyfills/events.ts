@@ -145,6 +145,8 @@ EventEmitter.prototype.once = function once(name: string, handler: EventHandler)
     self.removeListener(name, wrapper);
     handler.apply(self, payload);
   };
+  // Node exposes the original on wrapper.listener so removeListener(original) works
+  (wrapper as any).listener = handler;
   // use _ensureSlot directly, not addListener, to avoid recursion
   const slot = _ensureSlot(this, name);
   slot.push(wrapper);
@@ -154,7 +156,13 @@ EventEmitter.prototype.once = function once(name: string, handler: EventHandler)
 EventEmitter.prototype.removeListener = function removeListener(name: string, handler: EventHandler): any {
   const slot = _reg(this).get(name);
   if (slot) {
-    const pos = slot.indexOf(handler);
+    let pos = slot.indexOf(handler);
+    if (pos === -1) {
+      // once-wrappers: match by .listener === original handler (Node parity)
+      pos = slot.findIndex(
+        (fn) => (fn as any).listener === handler,
+      );
+    }
     if (pos !== -1) {
       slot.splice(pos, 1);
     }
@@ -258,6 +266,7 @@ EventEmitter.prototype.prependOnceListener = function prependOnceListener(name: 
     self.removeListener(name, wrapper);
     handler.apply(self, payload);
   };
+  (wrapper as any).listener = handler;
   return this.prependListener(name, wrapper);
 };
 

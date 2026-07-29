@@ -3,12 +3,14 @@
 
 import pako from "pako";
 import { MemoryVolume } from "../memory-volume";
+import { proxiedFetch } from "../cross-origin";
 import * as path from "../polyfills/path";
 import { offload, taskId, TaskPriority } from "../threading/offload";
 import type { ExtractResult } from "../threading/offload-types";
 import { base64ToBytes } from "../helpers/byte-encoding";
 import { precompileWasm } from "../helpers/wasm-cache";
 import { getTarballCache } from "../persistence/tarball-cache";
+import { digestSync } from "../polyfills/sync-digest";
 
 // skip round-tripping very large tarballs back from the worker just to cache
 const TARBALL_CACHE_MAX_BYTES = 20 * 1024 * 1024;
@@ -58,6 +60,26 @@ export interface ExtractionOptions {
   onProgress?: (msg: string) => void;
   /** expected sha1 hex from the npm registry, checked after download */
   expectedShasum?: string;
+  /** npm lockfile SRI, e.g. `sha512-<base64>` — verified on main after download */
+  expectedIntegrity?: string;
+}
+
+function verifySri(bytes: ArrayBuffer, integrity: string, url: string): void {
+  const m = /^sha(256|384|512)-([A-Za-z0-9+/=]+)$/.exec(integrity.trim());
+  if (!m) {
+    throw new Error(`Unsupported integrity algorithm for ${url}: ${integrity}`);
+  }
+  const alg = `SHA-${m[1]}` as "SHA-256" | "SHA-384" | "SHA-512";
+  const expectedB64 = m[2];
+  const digest = digestSync(alg, new Uint8Array(bytes));
+  let binary = "";
+  for (let i = 0; i < digest.length; i++) binary += String.fromCharCode(digest[i]!);
+  const actualB64 = btoa(binary);
+  if (actualB64 !== expectedB64) {
+    throw new Error(
+      `Integrity check failed for ${url}: expected ${integrity}, got ${alg.toLowerCase().replace("-", "")}-${actualB64}`,
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -143,9 +165,11 @@ export function* parseTarArchive(raw: Uint8Array): Generator<ArchiveEntry> {
     if (kind === "file") {
       payload =
         byteSize > 0 ? raw.slice(cursor, cursor + byteSize) : new Uint8Array(0);
-      if (byteSize > 0) {
-        cursor += Math.ceil(byteSize / BLOCK) * BLOCK;
-      }
+    }
+    // Always advance past payload blocks (PAX/GNU/link may carry size) to
+    // keep the stream aligned even when we skip materializing the entry.
+    if (byteSize > 0) {
+      cursor += Math.ceil(byteSize / BLOCK) * BLOCK;
     }
 
     yield {
@@ -244,11 +268,15 @@ export async function downloadAndExtract(
   }
 
   if (!cachedBytes) {
-    const response = await fetch(url);
+    const response = await proxiedFetch(url);
     if (!response.ok) {
       throw new Error(`Archive download failed (HTTP ${response.status}): ${url}`);
     }
     cachedBytes = await response.arrayBuffer();
+  }
+
+  if (opts.expectedIntegrity) {
+    verifySri(cachedBytes, opts.expectedIntegrity, url);
   }
 
   const extractionId = taskId();
@@ -340,7 +368,7 @@ export async function downloadAndExtractDirect(
     cache = null;
   }
 
-  const response = await fetch(url);
+  const response = await proxiedFetch(url);
   if (!response.ok) {
     throw new Error(
       `Archive download failed (HTTP ${response.status}): ${url}`,

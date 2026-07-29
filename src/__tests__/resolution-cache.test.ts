@@ -17,6 +17,7 @@ describe("resolution graph cache", () => {
       await gate;
       return new Map([["pkg", {
         name: "pkg",
+        fetchName: "pkg",
         version: "1.0.0",
         tarballUrl: "https://example.test/pkg.tgz",
         dependencies: { dep: "^1" },

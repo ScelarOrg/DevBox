@@ -8,12 +8,18 @@ export interface NodepodOptions {
   files?: Record<string, string | Uint8Array>;
   env?: Record<string, string>;
   workdir?: string;
+  /**
+   * Headless mode: no terminal/preview UI required. Defaults `serviceWorker`
+   * and `watermark` to false (can still be overridden). Implied when importing
+   * from `@scelar/nodepod/headless`.
+   */
+  headless?: boolean;
   /** URL of the nodepod service worker. Defaults to `/__sw__.js`. */
   swUrl?: string;
   /**
    * Set to `false` to skip SW registration (SSR, Node tests, or hosts
    * that don't need preview iframes / virtual HTTP servers). Defaults to
-   * `true` when `navigator.serviceWorker` is available.
+   * `true` when `navigator.serviceWorker` is available, or `false` in headless.
    */
   serviceWorker?: boolean;
   /**
@@ -72,6 +78,15 @@ export interface NodepodOptions {
    * the built library when omitted; the embedded copy remains the fallback.
    */
   workerUrl?: string;
+}
+
+/** Options for `Nodepod.request()` — programmatic HTTP against a virtual server. */
+export interface NodepodRequestOptions {
+  method?: string;
+  /** Path + query, e.g. `/api/health`. Defaults to `/`. */
+  path?: string;
+  headers?: Record<string, string>;
+  body?: string | ArrayBuffer | Uint8Array | null;
 }
 
 /* ---- Terminal ---- */

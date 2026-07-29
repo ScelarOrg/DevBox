@@ -94,6 +94,55 @@ MessagePort.prototype.unref = function unref(this: any): void {
   (this._elHandle as Handle | null)?.unref();
 };
 
+// emnapi (@emnapi/runtime) keeps Node alive during napi async work /
+// ThreadsafeFunction activity via:
+//   refHandle = new MessageChannel().port1
+//   increaseWaitingRequestCounter → refHandle.ref()
+//   decreaseWaitingRequestCounter → refHandle.unref()
+// It prefers globalThis.MessageChannel when present. In the browser that is
+// the host MessageChannel, whose MessagePort has no ref/unref — so the
+// keep-alive is a silent no-op and fire-and-forget CLIs (vite's bin calls
+// start() without await; cac actions are floating promises) drain mid-build.
+// Install Node-shaped ref/unref only when missing; never replace a working
+// implementation (real Node, or a prior install). Does not touch readline,
+// stdin, or Worker unref semantics.
+const _hostPortHandles = new WeakMap<object, Handle>();
+
+export function installHostMessagePortKeepAlive(opts?: {
+  force?: boolean;
+}): void {
+  const MP = (globalThis as { MessagePort?: { prototype: object } }).MessagePort;
+  if (typeof MP !== "function" && typeof MP !== "object") return;
+  const proto = MP.prototype as {
+    ref?: () => void;
+    unref?: () => void;
+    __nodepodRefPatched?: boolean;
+  };
+  if (!proto) return;
+  if (proto.__nodepodRefPatched && !opts?.force) return;
+  // leave Node's (or any existing) ref/unref alone unless tests force a reinstall
+  if (
+    !opts?.force &&
+    typeof proto.ref === "function" &&
+    typeof proto.unref === "function"
+  ) {
+    return;
+  }
+
+  proto.ref = function ref(this: object): void {
+    let h = _hostPortHandles.get(this);
+    if (!h) {
+      h = getRegistry().register("MessagePort");
+      _hostPortHandles.set(this, h);
+    } else {
+      h.ref();
+    }
+  };
+  proto.unref = function unref(this: object): void {
+    _hostPortHandles.get(this)?.unref();
+  };
+  proto.__nodepodRefPatched = true;
+}
 
 export interface MessageChannel {
   port1: MessagePort;
@@ -394,4 +443,5 @@ export default {
   setWorkerThreadForkCallback,
   getWorkerThreadForkCallback,
   setWorkerConstructorOverride,
+  installHostMessagePortKeepAlive,
 };

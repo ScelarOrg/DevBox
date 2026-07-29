@@ -43,8 +43,12 @@ export const WriteStream = function WriteStream(this: any) {
   this.rows = 40;
 } as unknown as { new(): WriteStream; prototype: any };
 
-WriteStream.prototype.getColorDepth = function getColorDepth(): number { return 8; };
+WriteStream.prototype.getColorDepth = function getColorDepth(): number {
+  // Non-TTY streams do not advertise color (Node returns 1)
+  return this.isTTY ? 8 : 1;
+};
 WriteStream.prototype.hasColors = function hasColors(count?: number): boolean {
+  if (!this.isTTY) return false;
   return (count ?? 1) <= 256;
 };
 WriteStream.prototype.getWindowSize = function getWindowSize(): [number, number] {

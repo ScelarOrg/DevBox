@@ -110,9 +110,9 @@ out of this batch for scope, risk, or because they're larger design efforts.
   (Web Crypto AES wrappers); its own plan when a consumer needs it.
 - **Polyfill: sync XHR wasm fallback freezes the tab** (`fs.ts:1391-1394`) — M
   effort, MED risk; couples with the install-time precompile path.
-- **Shell: `npm ci` ignores lockfile, `npm audit` always clean, no `2>`
-  redirection, `${VAR-default}` empty-as-unset** (`shell/**`) — a cluster of
-  shell-fidelity fixes worth their own batch.
+- **Shell fidelity (addressed):** `npm ci` lockfile-aware, real `npm audit`,
+  `2>` / `2>>` redirects, POSIX `${VAR-default}` / `${VAR:-default}` — see
+  `src/packages/pm-cli.ts` and shell parser/interpreter updates.
 - **Tests: no coverage for install pipeline / ProcessManager / SW / SDK spawn**
   — the harness plan referenced above; high leverage as a prerequisite.
 - **DX: no lint/formatter/pre-commit; no AGENTS.md; CONTRIBUTING omits

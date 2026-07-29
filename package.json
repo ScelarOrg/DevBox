@@ -1,6 +1,6 @@
 {
   "name": "@scelar/nodepod",
-  "version": "1.9.13",
+  "version": "1.9.14",
   "description": "Browser-native Node.js runtime environment",
   "type": "module",
   "license": "MIT WITH Commons-Clause",
@@ -42,6 +42,16 @@
       "require": {
         "types": "./dist/index.d.ts",
         "default": "./dist/index.cjs"
+      }
+    },
+    "./headless": {
+      "import": {
+        "types": "./dist/headless.d.ts",
+        "default": "./dist/headless.mjs"
+      },
+      "require": {
+        "types": "./dist/headless.d.ts",
+        "default": "./dist/headless.cjs"
       }
     },
     "./server": {

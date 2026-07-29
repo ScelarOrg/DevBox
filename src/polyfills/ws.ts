@@ -1,7 +1,7 @@
 // ws-compatible WebSocket polyfill wrapping browser native WebSocket
 
 
-import { encodeFrame, decodeFrame } from "./http";
+import { encodeFrame, decodeFrame, WS_GUID } from "./http";
 import { Buffer } from "./buffer";
 import { createHash } from "./crypto";
 import type { TcpSocket } from "./net";
@@ -34,11 +34,32 @@ const SafeMessageEvent: typeof MessageEvent =
         }
       } as unknown as typeof MessageEvent);
 
-// in-process server <-> client messaging via BroadcastChannel
-let internalChannel: BroadcastChannel | null = null;
-try {
-  internalChannel = new BroadcastChannel('nodepod-ws-bridge');
-} catch { /* not available */ }
+// in-process server <-> client messaging via BroadcastChannel.
+// Each participant needs its OWN channel instance: BC does not deliver
+// postMessage back to the same BroadcastChannel object that sent it.
+const WS_BC_NAME = "nodepod-ws-bridge";
+let _bcAvailable: boolean | null = null;
+
+function bcAvailable(): boolean {
+  if (_bcAvailable !== null) return _bcAvailable;
+  try {
+    const probe = new BroadcastChannel(WS_BC_NAME);
+    probe.close();
+    _bcAvailable = true;
+  } catch {
+    _bcAvailable = false;
+  }
+  return _bcAvailable;
+}
+
+function openBridgeChannel(): BroadcastChannel | null {
+  if (!bcAvailable()) return null;
+  try {
+    return new BroadcastChannel(WS_BC_NAME);
+  } catch {
+    return null;
+  }
+}
 
 const activeServers = new Map<string, WebSocketServer>();
 let nextClientId = 0;
@@ -104,12 +125,15 @@ export interface WebSocket extends TinyEmitter {
   _tcpSocket: TcpSocket | null;
   _tcpInboundBuf: Uint8Array;
   _elHandle: Handle | null;
+  _bc: BroadcastChannel | null;
+  _bcMsgHandler: ((ev: MessageEvent) => void) | null;
   onopen: ((ev: Event) => void) | null;
   onclose: ((ev: CloseEvent) => void) | null;
   onerror: ((ev: Event) => void) | null;
   onmessage: ((ev: MessageEvent) => void) | null;
   _open(): void;
   _openNative(): void;
+  _failOpen(reason: string): void;
   send(payload: string | ArrayBuffer | Uint8Array): void;
   close(code?: number, reason?: string): void;
   ping(): void;
@@ -149,6 +173,8 @@ export const WebSocket = function WebSocket(this: any, address: string, protocol
   this._native = null;
   this._tcpSocket = null;
   this._tcpInboundBuf = new Uint8Array(0);
+  this._bc = null;
+  this._bcMsgHandler = null;
   this.onopen = null;
   this.onclose = null;
   this.onerror = null;
@@ -157,7 +183,13 @@ export const WebSocket = function WebSocket(this: any, address: string, protocol
   this._elHandle = getRegistry().register("WebSocket");
   if (protocols) this.protocol = Array.isArray(protocols) ? protocols[0] : protocols;
   const self = this;
-  setTimeout(() => self._open(), 0);
+  // Server-side loopback sockets must be OPEN before handleUpgrade/BC emit
+  // 'connection', so callers can send immediately (matches `ws` package).
+  if (address.startsWith("internal://")) {
+    this._open();
+  } else {
+    setTimeout(() => self._open(), 0);
+  }
 } as unknown as WebSocketConstructor;
 
 Object.setPrototypeOf(WebSocket.prototype, TinyEmitter.prototype);
@@ -166,6 +198,39 @@ Object.setPrototypeOf(WebSocket.prototype, TinyEmitter.prototype);
 (WebSocket as any).OPEN = OPEN;
 (WebSocket as any).CLOSING = CLOSING;
 (WebSocket as any).CLOSED = CLOSED;
+
+WebSocket.prototype._closeBridge = function _closeBridge(this: any): void {
+  if (this._bc && this._bcMsgHandler) {
+    try {
+      this._bc.removeEventListener("message", this._bcMsgHandler);
+    } catch {
+      /* */
+    }
+  }
+  if (this._bc) {
+    try {
+      this._bc.close();
+    } catch {
+      /* */
+    }
+  }
+  this._bc = null;
+  this._bcMsgHandler = null;
+};
+
+WebSocket.prototype._failOpen = function _failOpen(this: any, reason: string): void {
+  this._closeBridge();
+  this.readyState = CLOSED;
+  const ee = new Event('error');
+  (ee as any).message = reason;
+  this.emit('error', ee);
+  this.onerror?.(ee);
+  const ce = new SafeCloseEvent('close', { code: 1006, reason, wasClean: false });
+  this.emit('close', ce);
+  this.onclose?.(ce);
+  (this._elHandle as Handle | null)?.close();
+  this._elHandle = null;
+};
 
 WebSocket.prototype._open = function _open(this: any): void {
   // Internal loopback connection (server-side socket)
@@ -182,26 +247,22 @@ WebSocket.prototype._open = function _open(this: any): void {
     return;
   }
 
-  // BroadcastChannel-based in-process connection
-  if (!internalChannel) {
-    const self = this;
-    setTimeout(() => {
-      self.readyState = OPEN;
-      self.emit('open');
-      self.onopen?.(new Event('open'));
-    }, 0);
+  // BroadcastChannel-based in-process connection (own channel instance)
+  const chan = openBridgeChannel();
+  if (!chan) {
+    this._failOpen('No BroadcastChannel available for in-process WebSocket');
     return;
   }
+  this._bc = chan;
 
-  internalChannel.postMessage({ kind: 'connect', uid: this._uid, url: this.url });
-
-  const chan = internalChannel;
   const self = this;
+  let settled = false;
   const onMsg = (ev: MessageEvent) => {
     const d = ev.data;
     if (d.targetUid !== self._uid) return;
 
     if (d.kind === 'connected') {
+      settled = true;
       self.readyState = OPEN;
       self.emit('open');
       self.onopen?.(new Event('open'));
@@ -216,21 +277,22 @@ WebSocket.prototype._open = function _open(this: any): void {
       self.onclose?.(ce);
       (self._elHandle as Handle | null)?.close();
       self._elHandle = null;
-      chan.removeEventListener('message', onMsg);
+      self._closeBridge();
     } else if (d.kind === 'fault') {
+      settled = true;
       const ee = new Event('error');
       self.emit('error', ee);
       self.onerror?.(ee);
     }
   };
+  this._bcMsgHandler = onMsg;
   chan.addEventListener('message', onMsg);
+  chan.postMessage({ kind: 'connect', uid: this._uid, url: this.url });
 
-  // If nobody responds within 100 ms, consider the socket "open" anyway
+  // No ack → fail closed (do not force-OPEN)
   setTimeout(() => {
-    if (self.readyState === CONNECTING) {
-      self.readyState = OPEN;
-      self.emit('open');
-      self.onopen?.(new Event('open'));
+    if (!settled && self.readyState === CONNECTING) {
+      self._failOpen('WebSocket connection timed out waiting for server ack');
     }
   }, 100);
 };
@@ -242,12 +304,7 @@ WebSocket.prototype._openNative = function _openNative(this: any): void {
     : null;
 
   if (!NativeImpl) {
-    const self = this;
-    setTimeout(() => {
-      self.readyState = OPEN;
-      self.emit('open');
-      self.onopen?.(new Event('open'));
-    }, 0);
+    this._failOpen('No native WebSocket available');
     return;
   }
 
@@ -319,8 +376,8 @@ WebSocket.prototype.send = function send(this: any, payload: string | ArrayBuffe
 
   if (this._boundServer) { this._boundServer._injectClientPayload(this, payload); return; }
 
-  if (internalChannel) {
-    internalChannel.postMessage({ kind: 'payload', uid: this._uid, url: this.url, body: payload });
+  if (this._bc) {
+    this._bc.postMessage({ kind: 'payload', uid: this._uid, url: this.url, body: payload });
   }
 };
 
@@ -355,8 +412,8 @@ WebSocket.prototype.close = function close(this: any, code?: number, reason?: st
     return;
   }
 
-  if (internalChannel) {
-    internalChannel.postMessage({ kind: 'disconnect', uid: this._uid, url: this.url, code, reason });
+  if (this._bc) {
+    this._bc.postMessage({ kind: 'disconnect', uid: this._uid, url: this.url, code, reason });
   }
 
   const self = this;
@@ -365,6 +422,7 @@ WebSocket.prototype.close = function close(this: any, code?: number, reason?: st
     const ce = new SafeCloseEvent('close', { code: code || 1000, reason: reason || '', wasClean: true });
     self.emit('close', ce);
     self.onclose?.(ce);
+    self._closeBridge();
     releaseHandle();
   }, 0);
 };
@@ -375,6 +433,7 @@ WebSocket.prototype.pong = function pong(): void { /* no-op in browser */ };
 WebSocket.prototype.terminate = function terminate(this: any): void {
   if (this._native) { this._native.close(); this._native = null; }
   if (this._tcpSocket) { try { this._tcpSocket.destroy(); } catch { /* */ } this._tcpSocket = null; }
+  this._closeBridge();
   this.readyState = CLOSED;
   (this._elHandle as Handle | null)?.close();
   this._elHandle = null;
@@ -402,8 +461,6 @@ WebSocket.prototype._deliverMessage = function _deliverMessage(this: any, data: 
 };
 
 // Sec-WebSocket-Accept key computation (RFC 6455)
-const WS_GUID = '258EAFA5-E914-47DA-95CA-5AB5DC76CB76';
-
 function _computeAcceptKey(wsKey: string): string {
   try {
     const hash = createHash('sha1');
@@ -430,6 +487,7 @@ export interface WebSocketServer extends TinyEmitter {
   clients: Set<WebSocket>;
   options: ServerConfig;
   _route: string;
+  _bc: BroadcastChannel | null;
   _channelCb: ((ev: MessageEvent) => void) | null;
   _listen(): void;
   _injectClientPayload(source: WebSocket, data: unknown): void;
@@ -450,6 +508,7 @@ export const WebSocketServer = function WebSocketServer(this: any, opts: ServerC
   this.clients = new Set<WebSocket>();
   this.options = opts;
   this._route = opts.path || '/';
+  this._bc = null;
   this._channelCb = null;
 
   if (!opts.noServer) this._listen();
@@ -458,15 +517,33 @@ export const WebSocketServer = function WebSocketServer(this: any, opts: ServerC
 
 Object.setPrototypeOf(WebSocketServer.prototype, TinyEmitter.prototype);
 
+function _pathFromUrl(url: string): string {
+  try {
+    // Absolute or path-only
+    if (url.startsWith('/')) {
+      const q = url.indexOf('?');
+      return q === -1 ? url : url.slice(0, q);
+    }
+    const u = new URL(url, 'http://localhost');
+    return u.pathname || '/';
+  } catch {
+    return '/';
+  }
+}
+
 WebSocketServer.prototype._listen = function _listen(this: any): void {
-  if (!internalChannel) return;
-  const chan = internalChannel;
+  const chan = openBridgeChannel();
+  if (!chan) return;
+  this._bc = chan;
   const self = this;
 
   this._channelCb = (ev: MessageEvent) => {
     const d = ev.data;
 
     if (d.kind === 'connect') {
+      const connectPath = _pathFromUrl(d.url || '/');
+      if (connectPath !== self._route) return;
+
       const sock = new WebSocket('internal://' + self._route);
       sock._bindServer(self);
       (sock as unknown as { _uid: string })._uid = d.uid;
@@ -476,10 +553,13 @@ WebSocketServer.prototype._listen = function _listen(this: any): void {
     }
 
     if (d.kind === 'payload') {
-      for (const c of self.clients) {
-        if ((c as unknown as { _uid: string })._uid === d.uid) {
-          c._deliverMessage(d.body);
-          break;
+      // Client → server: match by uid
+      if (d.uid) {
+        for (const c of self.clients) {
+          if ((c as unknown as { _uid: string })._uid === d.uid) {
+            c._deliverMessage(d.body);
+            break;
+          }
         }
       }
     }
@@ -497,9 +577,12 @@ WebSocketServer.prototype._listen = function _listen(this: any): void {
   chan.addEventListener('message', this._channelCb);
 };
 
-WebSocketServer.prototype._injectClientPayload = function _injectClientPayload(source: WebSocket, data: unknown): void {
-  const me = new SafeMessageEvent('message', { data });
-  source.emit('message', me);
+WebSocketServer.prototype._injectClientPayload = function _injectClientPayload(this: any, source: WebSocket, data: unknown): void {
+  // Server → client: deliver to the peer via BC (never echo to source)
+  if (this._bc) {
+    const uid = (source as unknown as { _uid: string })._uid;
+    this._bc.postMessage({ kind: 'payload', targetUid: uid, body: data });
+  }
 };
 
 WebSocketServer.prototype.handleUpgrade = function handleUpgrade(
@@ -592,10 +675,9 @@ WebSocketServer.prototype.handleUpgrade = function handleUpgrade(
     });
   }
 
-  const self = this;
+  // Match `ws` package: only invoke the callback. Callers emit 'connection' themselves.
   setTimeout(() => {
     done(sock, req);
-    self.emit('connection', sock, req);
   }, 0);
 };
 
@@ -603,9 +685,21 @@ WebSocketServer.prototype.close = function close(this: any, done?: (err?: Error)
   for (const c of this.clients) c.close(1001, 'Server closing');
   this.clients.clear();
   activeServers.delete(this._route);
-  if (this._channelCb && internalChannel) {
-    internalChannel.removeEventListener('message', this._channelCb);
+  if (this._channelCb && this._bc) {
+    try {
+      this._bc.removeEventListener('message', this._channelCb);
+    } catch {
+      /* */
+    }
     this._channelCb = null;
+  }
+  if (this._bc) {
+    try {
+      this._bc.close();
+    } catch {
+      /* */
+    }
+    this._bc = null;
   }
   this.emit('close');
   if (done) setTimeout(done, 0);

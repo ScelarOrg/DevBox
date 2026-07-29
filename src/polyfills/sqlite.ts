@@ -480,8 +480,12 @@ class SyncOps {
     if (typeof value === "number") {
       if (Number.isInteger(value)) {
         if (value > 0x7fffffff || value < -0x80000000) {
-          const lo = value & 0xffffffff;
-          const hi = value < 0 ? -1 : 0;
+          // JS bitwise ops ToInt32-truncate, so split via BigInt. Using
+          // `hi = value < 0 ? -1 : 0` silently stored Date.now() ms as ~1970
+          // and broke Better Auth session expiry checks.
+          const big = BigInt(value);
+          const lo = Number(big & 0xffffffffn);
+          const hi = Number((big >> 32n) & 0xffffffffn);
           rc = this.module._sqlite3_bind_int64(stmt, index, lo, hi);
         } else {
           rc = this.module._sqlite3_bind_int(stmt, index, value);
@@ -494,7 +498,7 @@ class SyncOps {
     }
     if (typeof value === "bigint") {
       const lo = Number(value & 0xffffffffn);
-      const hi = Number(value >> 32n);
+      const hi = Number((value >> 32n) & 0xffffffffn);
       rc = this.module._sqlite3_bind_int64(stmt, index, lo, hi);
       this.check(rc, db);
       return;

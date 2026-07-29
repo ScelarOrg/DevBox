@@ -149,6 +149,24 @@ const content = await nodepod.fs.readFile('/test.txt', 'utf8'); // "hello"
 
 Source: [`src/sdk/nodepod.ts`](src/sdk/nodepod.ts) — `Nodepod.boot()`, `spawn()`, `createTerminal()`.
 
+### Headless mode (browser or Node)
+
+Same SDK surface without terminal/preview UI. HTTP works via `pod.request()`; on Node a localhost ingress also exposes `/__virtual__/{instanceId}/{port}/...` URLs.
+
+```typescript
+// Browser / isomorphic — Web Workers, no Service Worker by default
+import { Nodepod } from "@scelar/nodepod";
+const pod = await Nodepod.boot({ headless: true });
+const res = await pod.request(3000, { method: "GET", path: "/" });
+
+// Node / Bun agents & CI — worker_threads + local HTTP
+import { Nodepod } from "@scelar/nodepod/headless";
+const nodePod = await Nodepod.boot();
+await fetch(`${nodePod.port(3000)}/`);
+```
+
+Host seam: [`src/host/`](src/host/) (`RuntimeHost`, browser vs Node adapters). Entry: [`src/headless.ts`](src/headless.ts).
+
 ---
 
 <a id="architecture-overview"></a>
@@ -177,7 +195,7 @@ Here's how the pieces fit together at the highest level:
 ├─────────────────────────────────────────────────────────┤
 │                  Shell Interpreter                         │
 │  Tokenizer → Parser → AST → Interpreter                   │
-│  60+ built-in commands (ls, grep, cat, sed, find, git, ...)    │
+│  53+ builtins + npm/git/node tools (ls, grep, cat, sed, ...)   │
 │  (src/shell/)                                             │
 ├─────────────────────────────────────────────────────────┤
 │                 Package Management                         │
@@ -530,12 +548,11 @@ Pure POSIX: `join`, `resolve`, `normalize`, `dirname`, `basename`, `extname`, `r
 
 **Source:** [`src/polyfills/crypto.ts`](src/polyfills/crypto.ts)
 
-- **Random**: `randomBytes()`, `randomUUID()`, `randomInt()` via `crypto.getRandomValues()`
-- **Hash**: `createHash('sha256')` — async via `crypto.subtle.digest()`, sync via `mixHash()` (deterministic pseudo-hash)
-- **HMAC**: `createHmac(alg, secret)` — same async/sync split
-- **KDF**: `pbkdf2`, `scrypt`, `hkdfSync`
-- **KeyObject**, `timingSafeEqual`, `getCiphers`/`getHashes`
-- `createCipheriv`/`createDecipheriv` throw — real symmetric encryption not supported
+- **Random**: `randomBytes()`, `randomUUID()`, `randomInt()`, `randomFill`/`randomFillSync` via `crypto.getRandomValues()`
+- **Hash / HMAC**: async via `crypto.subtle`; sync via [`sync-digest.ts`](src/polyfills/sync-digest.ts) (real SHA-1/256/384/512/MD5 + HMAC)
+- **KDF**: real `pbkdf2` / `pbkdf2Sync` / `hkdfSync`; real `scrypt`/`scryptSync` via `@noble/hashes`
+- **KeyObject**, `timingSafeEqual` (throws on length mismatch), `getCiphers`/`getHashes`
+- Gaps: `createCipheriv`/`createDecipheriv` throw; sync asymmetric `sign`/`verify` throw; prime/key-pair generation is stubbed
 
 <a id="polyfill-net"></a>
 ### Net (TCP)
@@ -610,7 +627,7 @@ Impossible to implement in the browser:
 
 | Module | Behavior |
 |--------|----------|
-| `dns` | All lookups return `127.0.0.1` / `0.0.0.0`, `promises` namespace included |
+| `dns` | Lookups via Cloudflare DNS-over-HTTPS; localhost short-circuits to `127.0.0.1` |
 | `vm` | Uses browser `eval()` / `new Function()` — no real V8 isolates. `Script` class, `createContext`, `compileFunction`, `Module`/`SourceTextModule`/`SyntheticModule` stubs |
 | `v8` | Returns zeros for all heap stats, JSON-based `serialize`/`deserialize` |
 | `tls`, `dgram`, `cluster`, `http2`, `inspector`, `domain`, `diagnostics_channel`, `async_hooks` | Throw on use |
@@ -694,9 +711,9 @@ Recursive-descent producing `ListNode` → `PipelineNode` → `CommandNode` AST.
 <a id="shell-builtins"></a>
 ### Built-in Commands
 
-60+ commands organized into 11 specialized modules under `src/shell/commands/`:
+53+ builtins across 5 modules under `src/shell/commands/`, plus registered tools (`node`, `npx`, `npm`/`pnpm`/`yarn`/`bun`/`bunx`, `git`) and interpreter specials (`alias`, `source`, `history`, `sh -c`). Redirects include `>`, `>>`, `<`, `2>&1`, `2>`, and `2>>`.
 
-**File ops** (`file-ops.ts`): `cat` (-n/-b/-s/-E/-T/-A), `head` (-n/-c), `tail`, `touch`, `cp` (-r), `mv`, `rm` (-rf), `mkdir` (-p), `rmdir` (-p), `chmod`, `wc` (-l/-w/-c/-m/-L), `tee` (-a), `readlink`, `ln`, `write`
+**File ops** (`file-ops.ts`): `cat` (-n/-b/-s/-E/-T/-A), `head` (-n/-c), `tail`, `touch`, `cp` (-r), `mv`, `rm` (-rf), `mkdir` (-p), `rmdir` (-p), `chmod` (stores file modes via VFS), `wc` (-l/-w/-c/-m/-L), `tee` (-a), `readlink` / `ln` (real VFS symlinks and hard links), `write`
 
 **Directory** (`directory.ts`): `ls` (-l/-a/-A/-R/-1/-h/-S/-t/-r/-F/-d/-i with ANSI colors), `cd` (including `cd -`), `pwd`, `basename`, `dirname`, `realpath`
 
@@ -704,13 +721,13 @@ Recursive-descent producing `ListNode` → `PipelineNode` → `CommandNode` AST.
 
 **Search** (`search.ts`): `find` (-name/-iname/-type/-maxdepth/-size/-mtime/-empty/-delete/-exec), `xargs` (-n/-I/-0)
 
-**Shell env** (`shell-env.ts`): `export`, `unset`, `env`, `which` (-a), `type`, `true`/`false`, `exit`, `clear`, `test`/`[` (full POSIX), `date` (format strings), `sleep`
+**Shell env** (`shell-env.ts`): `export`, `unset`, `env`, `which` (-a), `type`, `true`/`false`, `exit`, `clear`, `test`/`[` (including `-h`/`-L` symlink checks), `date` (format strings), `sleep`
 
-**Package managers** (`npm.ts`, `pnpm.ts`, `yarn.ts`, `bun.ts`): CLI frontends for the virtual package installer
+**Package managers** (`npm.ts`, `pnpm.ts`, `yarn.ts`, `bun.ts` + `src/packages/pm-cli.ts`): install/run/exec plus real `outdated`/`audit`/`ping`/`whoami`/`fund`/`cache clean`, `.npmrc` config, `npm pkg`, lockfile-aware `npm ci`, and `npm pack` tarballs. Global installs (`-g`) are rejected.
 
 **Node runner** (`node.ts`): `node` command dispatch
 
-**Git** (`git.ts`, ~2,100 lines): Full in-memory git implementation — one of the largest files in the project. Supports `init`, `add`, `commit`, `status`, `log`, `diff`, `branch`, `checkout`, `merge`, `clone`, `push`, `pull`, `remote`, `tag`, `stash`, and more, all operating on the virtual filesystem
+**Git** (`git.ts`): In-memory git on the VFS. Local: `init`, `add`, `commit`, `status`, `log`, `show`, `diff`, `branch`, `checkout`/`switch`, `restore`, `clean`, `merge` (3-way with conflicts), `cherry-pick`, `revert`, `rebase` (linear), `tag`, `blame`, `stash`, `reset`, `rm`, `rev-parse`, `config`. Remotes (`clone`/`push`/`pull`/`fetch`) use the GitHub API when `GITHUB_TOKEN` is set — not the raw git protocol.
 
 ---
 
@@ -1058,7 +1075,7 @@ The result: you can `npm install` real packages, run real frameworks, and serve 
 | Total source files | ~120 TypeScript files |
 | ScriptEngine | ~3,375 lines |
 | Polyfill files | 50+ |
-| Shell builtins | 60+ commands |
+| Shell builtins | 53+ commands + registered tools |
 | Shell code (parser + interpreter + commands) | ~6,600 lines |
 | child_process polyfill | ~2,288 lines |
 | Threading system | 16 files |

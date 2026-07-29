@@ -175,10 +175,34 @@ describe("shell builtins", () => {
       expect(result.exitCode).toBe(1);
     });
 
+    it("-c with zero matches prints 0 and exits 1", async () => {
+      const ctx = makeCtx({ "/f.txt": "hello\n" });
+      const result = await run("grep", ["-c", "xyz", "/f.txt"], ctx);
+      expect(strip(result.stdout).trim()).toBe("0");
+      expect(result.exitCode).toBe(1);
+    });
+
+    it("-c with matches exits 0", async () => {
+      const ctx = makeCtx({ "/f.txt": "hello\nhello\n" });
+      const result = await run("grep", ["-c", "hello", "/f.txt"], ctx);
+      expect(strip(result.stdout).trim()).toBe("2");
+      expect(result.exitCode).toBe(0);
+    });
+
     it("reads from stdin when no files", async () => {
       const ctx = makeCtx();
       const result = await run("grep", ["hello"], ctx, "hello world\nfoo\n");
       expect(strip(result.stdout)).toContain("hello");
+    });
+  });
+
+  describe("sed", () => {
+    it("$ addresses the last real line when file ends with newline", async () => {
+      const ctx = makeCtx({ "/f.txt": "one\ntwo\nthree\n" });
+      const result = await run("sed", ["$s/three/LAST/", "/f.txt"], ctx);
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain("LAST");
+      expect(result.stdout).not.toMatch(/three/);
     });
   });
 
@@ -352,6 +376,68 @@ describe("shell builtins", () => {
       const ctx = makeCtx();
       await run("export", ["FOO=bar"], ctx);
       expect(ctx.env.FOO).toBe("bar");
+    });
+  });
+
+  describe("find -exec quoting", () => {
+    it("quotes paths with spaces so -exec does not retokenize", async () => {
+      const ctx = makeCtx({ "/my file.txt": "data" });
+      ctx.exec = async (cmd) => {
+        // Without quoting this would be: echo /my file.txt → 2 args after echo
+        const words = cmd.match(/(?:'[^']*'|"[^"]*"|[^\s]+)/g) ?? [];
+        return {
+          stdout: words.slice(1).join("|") + "\n",
+          stderr: "",
+          exitCode: 0,
+        };
+      };
+      const result = await run(
+        "find",
+        ["/", "-name", "*.txt", "-exec", "echo", "{}", ";"],
+        ctx,
+      );
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toBe("'/my file.txt'");
+    });
+  });
+
+  describe("chmod ln readlink", () => {
+    it("chmod stores file mode", async () => {
+      const ctx = makeCtx({ "/f.txt": "x" });
+      const result = await run("chmod", ["755", "/f.txt"], ctx);
+      expect(result.exitCode).toBe(0);
+      expect(ctx.volume.statSync("/f.txt").mode & 0o777).toBe(0o755);
+    });
+
+    it("ln -s creates a symlink", async () => {
+      const ctx = makeCtx({ "/target.txt": "data" });
+      const result = await run("ln", ["-s", "/target.txt", "/link.txt"], ctx);
+      expect(result.exitCode).toBe(0);
+      expect(ctx.volume.lstatSync("/link.txt").isSymbolicLink()).toBe(true);
+      expect(ctx.volume.readlinkSync("/link.txt")).toBe("/target.txt");
+    });
+
+    it("ln creates a hard link", async () => {
+      const ctx = makeCtx({ "/a.txt": "shared" });
+      const result = await run("ln", ["/a.txt", "/b.txt"], ctx);
+      expect(result.exitCode).toBe(0);
+      expect(ctx.volume.readFileSync("/b.txt", "utf8")).toBe("shared");
+    });
+
+    it("readlink returns symlink target", async () => {
+      const ctx = makeCtx({ "/target.txt": "data" });
+      ctx.volume.symlinkSync("/target.txt", "/link.txt");
+      const result = await run("readlink", ["/link.txt"], ctx);
+      expect(result.stdout).toBe("/target.txt\n");
+    });
+
+    it("test -h detects symlink", async () => {
+      const ctx = makeCtx({ "/target.txt": "data" });
+      ctx.volume.symlinkSync("/target.txt", "/link.txt");
+      const yes = await run("test", ["-h", "/link.txt"], ctx);
+      const no = await run("test", ["-h", "/target.txt"], ctx);
+      expect(yes.exitCode).toBe(0);
+      expect(no.exitCode).toBe(1);
     });
   });
 });

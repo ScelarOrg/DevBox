@@ -8,10 +8,14 @@ import { RegistryClient, VersionDetail } from "./registry-client";
 
 export interface ResolvedDependency {
   name: string;
+  /** Registry name used for fetch (differs from `name` for npm: aliases). */
+  fetchName: string;
   version: string;
   tarballUrl: string;
   dependencies: Record<string, string>;
   shasum?: string;
+  /** npm lockfile SRI (sha512-…) when installing from a lock entry */
+  integrity?: string;
 }
 
 export interface ResolutionConfig {
@@ -70,9 +74,33 @@ export function compareSemver(left: string, right: string): number {
   if (a.prerelease && !b.prerelease) return -1;
   if (!a.prerelease && b.prerelease) return 1;
   if (a.prerelease && b.prerelease) {
-    return a.prerelease.localeCompare(b.prerelease);
+    return comparePrereleaseIds(a.prerelease, b.prerelease);
   }
 
+  return 0;
+}
+
+/** Semver prerelease identifier compare: numeric by number, else ASCII. */
+function comparePrereleaseIds(left: string, right: string): number {
+  const aParts = left.split(".");
+  const bParts = right.split(".");
+  const len = Math.max(aParts.length, bParts.length);
+  for (let i = 0; i < len; i++) {
+    if (i >= aParts.length) return -1;
+    if (i >= bParts.length) return 1;
+    const aNum = /^\d+$/.test(aParts[i]);
+    const bNum = /^\d+$/.test(bParts[i]);
+    if (aNum && bNum) {
+      const diff = Number(aParts[i]) - Number(bParts[i]);
+      if (diff !== 0) return diff;
+    } else if (aNum !== bNum) {
+      // numeric identifiers have lower precedence than non-numeric
+      return aNum ? -1 : 1;
+    } else {
+      const cmp = aParts[i].localeCompare(bParts[i]);
+      if (cmp !== 0) return cmp;
+    }
+  }
   return 0;
 }
 
@@ -139,22 +167,33 @@ export function satisfiesRange(version: string, range: string): boolean {
   }
 
   if (range.startsWith("^")) {
-    const base = padVersion(range.slice(1));
+    const caretRaw = range.slice(1).trim();
+    const base = padVersion(caretRaw);
     const bv = parseSemver(base);
     if (!bv) return false;
 
     if (sv.major !== bv.major) return false;
     if (bv.major === 0) {
       if (bv.minor !== 0 && sv.minor !== bv.minor) return false;
-      if (bv.minor === 0 && sv.minor !== 0) return false;
+      // ^0.0.x pins patch: only that exact 0.0.patch (and compatible prereleases)
+      if (bv.minor === 0) {
+        if (sv.minor !== 0) return false;
+        if (sv.patch !== bv.patch) return false;
+      }
     }
     return compareSemver(version, base) >= 0;
   }
 
   if (range.startsWith("~")) {
-    const base = padVersion(range.slice(1));
+    const tildeRaw = range.slice(1).trim();
+    const parts = tildeRaw.replace(/[xX*]/g, "0").split(".");
+    const base = padVersion(tildeRaw);
     const bv = parseSemver(base);
     if (!bv) return false;
+    // ~1 => >=1.0.0 <2.0.0; ~1.2 => >=1.2.0 <1.3.0
+    if (parts.length === 1) {
+      return sv.major === bv.major && compareSemver(version, base) >= 0;
+    }
     return (
       sv.major === bv.major &&
       sv.minor === bv.minor &&
@@ -176,10 +215,11 @@ export function satisfiesRange(version: string, range: string): boolean {
   if (
     range.includes("x") ||
     range.includes("X") ||
+    range.includes("*") ||
     /^\d+$/.test(range) ||
     /^\d+\.\d+$/.test(range)
   ) {
-    const segments = range.replace(/[xX]/g, "").split(".").filter(Boolean);
+    const segments = range.replace(/[xX*]/g, "").split(".").filter(Boolean);
     if (segments.length === 1) return sv.major === Number(segments[0]);
     if (segments.length === 2) {
       return (
@@ -314,6 +354,7 @@ export async function resolveFromManifest(
   manifest: {
     dependencies?: Record<string, string>;
     devDependencies?: Record<string, string>;
+    optionalDependencies?: Record<string, string>;
   },
   config: ResolutionConfig = {},
 ): Promise<Map<string, ResolvedDependency>> {
@@ -325,6 +366,11 @@ export async function resolveFromManifest(
     Object.assign(allDeps, manifest.devDependencies);
   }
 
+  const optionalRoot =
+    config.optionalDependencies && manifest.optionalDependencies
+      ? Object.entries(manifest.optionalDependencies)
+      : [];
+
   const entries = Object.entries(allDeps);
 
   // Claim root slots for every direct manifest dep before walking transitive
@@ -335,9 +381,25 @@ export async function resolveFromManifest(
     await walkDependency(depName, depRange, state, "", { walkEdges: false });
   }
 
+  for (const [depName, depRange] of optionalRoot) {
+    try {
+      await walkDependency(depName, depRange, state, "", { walkEdges: false });
+    } catch {
+      /* optional root deps may fail to resolve */
+    }
+  }
+
   // Walk transitive and peer edges for each direct manifest dependency.
   for (const [depName] of entries) {
     await walkDependencyEdges(depName, state);
+  }
+
+  for (const [depName] of optionalRoot) {
+    try {
+      await walkDependencyEdges(depName, state);
+    } catch {
+      /* optional root edge walks may fail */
+    }
   }
 
   return state.completed;
@@ -394,7 +456,11 @@ async function walkDependency(
       );
       deferred.resolve(resolved);
     } catch (err) {
+      // Drop the claim so a later hard edge can retry; silence the deferred
+      // rejection so soft-fail optional walks don't emit unhandledRejection.
+      rootPromises.delete(installName);
       deferred.reject(err);
+      void deferred.promise.catch(() => {});
       throw err;
     }
     return;
@@ -507,6 +573,7 @@ async function installPackageAt(
 
   const resolved: ResolvedDependency = {
     name: installName,
+    fetchName,
     version: chosenVersion,
     tarballUrl: versionInfo.dist.tarball,
     dependencies: versionInfo.dependencies || {},
@@ -528,7 +595,7 @@ async function walkDependencyEdges(
   const resolved = state.completed.get(placementKey);
   if (!resolved) return;
 
-  const metadata = await state.registry.fetchManifest(resolved.name);
+  const metadata = await state.registry.fetchManifest(resolved.fetchName);
   const versionInfo = metadata.versions[resolved.version];
   if (!versionInfo) return;
 
@@ -540,6 +607,19 @@ async function walkDependencyEdges(
   );
 }
 
+async function walkOptionalSoft(
+  childName: string,
+  childRange: string,
+  state: TreeWalkState,
+  placementKey: string,
+): Promise<void> {
+  try {
+    await walkDependency(childName, childRange, state, placementKey);
+  } catch {
+    /* optional dependency failures are ignored */
+  }
+}
+
 async function walkEdgesForPackage(
   placementKey: string,
   installName: string,
@@ -548,6 +628,7 @@ async function walkEdgesForPackage(
 ): Promise<void> {
   // non-optional peers are included (npm v7+ behaviour)
   const edges: Record<string, string> = {};
+  const optionalEdges: Record<string, string> = {};
 
   if (versionInfo.peerDependencies) {
     const peerMeta = versionInfo.peerDependenciesMeta || {};
@@ -570,7 +651,7 @@ async function walkEdgesForPackage(
 
     if (state.config.optionalDependencies) {
       for (const [optName, optRange] of optEntries) {
-        edges[optName] = optRange as string;
+        optionalEdges[optName] = optRange as string;
       }
     } else {
       // Always include wasm32-wasi optional deps — they're WASM alternatives
@@ -579,7 +660,7 @@ async function walkEdgesForPackage(
       let hasWasmVariant = false;
       for (const [optName, optRange] of Object.entries(versionInfo.optionalDependencies)) {
         if (optName.includes("wasm32-wasi") || optName.includes("wasm")) {
-          edges[optName] = optRange as string;
+          optionalEdges[optName] = optRange as string;
           hasWasmVariant = true;
         }
       }
@@ -595,7 +676,7 @@ async function walkEdgesForPackage(
         if (allPlatform) {
           const wasmAltsToTry = [installName + "-wasm32-wasi", installName + "-wasm"];
           await Promise.all(wasmAltsToTry.map(async (alt) => {
-            try { await walkDependency(alt, "*", state, placementKey); } catch { /* package may not exist */ }
+            await walkOptionalSoft(alt, "*", state, placementKey);
           }));
         }
       }
@@ -610,6 +691,16 @@ async function walkEdgesForPackage(
     await Promise.all(
       chunk.map(([childName, childRange]) =>
         walkDependency(childName, childRange, state, placementKey),
+      ),
+    );
+  }
+
+  const optList = Object.entries(optionalEdges);
+  for (let start = 0; start < optList.length; start += PARALLEL_LIMIT) {
+    const chunk = optList.slice(start, start + PARALLEL_LIMIT);
+    await Promise.all(
+      chunk.map(([childName, childRange]) =>
+        walkOptionalSoft(childName, childRange, state, placementKey),
       ),
     );
   }

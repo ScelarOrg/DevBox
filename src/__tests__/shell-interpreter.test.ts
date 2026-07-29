@@ -106,6 +106,33 @@ describe("NodepodShell", () => {
       const result = await shell.exec("cat < /in.txt");
       expect(result.stdout).toBe("file content");
     });
+
+    it("2> writes stderr to file", async () => {
+      const { vol, shell } = createShell();
+      const result = await shell.exec("ls /missing 2> /err.txt");
+      expect(result.stderr).toBe("");
+      expect(vol.readFileSync("/err.txt", "utf8").length).toBeGreaterThan(0);
+      expect(result.exitCode).not.toBe(0);
+    });
+
+    it("2>> appends stderr to file", async () => {
+      const { vol, shell } = createShell({ "/err.txt": "prev\n" });
+      await shell.exec("ls /missing 2>> /err.txt");
+      const content = vol.readFileSync("/err.txt", "utf8");
+      expect(content.startsWith("prev\n")).toBe(true);
+      expect(content.length).toBeGreaterThan("prev\n".length);
+    });
+  });
+
+  describe("history", () => {
+    it("records and prints command history", async () => {
+      const { shell } = createShell();
+      await shell.exec("echo one");
+      await shell.exec("echo two");
+      const result = await shell.exec("history");
+      expect(result.stdout).toContain("echo one");
+      expect(result.stdout).toContain("echo two");
+    });
   });
 
   describe("environment variables", () => {

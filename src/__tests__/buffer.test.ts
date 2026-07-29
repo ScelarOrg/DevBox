@@ -25,6 +25,12 @@ describe("Buffer", () => {
       expect(buf.toString()).toBe("hello");
     });
 
+    it("creates buffer from ascii as single-byte (not utf8)", () => {
+      const buf = Buffer.from("é", "ascii");
+      expect(buf.length).toBe(1);
+      expect(buf[0]).toBe(0xe9);
+    });
+
     it("creates buffer from utf16le string", () => {
       const buf = Buffer.from("A\u{1f642}", "utf16le");
       expect(Array.from(buf)).toEqual([0x41, 0x00, 0x3d, 0xd8, 0x42, 0xde]);
@@ -63,6 +69,16 @@ describe("Buffer", () => {
       const buf = Buffer.alloc(5, 0xff);
       expect(buf.every((b: number) => b === 255)).toBe(true);
     });
+
+    it("fills with a string character", () => {
+      const buf = Buffer.alloc(5, "a");
+      expect(buf.every((b: number) => b === 0x61)).toBe(true);
+    });
+
+    it("repeats a multi-byte fill pattern", () => {
+      const buf = Buffer.alloc(5, "ab");
+      expect(Array.from(buf)).toEqual([0x61, 0x62, 0x61, 0x62, 0x61]);
+    });
   });
 
   describe("Buffer.write", () => {
@@ -94,6 +110,20 @@ describe("Buffer", () => {
       const buf = Buffer.from("only");
       const result = Buffer.concat([buf]);
       expect(result.toString()).toBe("only");
+    });
+
+    it("truncates to totalLength", () => {
+      const result = Buffer.concat([Buffer.from("hello"), Buffer.from("world")], 7);
+      expect(result.toString()).toBe("hellowo");
+      expect(result.length).toBe(7);
+    });
+
+    it("zero-pads when totalLength exceeds sum", () => {
+      const result = Buffer.concat([Buffer.from("hi")], 5);
+      expect(result.length).toBe(5);
+      expect(result.slice(0, 2).toString()).toBe("hi");
+      expect(result[2]).toBe(0);
+      expect(result[4]).toBe(0);
     });
   });
 
@@ -167,6 +197,11 @@ describe("Buffer", () => {
     it("equals returns false for different content", () => {
       expect(Buffer.from("test").equals(Buffer.from("nope"))).toBe(false);
     });
+
+    it("Buffer.compare is a static wrapper", () => {
+      expect(Buffer.compare(Buffer.from("abc"), Buffer.from("abd"))).toBeLessThan(0);
+      expect(Buffer.compare(Buffer.from("abc"), Buffer.from("abc"))).toBe(0);
+    });
   });
 
   describe("indexOf", () => {
@@ -178,6 +213,13 @@ describe("Buffer", () => {
     it("returns -1 when not found", () => {
       const buf = Buffer.from([1, 2, 3]);
       expect(buf.indexOf(99)).toBe(-1);
+    });
+
+    it("lastIndexOf finds subsequence from the end", () => {
+      const buf = Buffer.from("abcabc");
+      expect(buf.lastIndexOf("abc")).toBe(3);
+      expect(buf.lastIndexOf(Buffer.from("ab"))).toBe(3);
+      expect(buf.lastIndexOf(0x61)).toBe(3);
     });
   });
 
@@ -300,6 +342,12 @@ describe("Buffer", () => {
 
     it("byteLength returns correct length for base64", () => {
       expect(Buffer.byteLength("SGVsbG8=", "base64")).toBe(5);
+    });
+
+    it("byteLength uses single-byte length for latin1/ascii", () => {
+      expect(Buffer.byteLength("é", "latin1")).toBe(1);
+      expect(Buffer.byteLength("é", "ascii")).toBe(1);
+      expect(Buffer.byteLength("é", "utf8")).toBe(2);
     });
   });
 

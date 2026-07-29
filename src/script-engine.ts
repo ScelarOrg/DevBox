@@ -140,113 +140,7 @@ import {
 import { buildCdnWasmUrl } from "./helpers/wasm-cdn";
 import { getRegistry } from "./helpers/event-loop";
 import * as acorn from "acorn";
-
-// ── TypeScript type stripper ──
-// Regex-based stripping of TS syntax so acorn/eval can handle it at runtime.
-
-function stripTypeScript(source: string): string {
-  let s = source;
-
-  s = s.replace(
-    /^\s*declare\s+(module|namespace|global)\s+[^{]*\{[^}]*(?:\{[^}]*\}[^}]*)*\}/gm,
-    "",
-  );
-  s = s.replace(
-    /^\s*declare\s+(?:const|let|var|function|class|enum|type|interface)\s+[^;\n]+[;\n]/gm,
-    "",
-  );
-
-  s = s.replace(
-    /^\s*(?:export\s+)?interface\s+\w+(?:\s+extends\s+[^{]+)?\s*\{[^}]*(?:\{[^}]*\}[^}]*)*\}/gm,
-    "",
-  );
-
-  s = s.replace(/^\s*(?:export\s+)?type\s+\w+(?:<[^>]*>)?\s*=\s*[^;]+;/gm, "");
-
-  s = s.replace(
-    /^\s*export\s+type\s*\{[^}]*\}\s*(?:from\s*['"][^'"]*['"])?\s*;?/gm,
-    "",
-  );
-  s = s.replace(
-    /^\s*import\s+type\s+(?:\{[^}]*\}|\w+)\s*(?:from\s*['"][^'"]*['"])?\s*;?/gm,
-    "",
-  );
-
-  s = s.replace(/\bas\s+const\b/g, "");
-  s = s.replace(/\s+as\s+(?:[A-Z][\w.<>,\s|&\[\]]*)/g, "");
-
-  s = s.replace(
-    /(function\s+\w+|(?:const|let|var)\s+\w+\s*=\s*(?:async\s+)?(?:function\s*)?)\s*<[^(]*?>\s*\(/g,
-    "$1(",
-  );
-
-  // Strip type annotations from params and return types
-  s = s.replace(
-    /:\s*(?:readonly\s+)?(?:[A-Z][\w.<>,\s|&\[\]]*|string|number|boolean|void|any|never|unknown|null|undefined|object|bigint)(?:\s*\|\s*(?:[A-Z][\w.<>,\s|&\[\]]*|string|number|boolean|void|any|never|unknown|null|undefined|object|bigint))*/g,
-    (match, offset) => {
-      // Heuristic: only strip if we're in a signature context, not object literals
-      const before = s.slice(Math.max(0, offset - 40), offset);
-      if (/[,(?]\s*\w+\s*\??$/.test(before)) return "";
-      if (/\)\s*$/.test(before)) return "";
-      if (/\(\s*\w+\s*\??$/.test(before)) return "";
-      if (/\b(?:const|let|var)\s+\w+$/.test(before)) return "";
-      return match;
-    },
-  );
-
-  s = s.replace(/(\w)!\./g, "$1.");
-  s = s.replace(/(\w)!\)/g, "$1)");
-  s = s.replace(/(\w)!\,/g, "$1,");
-
-  s = s.replace(
-    /(?<!=)\s*<(?:string|number|boolean|any|unknown|never|void|object|bigint|Record|Partial|Required|Readonly|Pick|Omit|Extract|Exclude|Array|Promise|Set|Map)\b[^>]*>/g,
-    "",
-  );
-
-  // Convert enums to plain objects
-  s = s.replace(
-    /^\s*(?:export\s+)?(?:const\s+)?enum\s+(\w+)\s*\{([^}]*)\}/gm,
-    (_, name, body) => {
-      const entries = body
-        .split(",")
-        .map((e: string) => e.trim())
-        .filter(Boolean);
-      const obj: string[] = [];
-      let autoVal = 0;
-      for (const entry of entries) {
-        const eqIdx = entry.indexOf("=");
-        if (eqIdx !== -1) {
-          const key = entry.slice(0, eqIdx).trim();
-          const val = entry.slice(eqIdx + 1).trim();
-          obj.push(`${JSON.stringify(key)}: ${val}`);
-          const numVal = Number(val);
-          if (!isNaN(numVal)) autoVal = numVal + 1;
-        } else {
-          obj.push(`${JSON.stringify(entry)}: ${autoVal}`);
-          autoVal++;
-        }
-      }
-      return `var ${name} = {${obj.join(", ")}};`;
-    },
-  );
-
-  s = s.replace(/^\s*(public|private|protected)?\s*readonly\s+/gm, "$1 ");
-  s = s.replace(/\b(public|private|protected)\s+(?=\w+[\s,):])/g, "");
-  s = s.replace(/\babstract\s+(class|extends)/g, "$1");
-  s = s.replace(/\bimplements\s+[\w.,\s<>]+(?=\s*\{)/g, "");
-  s = s.replace(/\boverride\s+(?=\w)/g, "");
-
-  return s;
-}
-
-function isTypeScriptFile(filename: string): boolean {
-  const clean = filename.split("?")[0];
-  if (clean.endsWith(".ts") || clean.endsWith(".tsx") || clean.endsWith(".mts"))
-    return true;
-  // Vite SFC query params like ?type=script&lang.ts
-  if (filename.includes("lang.ts") || filename.includes("lang=ts")) return true;
-  return false;
-}
+import { isTypeScriptFile, stripTypeScript } from "./strip-typescript";
 
 // CSS files must never go through stripTypeScript
 function isCSSFile(filename: string): boolean {
@@ -1141,6 +1035,24 @@ const CORE_MODULES: Record<string, unknown> = {
   zlib: compressionPolyfill,
   dns: dnsPolyfill,
   child_process: shellExecProxy,
+  "child_process/promises": new Proxy({} as any, {
+    get(_t, prop) {
+      if (!_shellExecPolyfill?.promises) return undefined;
+      return _shellExecPolyfill.promises[prop];
+    },
+    ownKeys() {
+      if (!_shellExecPolyfill?.promises) return [];
+      return Reflect.ownKeys(_shellExecPolyfill.promises);
+    },
+    getOwnPropertyDescriptor(_t, prop) {
+      if (!_shellExecPolyfill?.promises) return undefined;
+      return Object.getOwnPropertyDescriptor(_shellExecPolyfill.promises, prop);
+    },
+    has(_t, prop) {
+      if (!_shellExecPolyfill?.promises) return false;
+      return prop in _shellExecPolyfill.promises;
+    },
+  }),
   assert: assertPolyfill,
   string_decoder: stringDecoderPolyfill,
   timers: timersPolyfill,
@@ -1185,6 +1097,7 @@ const CORE_MODULES: Record<string, unknown> = {
   "path/win32": pathPolyfill.win32,
   "timers/promises": timersPromises,
   "stream/promises": streamPromises,
+  "zlib/promises": compressionPolyfill.promises,
   "stream/web": {
     ReadableStream: globalThis.ReadableStream,
     WritableStream: globalThis.WritableStream,
@@ -1265,6 +1178,13 @@ const CORE_MODULES: Record<string, unknown> = {
   _stream_passthrough: PassThrough,
   // Vite imports rollup/parseAst which normally uses native bindings
   "rollup/parseAst": {
+    parseAst: rollupPolyfill.parseAst,
+    parseAstAsync: rollupPolyfill.parseAstAsync,
+  },
+  // Vite 8+ imports rolldown/parseAst → oxc wrap(binding.parse()). The WASM
+  // binding's parse can return undefined, so wrap crashes on `.errors`. Serve
+  // the same acorn Program AST rollup/parseAst already provides.
+  "rolldown/parseAst": {
     parseAst: rollupPolyfill.parseAst,
     parseAstAsync: rollupPolyfill.parseAstAsync,
   },
@@ -1808,7 +1728,7 @@ function buildResolver(
         processedCode = processedCode.slice(processedCode.indexOf("\n") + 1);
       }
       if (isTypeScriptFile(resolved)) {
-        processedCode = stripTypeScript(processedCode);
+        processedCode = stripTypeScript(processedCode, resolved);
       }
       if (resolved.endsWith(".cjs")) {
         // CJS: only rewrite import()/import.meta via AST, skip full ESM conversion
@@ -2205,6 +2125,15 @@ function buildResolver(
     }
     if (CORE_MODULES[resolved]) return CORE_MODULES[resolved];
 
+    // package exports resolve rolldown/parseAst to a concrete file; still
+    // short-circuit so we never hit the broken binding.parse → wrap(.errors) path
+    if (
+      /\/rolldown\/dist\/parse-ast-index\.(mjs|js|cjs)$/.test(resolved) ||
+      resolved.endsWith("/rolldown/parseAst")
+    ) {
+      return CORE_MODULES["rolldown/parseAst"];
+    }
+
     let rec: ModuleRecord;
     try {
       rec = loadModule(resolved, resolver._ownerRecord);
@@ -2336,6 +2265,9 @@ export class ScriptEngine {
     } else {
       this.transformCache = new Map();
     }
+    // before any napi-rs / emnapi package loads: host MessagePort.ref must
+    // keep the event loop alive (emnapi WaitingRequestCounter).
+    threadPoolPolyfill.installHostMessagePortKeepAlive();
     this.vol = vol;
     this.proc = buildProcessEnv({
       cwd: opts.cwd || "/",
@@ -2534,14 +2466,6 @@ export class ScriptEngine {
       (globalThis as any).URL = PatchedURL;
     }
 
-    if (typeof globalThis.setImmediate === "undefined") {
-      (globalThis as any).setImmediate = (
-        fn: (...a: unknown[]) => void,
-        ...a: unknown[]
-      ) => setTimeout(fn, 0, ...a);
-      (globalThis as any).clearImmediate = (id: number) => clearTimeout(id);
-    }
-
     // Browsers disallow sync WebAssembly.Module() for >8MB buffers — serve from cache
     if (
       typeof WebAssembly !== "undefined" &&
@@ -2586,6 +2510,7 @@ export class ScriptEngine {
     // timers need .ref/.unref to match node's API and have to register
     // Handles so the loop knows about pending work. delegate to the
     // node:timers polyfill, it wires everything through getRegistry().
+    // setImmediate uses the MessageChannel check-phase queue (not setTimeout(0)).
     if (!(globalThis.setTimeout as any).__nodepodPatched) {
       (globalThis as any).setTimeout = Object.assign(timersPolyfill.setTimeout, {
         __nodepodPatched: true,
@@ -2596,6 +2521,17 @@ export class ScriptEngine {
       );
       (globalThis as any).clearTimeout = timersPolyfill.clearTimeout;
       (globalThis as any).clearInterval = timersPolyfill.clearInterval;
+      (globalThis as any).setImmediate = Object.assign(
+        timersPolyfill.setImmediate,
+        { __nodepodPatched: true },
+      );
+      (globalThis as any).clearImmediate = timersPolyfill.clearImmediate;
+    } else if (!(globalThis.setImmediate as any)?.__nodepodPatched) {
+      (globalThis as any).setImmediate = Object.assign(
+        timersPolyfill.setImmediate,
+        { __nodepodPatched: true },
+      );
+      (globalThis as any).clearImmediate = timersPolyfill.clearImmediate;
     }
 
     this.patchStackTraceApi();
@@ -2878,7 +2814,7 @@ export class ScriptEngine {
     if (processed.startsWith("#!"))
       processed = processed.slice(processed.indexOf("\n") + 1);
     if (isTypeScriptFile(filename)) {
-      processed = stripTypeScript(processed);
+      processed = stripTypeScript(processed, filename);
     }
     let fileHasTLA = false;
     if (filename.endsWith(".cjs")) {
@@ -3021,7 +2957,7 @@ export class ScriptEngine {
     if (processed.startsWith("#!"))
       processed = processed.slice(processed.indexOf("\n") + 1);
     if (isTypeScriptFile(filename)) {
-      processed = stripTypeScript(processed);
+      processed = stripTypeScript(processed, filename);
     }
     let tla = false;
     if (filename.endsWith(".cjs")) {

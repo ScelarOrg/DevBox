@@ -1,5 +1,18 @@
 import { describe, it, expect } from "vitest";
-import { createHash, createHmac, pbkdf2Sync } from "../polyfills/crypto";
+import { Buffer } from "../polyfills/buffer";
+import {
+  checkPrimeSync,
+  createHash,
+  createHmac,
+  createSecretKey,
+  generatePrimeSync,
+  getCiphers,
+  getDiffieHellman,
+  pbkdf2Sync,
+  randomFill,
+  scryptSync,
+  timingSafeEqual,
+} from "../polyfills/crypto";
 
 describe("crypto sync digests", () => {
   it("SHA-256 of 'abc'", () => {
@@ -67,5 +80,93 @@ describe("crypto sync digests", () => {
     const sync = h.digest("hex");
     const async_ = await h.digestAsync("hex");
     expect(sync).toBe(async_);
+  });
+});
+
+describe("crypto API fidelity", () => {
+  it("timingSafeEqual compares equal buffers", () => {
+    const a = Buffer.from([1, 2, 3, 4]);
+    const b = Buffer.from([1, 2, 3, 4]);
+    expect(timingSafeEqual(a, b)).toBe(true);
+  });
+
+  it("timingSafeEqual returns false for unequal content", () => {
+    const a = Buffer.from([1, 2, 3, 4]);
+    const b = Buffer.from([1, 2, 3, 5]);
+    expect(timingSafeEqual(a, b)).toBe(false);
+  });
+
+  it("timingSafeEqual throws on length mismatch", () => {
+    const a = Buffer.from([1, 2, 3]);
+    const b = Buffer.from([1, 2, 3, 4]);
+    try {
+      timingSafeEqual(a, b);
+      expect.unreachable("should have thrown");
+    } catch (e) {
+      expect(e).toBeInstanceOf(RangeError);
+      expect((e as RangeError & { code?: string }).code).toBe(
+        "ERR_CRYPTO_TIMING_SAFE_EQUAL_LENGTH",
+      );
+    }
+  });
+
+  it("Hmac.update honors hex encoding", () => {
+    const bytes = Buffer.from([0xde, 0xad, 0xbe, 0xef]);
+    const viaHex = createHmac("sha256", "key")
+      .update("deadbeef", "hex")
+      .digest("hex");
+    const viaBytes = createHmac("sha256", "key").update(bytes).digest("hex");
+    expect(viaHex).toBe(viaBytes);
+  });
+
+  it("createSecretKey.symmetricKeySize is in bytes", () => {
+    expect(createSecretKey(Buffer.alloc(32)).symmetricKeySize).toBe(32);
+  });
+
+  it("randomFill with offset only fills from offset to end", async () => {
+    const buf = Buffer.alloc(8, 0);
+    await new Promise<void>((resolve, reject) => {
+      randomFill(buf, 4, (err) => {
+        if (err) reject(err);
+        else resolve();
+      });
+    });
+    expect([...buf.subarray(0, 4)]).toEqual([0, 0, 0, 0]);
+    // Filled region should almost certainly be non-zero for 4 random bytes
+    expect(buf.subarray(4).some((b) => b !== 0)).toBe(true);
+  });
+
+  it("scryptSync matches Node vector (password/NaCl, N=1024,r=8,p=16)", () => {
+    expect(
+      scryptSync("password", "NaCl", 64, {
+        N: 1024,
+        r: 8,
+        p: 16,
+        maxmem: 32 * 1024 * 1024,
+      }).toString("hex"),
+    ).toBe(
+      "fdbabe1c9d3472007856e7190d01e9fe7c6ad7cbc8237830e77376634b3731622eaf30d92e22a3886ff109279d9830dac727afb94a83ee6d8360cbdfa2cc0640",
+    );
+  });
+
+  it("checkPrimeSync / generatePrimeSync produce primes", () => {
+    expect(checkPrimeSync(2n)).toBe(true);
+    expect(checkPrimeSync(9n)).toBe(false);
+    const p = generatePrimeSync(64, { bigint: true }) as bigint;
+    expect(checkPrimeSync(p)).toBe(true);
+  });
+
+  it("getDiffieHellman computeSecret is symmetric", () => {
+    const a = getDiffieHellman("modp1");
+    const b = getDiffieHellman("modp1");
+    const aPub = a.generateKeys();
+    const bPub = b.generateKeys();
+    const secretA = a.computeSecret(bPub);
+    const secretB = b.computeSecret(aPub);
+    expect(Buffer.from(secretA).equals(Buffer.from(secretB))).toBe(true);
+  });
+
+  it("getCiphers is empty while AES is unsupported", () => {
+    expect(getCiphers()).toEqual([]);
   });
 });

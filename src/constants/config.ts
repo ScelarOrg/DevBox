@@ -160,7 +160,7 @@ export const MOCK_PROCESS = {
 export const DEFAULT_ENV = {
   NODE_ENV: "development",
   PATH: "/usr/local/bin:/usr/bin:/bin",
-  HOME: "/",
+  HOME: MOCK_OS.HOMEDIR,
   SHELL: "/bin/sh",
   TERM: "xterm-256color",
   COLORTERM: "truecolor",

@@ -28,7 +28,13 @@ export interface ShellCommand {
 /* ------------------------------------------------------------------ */
 
 export interface RedirectNode {
-  type: "write" | "append" | "read" | "stderr-to-stdout";
+  type:
+    | "write"
+    | "append"
+    | "read"
+    | "stderr-to-stdout"
+    | "stderr-write"
+    | "stderr-append";
   target: string; // file path (empty for 2>&1)
 }
 
@@ -70,6 +76,8 @@ export type TokenType =
   | "redirect-app"  // >>
   | "redirect-in"   // <
   | "redirect-2to1" // 2>&1
+  | "redirect-err"  // 2>
+  | "redirect-err-app" // 2>>
   | "newline"
   | "eof";
 

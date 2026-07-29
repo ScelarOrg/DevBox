@@ -1,4 +1,4 @@
-import type { BuiltinFn, ShellContext } from "../shell-types";
+import type { BuiltinFn, ShellContext, ShellResult } from "../shell-types";
 import {
   ok,
   fail,
@@ -205,7 +205,12 @@ interface GrepOpts {
   maxCount: number;
 }
 
-function grepLines(content: string, opts: GrepOpts, label?: string): string {
+interface GrepLinesResult {
+  text: string;
+  hits: number;
+}
+
+function grepLines(content: string, opts: GrepOpts, label?: string): GrepLinesResult {
   const {
     regex, highlightRe, patternStr, ignoreCase, invert,
     countOnly, filesOnly, lineNumbers, onlyMatching, quiet,
@@ -223,14 +228,21 @@ function grepLines(content: string, opts: GrepOpts, label?: string): string {
     }
   }
 
+  const hits = matchedIndices.size;
+
   if (countOnly) {
-    return (label ? `${MAGENTA}${label}${RESET}${CYAN}:${RESET}` : "") +
-      matchedIndices.size + "\n";
+    return {
+      text:
+        (label ? `${MAGENTA}${label}${RESET}${CYAN}:${RESET}` : "") +
+        hits +
+        "\n",
+      hits,
+    };
   }
-  if (filesOnly && matchedIndices.size > 0) {
-    return `${MAGENTA}${label ?? ""}${RESET}\n`;
+  if (filesOnly && hits > 0) {
+    return { text: `${MAGENTA}${label ?? ""}${RESET}\n`, hits };
   }
-  if (quiet) return matchedIndices.size > 0 ? "\0" : "";
+  if (quiet) return { text: hits > 0 ? "\0" : "", hits };
 
   const showLines = new Set<number>();
   for (const idx of matchedIndices) {
@@ -276,25 +288,30 @@ function grepLines(content: string, opts: GrepOpts, label?: string): string {
     }
   }
 
-  return out;
+  return { text: out, hits };
 }
 
 function grepDirFull(
   ctx: ShellContext,
   dir: string,
   opts: GrepOpts,
-): string {
-  let out = "";
+): GrepLinesResult {
+  let text = "";
+  let hits = 0;
   try {
     for (const name of ctx.volume.readdirSync(dir)) {
       const full = `${dir}/${name}`;
       const st = ctx.volume.statSync(full);
       if (st.isDirectory()) {
-        out += grepDirFull(ctx, full, opts);
+        const nested = grepDirFull(ctx, full, opts);
+        text += nested.text;
+        hits += nested.hits;
       } else {
         try {
           const content = ctx.volume.readFileSync(full, "utf8");
-          out += grepLines(content, opts, full);
+          const result = grepLines(content, opts, full);
+          text += result.text;
+          hits += result.hits;
         } catch {
           /* skip binary/unreadable */
         }
@@ -303,7 +320,7 @@ function grepDirFull(
   } catch {
     /* skip unreadable dirs */
   }
-  return out;
+  return { text, hits };
 }
 
 const grep_cmd: BuiltinFn = (args, ctx, stdin) => {
@@ -364,8 +381,10 @@ const grep_cmd: BuiltinFn = (args, ctx, stdin) => {
 
   if (files.length === 0 && stdin !== undefined) {
     const result = grepLines(stdin, grepOpts);
-    if (quiet) return result ? EXIT_OK : EXIT_FAIL;
-    return result ? ok(result) : EXIT_FAIL;
+    if (quiet) return result.hits > 0 ? EXIT_OK : EXIT_FAIL;
+    return result.hits > 0
+      ? ok(result.text)
+      : { stdout: result.text, stderr: "", exitCode: 1 };
   }
 
   if (files.length === 0) {
@@ -374,7 +393,7 @@ const grep_cmd: BuiltinFn = (args, ctx, stdin) => {
 
   let out = "";
   const multiFile = files.length > 1 || recursive;
-  let anyMatch = false;
+  let totalHits = 0;
 
   for (const file of files) {
     const p = resolvePath(file, ctx.cwd);
@@ -383,8 +402,8 @@ const grep_cmd: BuiltinFn = (args, ctx, stdin) => {
       if (st.isDirectory()) {
         if (recursive) {
           const r = grepDirFull(ctx, p, grepOpts);
-          out += r;
-          if (r) anyMatch = true;
+          out += r.text;
+          totalHits += r.hits;
         } else if (!suppressErrors) {
           out += `grep: ${file}: Is a directory\n`;
         }
@@ -392,16 +411,16 @@ const grep_cmd: BuiltinFn = (args, ctx, stdin) => {
       }
       const content = ctx.volume.readFileSync(p, "utf8");
       const result = grepLines(content, grepOpts, multiFile ? file : undefined);
-      out += result;
-      if (result) anyMatch = true;
+      out += result.text;
+      totalHits += result.hits;
     } catch {
       if (!suppressErrors)
         return fail(`grep: ${file}: No such file or directory\n`);
     }
   }
 
-  if (quiet) return anyMatch ? EXIT_OK : EXIT_FAIL;
-  return anyMatch ? ok(out) : { stdout: out, stderr: "", exitCode: 1 };
+  if (quiet) return totalHits > 0 ? EXIT_OK : EXIT_FAIL;
+  return totalHits > 0 ? ok(out) : { stdout: out, stderr: "", exitCode: 1 };
 };
 
 /* ------------------------------------------------------------------ */
@@ -515,7 +534,9 @@ const sed_cmd: BuiltinFn = (args, ctx, stdin) => {
   if (typeof cmds === "string") return fail(`sed: ${cmds}\n`);
 
   const doSed = (content: string): string => {
+    // drop trailing empty segment from a final newline so $ is the last real line
     const lines = content.split("\n");
+    if (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
     let out = "";
     for (let i = 0; i < lines.length; i++) {
       const lineNum = i + 1;
@@ -534,7 +555,7 @@ const sed_cmd: BuiltinFn = (args, ctx, stdin) => {
             try {
               re = new RegExp(cmd.pattern!, cmd.sFlags || undefined);
             } catch {
-              break;
+              throw new Error(`invalid regular expression: ${cmd.pattern}`);
             }
             line = line.replace(re, cmd.replacement!);
             if (cmd.printAfter && re.test(lines[i])) suppress = false;
@@ -567,7 +588,19 @@ const sed_cmd: BuiltinFn = (args, ctx, stdin) => {
     return out;
   };
 
-  if (files.length === 0 && stdin !== undefined) return ok(doSed(stdin));
+  const runSed = (content: string): ShellResult | string => {
+    try {
+      return doSed(content);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return fail(`sed: ${msg}\n`);
+    }
+  };
+
+  if (files.length === 0 && stdin !== undefined) {
+    const result = runSed(stdin);
+    return typeof result === "string" ? ok(result) : result;
+  }
   if (files.length === 0) return fail("sed: missing input\n");
 
   let out = "";
@@ -575,13 +608,17 @@ const sed_cmd: BuiltinFn = (args, ctx, stdin) => {
     const p = resolvePath(file, ctx.cwd);
     try {
       const content = ctx.volume.readFileSync(p, "utf8");
-      const result = doSed(content);
+      const result = runSed(content);
+      if (typeof result !== "string") return result;
       if (inPlace) {
         ctx.volume.writeFileSync(p, result);
       } else {
         out += result;
       }
-    } catch {
+    } catch (e) {
+      if (e instanceof Error && e.message.startsWith("invalid regular expression")) {
+        return fail(`sed: ${e.message}\n`);
+      }
       return fail(`sed: ${file}: No such file or directory\n`);
     }
   }

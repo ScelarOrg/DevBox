@@ -81,8 +81,10 @@ describe("compareSemver", () => {
     expect(compareSemver("1.0.0", "1.0.0-beta")).toBeGreaterThan(0);
   });
 
-  it("compares two prerelease versions alphabetically", () => {
+  it("compares two prerelease versions by semver identifier rules", () => {
     expect(compareSemver("1.0.0-alpha", "1.0.0-beta")).toBeLessThan(0);
+    expect(compareSemver("1.0.0-beta.9", "1.0.0-beta.10")).toBeLessThan(0);
+    expect(compareSemver("1.0.0-1", "1.0.0-alpha")).toBeLessThan(0);
   });
 
   it("falls back to localeCompare for unparseable versions", () => {
@@ -109,9 +111,21 @@ describe("satisfiesRange", () => {
     expect(satisfiesRange("0.3.0", "^0.2.0")).toBe(false);
   });
 
+  it("caret ^0.0.x pins patch", () => {
+    expect(satisfiesRange("0.0.1", "^0.0.1")).toBe(true);
+    expect(satisfiesRange("0.0.9", "^0.0.1")).toBe(false);
+    expect(satisfiesRange("0.1.0", "^0.0.1")).toBe(false);
+  });
+
   it("tilde range ~1.2.3 allows patch bumps only", () => {
     expect(satisfiesRange("1.2.9", "~1.2.3")).toBe(true);
     expect(satisfiesRange("1.3.0", "~1.2.3")).toBe(false);
+  });
+
+  it("tilde ~1 allows any minor within major", () => {
+    expect(satisfiesRange("1.0.0", "~1")).toBe(true);
+    expect(satisfiesRange("1.9.9", "~1")).toBe(true);
+    expect(satisfiesRange("2.0.0", "~1")).toBe(false);
   });
 
   it("comparison operators: >=, >, <, <=", () => {
@@ -144,6 +158,8 @@ describe("satisfiesRange", () => {
   it("x-ranges", () => {
     expect(satisfiesRange("1.9.9", "1.x")).toBe(true);
     expect(satisfiesRange("2.0.0", "1.x")).toBe(false);
+    expect(satisfiesRange("1.9.9", "1.*")).toBe(true);
+    expect(satisfiesRange("2.0.0", "1.*")).toBe(false);
   });
 
   it("partial version ranges", () => {
@@ -202,6 +218,7 @@ function makeMockRegistry(
       version: string;
       dependencies?: Record<string, string>;
       peerDependencies?: Record<string, string>;
+      optionalDependencies?: Record<string, string>;
     }[]
   >,
 ): RegistryClient {
@@ -214,6 +231,7 @@ function makeMockRegistry(
         version: rel.version,
         dependencies: rel.dependencies ?? {},
         peerDependencies: rel.peerDependencies,
+        optionalDependencies: rel.optionalDependencies,
         dist: {
           tarball: `https://registry.example/${name}/-/${name}-${rel.version}.tgz`,
           shasum: `sha-${name}-${rel.version}`,
@@ -402,6 +420,59 @@ describe("resolveDependencyTree — nested placement", () => {
       { registry },
     );
     expect(Array.from(tree.keys()).sort()).toEqual(["a", "b"]);
+  });
+
+  it("soft-fails missing optional dependencies", async () => {
+    const registry = makeMockRegistry({
+      host: [
+        {
+          version: "1.0.0",
+          optionalDependencies: { "missing-native": "^1.0.0" },
+        },
+      ],
+    });
+    const tree = await resolveDependencyTree("host", "^1.0.0", {
+      registry,
+      optionalDependencies: true,
+    });
+    expect(tree.get("host")?.version).toBe("1.0.0");
+    expect(tree.has("missing-native")).toBe(false);
+  });
+
+  it("resolves root optionalDependencies when enabled", async () => {
+    const registry = makeMockRegistry({
+      opt: [{ version: "1.0.0" }],
+    });
+    const tree = await resolveFromManifest(
+      {
+        dependencies: {},
+        optionalDependencies: { opt: "^1.0.0" },
+      },
+      { registry, optionalDependencies: true },
+    );
+    expect(tree.get("opt")?.version).toBe("1.0.0");
+  });
+
+  it("stores fetchName for npm aliases and re-walks with it", async () => {
+    const registry = makeMockRegistry({
+      "strip-ansi": [
+        { version: "6.0.1", dependencies: { "ansi-regex": "^5.0.0" } },
+      ],
+      "ansi-regex": [{ version: "5.0.1" }],
+    });
+    const tree = await resolveFromManifest(
+      {
+        dependencies: {
+          "string-width-cjs": "npm:strip-ansi@^6.0.1",
+        },
+      },
+      { registry },
+    );
+    const alias = tree.get("string-width-cjs");
+    expect(alias?.name).toBe("string-width-cjs");
+    expect(alias?.fetchName).toBe("strip-ansi");
+    expect(alias?.version).toBe("6.0.1");
+    expect(tree.get("ansi-regex")?.version).toBe("5.0.1");
   });
 
   it("breaks cycles without hanging", async () => {

@@ -1,5 +1,6 @@
 // Console class matching Node.js constructor (accepts stdout/stderr streams)
 
+import { inspect } from "./util";
 
 /* ------------------------------------------------------------------ */
 /*  Console class                                                      */
@@ -56,7 +57,14 @@ export const Console = function Console(this: any, stdout?: unknown, stderr?: un
 Console.prototype._emit = function _emit(this: any, target: "out" | "err", args: unknown[]) {
   const text =
     args
-      .map((a: unknown) => (typeof a === "string" ? a : JSON.stringify(a)))
+      .map((a: unknown) => {
+        if (typeof a === "string") return a;
+        try {
+          return inspect(a);
+        } catch {
+          return String(a);
+        }
+      })
       .join(" ") + "\n";
   const dest = target === "err" ? this._err : this._out;
   if (dest) dest.write(text);

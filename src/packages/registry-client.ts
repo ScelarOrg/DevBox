@@ -35,6 +35,7 @@ export interface RegistryConfig {
 }
 
 import { NPM_REGISTRY_URL } from "../constants/config";
+import { proxiedFetch } from "../cross-origin";
 
 const NPM_REGISTRY_BASE = NPM_REGISTRY_URL;
 const REGISTRY_CACHE_NAME = "nodepod-registry-v1";
@@ -119,21 +120,23 @@ export class RegistryClient {
       return metadata;
     }
 
-    const resp = await fetch(requestUrl, {
-      headers: {
-        Accept:
-          'application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8',
-        ...(persisted?.headers.get("etag")
-          ? { "If-None-Match": persisted.headers.get("etag")! }
-          : {}),
-      },
-    });
-
-    if (resp.status === 304 && persisted) {
-      const metadata = (await persisted.json()) as PackageMetadata;
-      this.metadataStore.set(name, metadata);
-      remember(sharedKey, metadata);
-      return metadata;
+    // Avoid If-None-Match: it triggers a CORS preflight, and npm's OPTIONS /
+    // scoped-404 responses often omit Access-Control-Allow-Origin. Local TTL
+    // above is enough for browser caching.
+    let resp: Response;
+    try {
+      resp = await proxiedFetch(requestUrl, {
+        headers: {
+          Accept:
+            "application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8",
+        },
+      });
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `Failed to fetch package "${name}" from the registry (${detail}). ` +
+          `The package may not exist, or the registry blocked the browser request.`,
+      );
     }
 
     if (resp.status === 404) {
@@ -196,7 +199,15 @@ export class RegistryClient {
   }
 
   async downloadArchive(tarballUrl: string): Promise<ArrayBuffer> {
-    const resp = await fetch(tarballUrl);
+    let resp: Response;
+    try {
+      resp = await proxiedFetch(tarballUrl);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `Tarball download failed (${detail}): ${tarballUrl}`,
+      );
+    }
     if (!resp.ok) {
       throw new Error(`Tarball download failed (HTTP ${resp.status}): ${tarballUrl}`);
     }
@@ -206,6 +217,11 @@ export class RegistryClient {
   flushCache(): void {
     this.metadataStore.clear();
   }
+}
+
+export function flushSharedRegistryCache(): void {
+  sharedMetadata.clear();
+  inFlightMetadata.clear();
 }
 
 export default RegistryClient;

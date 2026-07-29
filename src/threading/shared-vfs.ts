@@ -59,6 +59,9 @@ const DATA_OFFSET = HEADER_SIZE + TABLE_SIZE;
 
 const DEFAULT_BUFFER_SIZE = 64 * 1024 * 1024; // 64MB
 const COMPACT_WASTE_THRESHOLD = 16 * 1024 * 1024; // 16MB
+// reclaim tombstones even when wasteBytes===0 (dir deletes add no data waste)
+const COMPACT_INACTIVE_RATIO = 0.25;
+const COMPACT_NEAR_FULL_SLACK = 64;
 
 export interface SharedVFSStats {
   entries: number;
@@ -131,15 +134,15 @@ export class SharedVFSController {
   writeFile(path: string, content: Uint8Array): boolean {
     this._lock();
     try {
-      // opportunistic compaction when orphaned bytes pile up (HMR rewriting
-      // the same files bloats the append-only region)
-      if (this._view.getUint32(16) > COMPACT_WASTE_THRESHOLD) {
+      // opportunistic compaction: data waste, inactive tombstones, or table pressure
+      if (this._shouldCompact()) {
         this._compactLocked();
       }
 
       let ok = this._writeFileLocked(path, content);
-      if (!ok && this._view.getUint32(16) > 0) {
-        // rescue: reclaim orphaned space, then retry once
+      // rescue on any reclaimable waste/tombstones (not only the 16MB threshold —
+      // small buffers fail writes long before waste hits COMPACT_WASTE_THRESHOLD)
+      if (!ok && (this._view.getUint32(16) > 0 || this._inactiveCount() > 0)) {
         this._compactLocked();
         ok = this._writeFileLocked(path, content);
       }
@@ -150,7 +153,13 @@ export class SharedVFSController {
     }
   }
 
+  private _pathTooLong(path: string): boolean {
+    return this._pathEncoder.encode(path).byteLength >= ENTRY_PATH_MAX;
+  }
+
   private _writeFileLocked(path: string, content: Uint8Array): boolean {
+    if (this._pathTooLong(path)) return false;
+
     const entryCount = Atomics.load(this._int32, 1);
     const dataUsed = this._view.getUint32(8);
 
@@ -185,8 +194,19 @@ export class SharedVFSController {
   writeDirectory(path: string): boolean {
     this._lock();
     try {
-      const entryCount = Atomics.load(this._int32, 1);
+      if (this._pathTooLong(path)) {
+        this._droppedWrites++;
+        return false;
+      }
+      if (this._shouldCompact()) {
+        this._compactLocked();
+      }
+      let entryCount = Atomics.load(this._int32, 1);
       if (this._findEntry(path) !== -1) return true;
+      if (entryCount >= MAX_ENTRIES && this._inactiveCount() > 0) {
+        this._compactLocked();
+        entryCount = Atomics.load(this._int32, 1);
+      }
       if (entryCount >= MAX_ENTRIES) {
         this._droppedWrites++;
         return false;
@@ -297,12 +317,32 @@ export class SharedVFSController {
     this._view.setUint32(16, this._view.getUint32(16) + bytes);
   }
 
+  private _inactiveCount(): number {
+    const entryCount = Atomics.load(this._int32, 1);
+    let inactive = 0;
+    for (let i = 0; i < entryCount; i++) {
+      const flags = this._view.getUint32(HEADER_SIZE + i * ENTRY_SIZE + ENTRY_FLAGS_OFFSET);
+      if (!(flags & FLAG_ACTIVE)) inactive++;
+    }
+    return inactive;
+  }
+
+  private _shouldCompact(): boolean {
+    if (this._view.getUint32(16) > COMPACT_WASTE_THRESHOLD) return true;
+    const entryCount = Atomics.load(this._int32, 1);
+    if (entryCount === 0) return false;
+    const inactive = this._inactiveCount();
+    if (inactive === 0) return false;
+    if (entryCount >= MAX_ENTRIES - COMPACT_NEAR_FULL_SLACK) return true;
+    return inactive / entryCount > COMPACT_INACTIVE_RATIO;
+  }
+
   private _writePath(entryOffset: number, path: string): void {
+    // callers must reject paths >= ENTRY_PATH_MAX; never truncate (hash/path skew)
     const pathBytes = this._pathEncoder.encode(path);
-    const pathLen = Math.min(pathBytes.byteLength, ENTRY_PATH_MAX - 1);
     this._view.setUint32(entryOffset + ENTRY_HASH_OFFSET, fnv1a(path));
-    this._uint8.set(pathBytes.subarray(0, pathLen), entryOffset + ENTRY_PATH_OFFSET);
-    this._uint8[entryOffset + ENTRY_PATH_OFFSET + pathLen] = 0;
+    this._uint8.set(pathBytes, entryOffset + ENTRY_PATH_OFFSET);
+    this._uint8[entryOffset + ENTRY_PATH_OFFSET + pathBytes.byteLength] = 0;
   }
 
   // Compacts both the entry table (drops inactive entries) and the data
@@ -310,6 +350,9 @@ export class SharedVFSController {
   // Readers never cache offsets across calls, and main-thread JS can't run
   // concurrently with a worker read of a *consistent* entry — the version
   // bump at the end tells pollers something moved.
+  // Torn reads under concurrent compact are real (plan 020 COW NO-GO); do not
+  // treat SharedVFS as the primary read path without a per-entry seqlock —
+  // see plans/020-cow-vfs-spike.RESULTS.md.
   private _compactLocked(): void {
     const entryCount = Atomics.load(this._int32, 1);
 
@@ -430,6 +473,8 @@ export class SharedVFSController {
     const contentOffset = dataUsed;
     this._uint8.set(content, DATA_OFFSET + contentOffset);
 
+    // file overwrite clears FLAG_DIRECTORY (dir→file must not keep DIR bit)
+    this._view.setUint32(entryOffset + ENTRY_FLAGS_OFFSET, FLAG_ACTIVE);
     this._view.setUint32(entryOffset + ENTRY_CONTENT_OFFSET, contentOffset);
     this._view.setUint32(entryOffset + ENTRY_CONTENT_LENGTH, content.byteLength);
     this._view.setUint32(entryOffset + ENTRY_MODIFIED_OFFSET, (Date.now() / 1000) | 0);

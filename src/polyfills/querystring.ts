@@ -3,6 +3,19 @@
 
 export type ParsedQuery = Record<string, string | string[]>;
 
+/** Node-style unescape: invalid % sequences are left literal. */
+function decodeLenient(text: string): string {
+  const plusDecoded = text.replace(/\+/g, " ");
+  try {
+    return decodeURIComponent(plusDecoded);
+  } catch {
+    // Fall back to percent-decoding valid sequences only
+    return plusDecoded.replace(/%([0-9A-Fa-f]{2})/g, (_m, hex: string) =>
+      String.fromCharCode(parseInt(hex, 16)),
+    );
+  }
+}
+
 // supports duplicate keys (values become arrays) and custom separators
 export function parse(
   input: string,
@@ -24,10 +37,10 @@ export function parse(
     let v: string;
 
     if (eqPos >= 0) {
-      k = decodeURIComponent(segment.substring(0, eqPos).replace(/\+/g, ' '));
-      v = decodeURIComponent(segment.substring(eqPos + 1).replace(/\+/g, ' '));
+      k = decodeLenient(segment.substring(0, eqPos));
+      v = decodeLenient(segment.substring(eqPos + 1));
     } else {
-      k = decodeURIComponent(segment.replace(/\+/g, ' '));
+      k = decodeLenient(segment);
       v = '';
     }
 
@@ -76,7 +89,7 @@ export function escape(text: string): string {
 }
 
 export function unescape(text: string): string {
-  return decodeURIComponent(text.replace(/\+/g, ' '));
+  return decodeLenient(text);
 }
 
 // Node.js compatibility aliases

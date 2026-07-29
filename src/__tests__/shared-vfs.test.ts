@@ -199,12 +199,22 @@ describe("SharedVFSController + SharedVFSReader", () => {
   });
 
   describe("caps", () => {
-    it("path over 248 bytes gets truncated, still writes", () => {
-      // path cap doesn't return false, it just truncates. documents the quirk.
+    it("path over 248 bytes is rejected", () => {
       const ctrl = new SharedVFSController();
       const longPath = "/" + "a".repeat(300);
-      const res = ctrl.writeFile(longPath, new Uint8Array([1]));
-      expect(typeof res).toBe("boolean");
+      expect(ctrl.writeFile(longPath, new Uint8Array([1]))).toBe(false);
+      expect(ctrl.getStats().droppedWrites).toBeGreaterThanOrEqual(1);
+      expect(ctrl.readFile(longPath)).toBeNull();
+    });
+
+    it("writeFile over directory clears FLAG_DIRECTORY", () => {
+      const ctrl = new SharedVFSController();
+      const reader = new SharedVFSReader(ctrl.buffer);
+      expect(ctrl.writeDirectory("/morph")).toBe(true);
+      expect(reader.isDirectorySync("/morph")).toBe(true);
+      expect(ctrl.writeFile("/morph", new Uint8Array([7, 8]))).toBe(true);
+      expect(reader.isDirectorySync("/morph")).toBe(false);
+      expect(ctrl.readFile("/morph")).toEqual(new Uint8Array([7, 8]));
     });
 
     it("writeFile returns false when data won't fit", () => {
@@ -398,6 +408,28 @@ describe("VFSBridge -> SharedVFS mirror (main-thread write visibility)", () => {
 
     unwatch();
   });
+
+  it("broadcasts empty files as files, not directories", () => {
+    const vol = new MemoryVolume();
+    const bridge = new VFSBridge(vol);
+    const events: Array<{ path: string; isDirectory: boolean; len: number | null }> = [];
+    bridge.setBroadcaster((path, content, isDirectory) => {
+      events.push({
+        path,
+        isDirectory,
+        len: content === null ? null : content.byteLength,
+      });
+    });
+    const unwatch = bridge.watch();
+
+    vol.writeFileSync("/empty.txt", "");
+    vol.mkdirSync("/adir", { recursive: true });
+
+    expect(events).toContainEqual({ path: "/empty.txt", isDirectory: false, len: 0 });
+    expect(events).toContainEqual({ path: "/adir", isDirectory: true, len: 0 });
+
+    unwatch();
+  });
 });
 
 describe("cross-thread attach (SAB via worker_threads)", () => {
@@ -499,6 +531,25 @@ describe("compaction + waste accounting (plan 014)", () => {
     ctrl.writeFile("/b.txt", new Uint8Array(30));
     ctrl.deleteFile("/b.txt");
     expect(ctrl.getStats().wasteBytes).toBe(130);
+  });
+
+  it("compacts directory tombstones even when wasteBytes is 0", () => {
+    const ctrl = new SharedVFSController(SMALL);
+    // create and delete enough dirs that inactive/entryCount > 25%
+    for (let i = 0; i < 40; i++) {
+      expect(ctrl.writeDirectory(`/d${i}`)).toBe(true);
+    }
+    for (let i = 0; i < 30; i++) {
+      expect(ctrl.deleteFile(`/d${i}`)).toBe(true);
+    }
+    expect(ctrl.getStats().wasteBytes).toBe(0);
+    expect(ctrl.getStats().entries).toBe(40);
+    // next write should trigger inactive-ratio compact
+    expect(ctrl.writeDirectory("/fresh")).toBe(true);
+    const stats = ctrl.getStats();
+    expect(stats.compactions).toBeGreaterThan(0);
+    expect(stats.entries).toBeLessThan(40);
+    expect(stats.activeEntries).toBe(11); // 10 leftover dirs + /fresh
   });
 
   it("churn does not exhaust the data region (overwrites reclaim via compaction)", () => {

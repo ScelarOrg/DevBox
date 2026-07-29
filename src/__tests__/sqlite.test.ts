@@ -96,6 +96,20 @@ describe("node:sqlite polyfill", () => {
     db.close();
   });
 
+  it("preserves int64 values above 32-bit (Date.now ms timestamps)", () => {
+    const db = new DatabaseSync(":memory:");
+    db.exec("CREATE TABLE t(ts INTEGER)");
+    const ms = 1_784_824_688_681; // ~2026-07-23 in unix ms
+    const neg = -3_000_000_000;
+    db.prepare("INSERT INTO t VALUES (?), (?)").run(ms, neg);
+    const rows = db.prepare("SELECT ts FROM t ORDER BY rowid").all() as Array<{
+      ts: number;
+    }>;
+    expect(rows[0]?.ts).toBe(ms);
+    expect(rows[1]?.ts).toBe(neg);
+    db.close();
+  });
+
   it("user-defined function", () => {
     const db = new DatabaseSync(":memory:");
     db.function("plus", (a: unknown, b: unknown) => (a as number) + (b as number));

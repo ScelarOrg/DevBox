@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>nodepod - TS inline generic optional (value?:) strip</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: monospace; background: #1a1a2e; color: #e0e0e0; padding: 20px; line-height: 1.5; }
+    h1 { font-size: 18px; margin-bottom: 4px; color: #fff; }
+    p { font-size: 13px; color: #888; margin-bottom: 12px; max-width: 920px; }
+    code { background: #0d0d1a; padding: 2px 6px; border-radius: 3px; color: #a8e6a3; font-size: 12px; }
+    .pane {
+      background: #0d0d1a; border: 1px solid #333; border-radius: 6px;
+      padding: 12px; display: flex; flex-direction: column; min-height: 520px;
+    }
+    .pane h2 { font-size: 13px; margin-bottom: 8px; color: #8ac4e6; }
+    #output {
+      flex: 1; white-space: pre-wrap; font-size: 12px; line-height: 1.55;
+      overflow-y: auto; max-height: 70vh;
+    }
+    .stdout { color: #a8e6a3; }
+    .stderr { color: #e68a8a; }
+    .info { color: #8ac4e6; }
+    .dim { color: #666; }
+    .pass { color: #a8e6a3; font-weight: bold; }
+    .fail { color: #e68a8a; font-weight: bold; }
+    .title { color: #c38ae6; font-weight: bold; }
+    .controls { display: flex; gap: 8px; margin-bottom: 12px; align-items: center; flex-wrap: wrap; }
+    button {
+      background: #2a2a4a; color: #e0e0e0; border: 1px solid #444;
+      padding: 6px 12px; border-radius: 4px; font-family: monospace; cursor: pointer;
+    }
+    button:hover { background: #3a3a5a; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+  </style>
+</head>
+<body>
+  <h1>nodepod — TS inline generic with <code>value?:</code></h1>
+  <p>
+    Recreates the Scelar / Vite failure where loading
+    <code>server/api/databases/cells/[rowId].[columnId].ts</code> threw
+    <code>SyntaxError: Unexpected token '?'</code>.
+    The old regex stripper left
+    <code>ctx.readJson&lt;{ value?: string | null }&gt;()</code> in the JS output;
+    Sucrase should strip it cleanly. No npm install — mounts the files and runs
+    <code>node main.ts</code>.
+  </p>
+
+  <div class="controls">
+    <button id="run-cells">run cells route repro (auto)</button>
+    <button id="run-matrix">run broader TS strip matrix</button>
+    <button id="clear">clear log</button>
+  </div>
+
+  <div class="pane">
+    <h2>log</h2>
+    <div id="output"></div>
+  </div>
+
+  <script id="file-http" type="text/plain">
+export type ApiContext = {
+  session: { user: { id: string } } | null;
+  params: Record<string, string>;
+  db: any;
+  json: (body: unknown, status?: number) => void;
+  readJson: <T = unknown>() => Promise<T>;
+};
+</script>
+
+  <script id="file-schema" type="text/plain">
+export const databaseCells = { id: "id", rowId: "rowId", columnId: "columnId", value: "value" };
+export const databaseRows = { id: "id", pageId: "pageId" };
+export const databaseColumns = { id: "id" };
+export const pages = { id: "id", ownerUserId: "ownerUserId" };
+</script>
+
+  <script id="file-fake-drizzle" type="text/plain">
+export function eq(col: string, val: unknown) {
+  return { op: "eq", col, val };
+}
+export function and(...parts: unknown[]) {
+  return { op: "and", parts };
+}
+</script>
+
+  <script id="file-fake-nanoid" type="text/plain">
+export function nanoid(): string {
+  return "id_" + Math.random().toString(36).slice(2, 10);
+}
+</script>
+
+  <!-- Same smoking-gun PATCH as Scelar; helpers are VFS-absolute for reliable resolve -->
+  <script id="file-cells" type="text/plain">
+import { eq, and } from "/app/fake-drizzle.ts";
+import { nanoid } from "/app/fake-nanoid.ts";
+import { databaseCells, databaseRows, pages } from "/app/schema.ts";
+import type { ApiContext } from "/app/http.ts";
+
+function requireAuth(ctx: ApiContext) {
+  if (!ctx.session) {
+    ctx.json({ error: "Unauthorized" }, 401);
+    return null;
+  }
+  return ctx.session.user.id;
+}
+
+/** PATCH /api/databases/cells/:rowId/:columnId — upsert cell value */
+export async function PATCH(ctx: ApiContext) {
+  const userId = requireAuth(ctx);
+  if (!userId) return;
+
+  const { rowId, columnId } = ctx.params;
+
+  const row = ctx.db
+    .select()
+    .from(databaseRows)
+    .where(eq(databaseRows.id, rowId))
+    .get();
+
+  if (!row) {
+    ctx.json({ error: "Row not found" }, 404);
+    return;
+  }
+
+  const page = ctx.db
+    .select()
+    .from(pages)
+    .where(and(eq(pages.id, row.pageId), eq(pages.ownerUserId, userId)))
+    .get();
+
+  if (!page) {
+    ctx.json({ error: "Forbidden" }, 403);
+    return;
+  }
+
+  // Smoking gun: inline object generic with optional `value?:`
+  const body = await ctx.readJson<{ value?: string | null }>();
+
+  const existing = ctx.db
+    .select()
+    .from(databaseCells)
+    .where(and(eq(databaseCells.rowId, rowId), eq(databaseCells.columnId, columnId)))
+    .get();
+
+  if (existing) {
+    ctx.db
+      .update(databaseCells)
+      .set({ value: body.value ?? null })
+      .where(eq(databaseCells.id, existing.id))
+      .run();
+  } else {
+    ctx.db
+      .insert(databaseCells)
+      .values({ id: nanoid(), rowId, columnId, value: body.value ?? null })
+      .run();
+  }
+
+  ctx.json({ ok: true });
+}
+</script>
+
+  <script id="file-main" type="text/plain">
+import { PATCH } from "./server/api/databases/cells/[rowId].[columnId].ts";
+import { databaseRows, databaseCells, pages } from "./schema.ts";
+
+type Row = { id: string; pageId: string };
+type Cell = { id: string; rowId: string; columnId: string; value: string | null };
+type Page = { id: string; ownerUserId: string };
+
+const rows: Row[] = [{ id: "row1", pageId: "page1" }];
+const cells: Cell[] = [];
+const pageTable: Page[] = [{ id: "page1", ownerUserId: "user1" }];
+
+function matchPred(row: Record<string, unknown>, pred: any): boolean {
+  if (!pred) return true;
+  if (pred.op === "eq") return row[pred.col] === pred.val;
+  if (pred.op === "and") return pred.parts.every((p: any) => matchPred(row, p));
+  return true;
+}
+
+function tableFor(ref: unknown): any[] {
+  if (ref === databaseRows) return rows;
+  if (ref === pages) return pageTable;
+  if (ref === databaseCells) return cells;
+  return [];
+}
+
+function makeDb() {
+  let active: any[] = rows;
+  let pred: any = null;
+  let pendingSet: Partial<Cell> | null = null;
+  let pendingInsert: Cell | null = null;
+
+  const api: any = {
+    select() { pred = null; return api; },
+    from(ref: unknown) { active = tableFor(ref); return api; },
+    where(p: unknown) { pred = p; return api; },
+    get() { return active.find((r) => matchPred(r as any, pred)); },
+    update(ref: unknown) { active = tableFor(ref); pred = null; pendingSet = null; return api; },
+    set(values: Partial<Cell>) { pendingSet = values; return api; },
+    insert(ref: unknown) { active = tableFor(ref); pendingInsert = null; return api; },
+    values(row: Cell) { pendingInsert = row; return api; },
+    run() {
+      if (pendingInsert) {
+        cells.push(pendingInsert);
+        pendingInsert = null;
+        return;
+      }
+      if (pendingSet) {
+        const existing = active.find((r) => matchPred(r as any, pred));
+        if (existing) Object.assign(existing, pendingSet);
+        pendingSet = null;
+      }
+    },
+  };
+  return api;
+}
+
+const ctx = {
+  session: { user: { id: "user1" } },
+  params: { rowId: "row1", columnId: "col1" },
+  db: makeDb(),
+  json(body: unknown, status = 200) {
+    console.log("RESPONSE", status, JSON.stringify(body));
+  },
+  async readJson<T = unknown>(): Promise<T> {
+    return { value: "hello-from-cell" } as T;
+  },
+};
+
+console.log("loading PATCH handler (old stripper used to throw on value?:)...");
+await PATCH(ctx);
+console.log("cells after PATCH:", JSON.stringify(cells));
+if (cells.length !== 1 || cells[0].value !== "hello-from-cell") {
+  console.error("FAIL: cell was not upserted");
+  throw new Error("FAIL: cell was not upserted");
+}
+console.log("PASS: inline generic optional stripped and PATCH ran");
+</script>
+
+  <script id="file-matrix" type="text/plain">
+type Box<T> = { value: T };
+interface Named { name: string }
+enum Kind { A = 1, B }
+
+async function readJson<T = unknown>(): Promise<T> {
+  return { value: "x", flag: true } as T;
+}
+
+async function main() {
+  const body = await readJson<{ value?: string | null; flag?: boolean }>();
+  const boxed = { value: body.value ?? "fallback" } satisfies Box<string>;
+  const kind: Kind = Kind.B;
+  const name = (undefined as Named | undefined)?.name ?? "anon";
+  const mapped = new Map<string, number>();
+  mapped.set("n", 1);
+  return { boxed, kind, name, flag: body.flag ?? false, mapSize: mapped.size };
+}
+
+const result = await main();
+console.log("matrix result:", JSON.stringify(result));
+if (result.boxed.value !== "x" || result.kind !== 2 || result.flag !== true) {
+  console.error("FAIL: unexpected matrix result");
+  throw new Error("FAIL: unexpected matrix result");
+}
+console.log("PASS: broader TS strip matrix ok");
+</script>
+
+  <script type="module">
+    import { Nodepod } from "/dist/index.mjs";
+
+    const out = document.getElementById("output");
+    const runCellsBtn = document.getElementById("run-cells");
+    const runMatrixBtn = document.getElementById("run-matrix");
+    const clearBtn = document.getElementById("clear");
+
+    function log(text, cls = "stdout") {
+      const span = document.createElement("span");
+      span.className = cls;
+      span.textContent = text + "\n";
+      out.appendChild(span);
+      out.scrollTop = out.scrollHeight;
+    }
+    function readFile(id) {
+      return document.getElementById(id).textContent.replace(/^\n/, "");
+    }
+    function disableButtons(d) {
+      runCellsBtn.disabled = d;
+      runMatrixBtn.disabled = d;
+    }
+    clearBtn.addEventListener("click", () => { out.textContent = ""; });
+
+    async function mountFiles(pod, files) {
+      for (const [path, content] of Object.entries(files)) {
+        await pod.fs.writeFile(path, content);
+      }
+    }
+
+    function looksLikeStripBug(text) {
+      return /Unexpected token '\?'/.test(text) || /Unexpected token "\?"/.test(text);
+    }
+
+    const CELLS_PATH =
+      "/app/server/api/databases/cells/" + "[rowId].[columnId].ts";
+
+    async function runCells() {
+      disableButtons(true);
+      let sawStripBug = false;
+      try {
+        log("=== cells route repro (readJson<{ value?: ... }>) ===", "title");
+        log("booting nodepod (workdir=/app) ...", "info");
+        const pod = await Nodepod.boot({ watermark: false, workdir: "/app" });
+        log("booted.\n", "info");
+
+        await mountFiles(pod, {
+          "/app/http.ts": readFile("file-http"),
+          "/app/schema.ts": readFile("file-schema"),
+          "/app/fake-drizzle.ts": readFile("file-fake-drizzle"),
+          "/app/fake-nanoid.ts": readFile("file-fake-nanoid"),
+          [CELLS_PATH]: readFile("file-cells"),
+          "/app/main.ts": readFile("file-main"),
+        });
+        log("files mounted (including " + CELLS_PATH + ").", "info");
+        log("running: node main.ts\n", "info");
+
+        const proc = await pod.spawn("node", ["main.ts"], { cwd: "/app" });
+        proc.on("output", (t) => {
+          const line = t.trimEnd();
+          if (looksLikeStripBug(line)) sawStripBug = true;
+          log(line, "stdout");
+        });
+        proc.on("error", (t) => {
+          const line = t.trimEnd();
+          if (looksLikeStripBug(line)) sawStripBug = true;
+          log(line, "stderr");
+        });
+        const res = await proc.completion;
+
+        if (sawStripBug) {
+          log("\nFAIL: still seeing Unexpected token '?' — TS strip gap not fixed.", "fail");
+        } else if (res.exitCode === 0) {
+          log("\nPASS: cells route loaded and PATCH ran. Strip fix looks good.", "pass");
+        } else {
+          log(`\nFAIL: process exited ${res.exitCode} (not the classic '?' bug — see log).`, "fail");
+        }
+      } catch (e) {
+        const msg = e?.stack || String(e);
+        if (looksLikeStripBug(msg)) {
+          log(`\nFAIL: Unexpected token '?' during load.\n${msg}`, "fail");
+        } else {
+          log(`uncaught: ${msg}`, "fail");
+        }
+      } finally {
+        disableButtons(false);
+      }
+    }
+
+    async function runMatrix() {
+      disableButtons(true);
+      let sawStripBug = false;
+      try {
+        log("=== broader TS strip matrix ===", "title");
+        const pod = await Nodepod.boot({ watermark: false, workdir: "/app" });
+        await mountFiles(pod, {
+          "/app/matrix.ts": readFile("file-matrix"),
+        });
+        log("running: node matrix.ts\n", "info");
+        const proc = await pod.spawn("node", ["matrix.ts"], { cwd: "/app" });
+        proc.on("output", (t) => {
+          const line = t.trimEnd();
+          if (looksLikeStripBug(line)) sawStripBug = true;
+          log(line, "stdout");
+        });
+        proc.on("error", (t) => {
+          const line = t.trimEnd();
+          if (looksLikeStripBug(line)) sawStripBug = true;
+          log(line, "stderr");
+        });
+        const res = await proc.completion;
+        if (sawStripBug) {
+          log("\nFAIL: Unexpected token '?' in matrix.", "fail");
+        } else if (res.exitCode === 0) {
+          log("\nPASS: matrix ok.", "pass");
+        } else {
+          log(`\nFAIL: matrix exit=${res.exitCode}`, "fail");
+        }
+      } catch (e) {
+        log(`uncaught: ${e?.stack || e}`, "fail");
+      } finally {
+        disableButtons(false);
+      }
+    }
+
+    runCellsBtn.addEventListener("click", runCells);
+    runMatrixBtn.addEventListener("click", runMatrix);
+
+    // Auto-run the exact repro on load
+    runCells();
+  </script>
+</body>
+</html>

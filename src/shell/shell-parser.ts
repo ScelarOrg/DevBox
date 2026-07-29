@@ -70,26 +70,39 @@ export function expandVariables(
       if (raw[i] === "{") {
         i++;
         let name = "";
-        while (i < raw.length && raw[i] !== "}" && raw[i] !== ":" && raw[i] !== "-" && raw[i] !== "=") {
+        while (
+          i < raw.length &&
+          raw[i] !== "}" &&
+          raw[i] !== ":" &&
+          raw[i] !== "-" &&
+          raw[i] !== "="
+        ) {
           name += raw[i++];
         }
+        // POSIX: ${VAR-default} (unset only), ${VAR:-default} (unset or empty)
+        let op: "-" | ":-" | null = null;
         let defaultVal = "";
-        let useDefault = false;
-        if (i < raw.length && (raw[i] === ":" || raw[i] === "-")) {
-          useDefault = true;
-          if (raw[i] === ":") i++;
-          if (i < raw.length && (raw[i] === "-" || raw[i] === "=")) i++;
-          while (i < raw.length && raw[i] !== "}") {
-            defaultVal += raw[i++];
+        if (i < raw.length && raw[i] === ":") {
+          i++;
+          if (i < raw.length && (raw[i] === "-" || raw[i] === "=")) {
+            op = ":-";
+            i++;
+            while (i < raw.length && raw[i] !== "}") defaultVal += raw[i++];
           }
+        } else if (i < raw.length && (raw[i] === "-" || raw[i] === "=")) {
+          op = "-";
+          i++;
+          while (i < raw.length && raw[i] !== "}") defaultVal += raw[i++];
         }
         if (i < raw.length && raw[i] === "}") i++;
 
         const val = env[name];
-        if (val !== undefined && val !== "") {
+        if (op === ":-") {
+          result += val !== undefined && val !== "" ? val : defaultVal;
+        } else if (op === "-") {
+          result += val !== undefined ? val : defaultVal;
+        } else if (val !== undefined) {
           result += val;
-        } else if (useDefault) {
-          result += defaultVal;
         }
         continue;
       }
@@ -198,6 +211,18 @@ export function tokenize(
       continue;
     }
 
+    if (input.slice(i, i + 3) === "2>>") {
+      tokens.push({ type: "redirect-err-app", value: "2>>" });
+      i += 3;
+      continue;
+    }
+
+    if (input.slice(i, i + 2) === "2>") {
+      tokens.push({ type: "redirect-err", value: "2>" });
+      i += 2;
+      continue;
+    }
+
     if (input[i] === ">" && input[i + 1] === ">") {
       tokens.push({ type: "redirect-app", value: ">>" });
       i += 2;
@@ -222,6 +247,13 @@ export function tokenize(
       continue;
     }
 
+    // bare & — treat as command separator (no background jobs yet)
+    if (input[i] === "&") {
+      tokens.push({ type: "semi", value: "&" });
+      i++;
+      continue;
+    }
+
     if (input[i] === "|" && input[i + 1] === "|") {
       tokens.push({ type: "or", value: "||" });
       i += 2;
@@ -241,21 +273,32 @@ export function tokenize(
     }
 
     let word = "";
+    let unquoted = "";
+    const flushUnquoted = () => {
+      if (unquoted.length > 0) {
+        word += expandVariables(unquoted, env, lastExit);
+        unquoted = "";
+      }
+    };
+
     while (i < input.length) {
       const ch = input[i];
 
       if (ch === " " || ch === "\t" || ch === "\n") break;
       if (ch === "|" || ch === "&" || ch === ";" || ch === ">" || ch === "<") break;
       if (ch === "2" && input.slice(i, i + 4) === "2>&1") break;
+      if (ch === "2" && input.slice(i, i + 3) === "2>>") break;
+      if (ch === "2" && input.slice(i, i + 2) === "2>") break;
 
       if (ch === "\\") {
         i++;
-        if (i < input.length) word += input[i++];
+        if (i < input.length) unquoted += input[i++];
         continue;
       }
 
       // single quotes: no expansion
       if (ch === "'") {
+        flushUnquoted();
         i++;
         while (i < input.length && input[i] !== "'") {
           word += input[i++];
@@ -266,6 +309,7 @@ export function tokenize(
 
       // double quotes: expand variables
       if (ch === '"') {
+        flushUnquoted();
         i++;
         let dqContent = "";
         while (i < input.length && input[i] !== '"') {
@@ -284,13 +328,13 @@ export function tokenize(
         continue;
       }
 
-      word += ch;
+      unquoted += ch;
       i++;
     }
 
+    flushUnquoted();
     if (word.length > 0) {
-      const expanded = expandVariables(word, env, lastExit);
-      tokens.push({ type: "word", value: expanded });
+      tokens.push({ type: "word", value: word });
     }
   }
 
@@ -385,15 +429,23 @@ class Parser {
         continue;
       }
 
-      if (tok.type === "redirect-out" || tok.type === "redirect-app" || tok.type === "redirect-in") {
+      if (
+        tok.type === "redirect-out" ||
+        tok.type === "redirect-app" ||
+        tok.type === "redirect-in" ||
+        tok.type === "redirect-err" ||
+        tok.type === "redirect-err-app"
+      ) {
         this.advance();
         const target = this.peek();
         if (target.type === "word") {
           this.advance();
           const rtype =
-            tok.type === "redirect-out" ? "write" as const :
-            tok.type === "redirect-app" ? "append" as const :
-            "read" as const;
+            tok.type === "redirect-out" ? ("write" as const) :
+            tok.type === "redirect-app" ? ("append" as const) :
+            tok.type === "redirect-err" ? ("stderr-write" as const) :
+            tok.type === "redirect-err-app" ? ("stderr-append" as const) :
+            ("read" as const);
           redirects.push({ type: rtype, target: target.value });
         }
         continue;

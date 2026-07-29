@@ -6,11 +6,12 @@ import { wrap, type Remote } from "comlink";
 import type { OffloadWorkerEndpoint, PoolConfig } from "./offload-types";
 import { createInlineWorker, revokeInlineWorkerUrl } from "./inline-worker";
 import { TIMEOUTS, LIMITS } from "../constants/config";
+import type { HostWorker } from "../host/types";
 
 // --- Internal types ---
 
 interface PooledWorker {
-  thread: Worker;
+  thread: HostWorker;
   endpoint: Remote<OffloadWorkerEndpoint>;
   busy: boolean;
   initialized: boolean;
@@ -161,7 +162,7 @@ export class WorkerPool {
     if (!thread) return null;
 
     try {
-      const endpoint = wrap<OffloadWorkerEndpoint>(thread);
+      const endpoint = wrap<OffloadWorkerEndpoint>(thread as unknown as Worker);
       const id = this.nextId++;
 
       const pooled: PooledWorker = {

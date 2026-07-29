@@ -390,9 +390,23 @@ const rmdir_cmd: BuiltinFn = (args, ctx) => {
   return ok(out);
 };
 
-const chmod: BuiltinFn = (args, _ctx) => {
+const chmod: BuiltinFn = (args, ctx) => {
   if (args.length < 2) return fail("chmod: missing operand\n");
-  return ok(); // no-op in VFS
+  const modeStr = args[0];
+  const files = args.slice(1);
+  if (!/^[0-7]{3,4}$/.test(modeStr)) {
+    return fail(`chmod: invalid mode: '${modeStr}'\n`);
+  }
+  const mode = parseInt(modeStr, 8);
+  for (const file of files) {
+    const p = resolvePath(file, ctx.cwd);
+    try {
+      ctx.volume.chmodSync(p, mode);
+    } catch (e: any) {
+      return fail(`chmod: ${file}: ${e?.message || "failed"}\n`);
+    }
+  }
+  return ok();
 };
 
 const wc: BuiltinFn = (args, ctx, stdin) => {
@@ -473,24 +487,39 @@ const tee: BuiltinFn = (args, ctx, stdin) => {
 };
 
 const readlink_cmd: BuiltinFn = (args, ctx) => {
-  const { positional } = parseArgs(args, ["f", "e", "m", "n", "q", "z"]);
+  const { flags, positional } = parseArgs(args, ["f", "e", "m", "n", "q", "z"]);
   if (positional.length === 0) return fail("readlink: missing operand\n");
   const p = resolvePath(positional[0], ctx.cwd);
-  return ok(p + "\n");
+  try {
+    if (flags.has("f") || flags.has("e") || flags.has("m")) {
+      return ok(ctx.volume.realpathSync(p) + "\n");
+    }
+    return ok(ctx.volume.readlinkSync(p) + "\n");
+  } catch (e: any) {
+    return fail(`readlink: ${positional[0]}: ${e?.message || "failed"}\n`);
+  }
 };
 
 const ln_cmd: BuiltinFn = (args, ctx) => {
-  const { positional } = parseArgs(args, ["s", "f"]);
+  const { flags, positional } = parseArgs(args, ["s", "f"]);
   if (positional.length < 2) return fail("ln: missing operand\n");
-  const src = resolvePath(positional[0], ctx.cwd);
+  const src = positional[0];
   const dst = resolvePath(positional[1], ctx.cwd);
+  const srcPath = resolvePath(src, ctx.cwd);
   try {
-    const content = ctx.volume.readFileSync(src);
-    ctx.volume.writeFileSync(dst, content);
+    if (flags.has("f") && ctx.volume.existsSync(dst)) {
+      ctx.volume.unlinkSync(dst);
+    }
+    if (flags.has("s")) {
+      // store the original target string (relative targets are valid)
+      ctx.volume.symlinkSync(src, dst);
+      return ok();
+    }
+    ctx.volume.linkSync(srcPath, dst);
     return ok();
-  } catch {
+  } catch (e: any) {
     return fail(
-      `ln: cannot create link '${positional[1]}': source not found\n`,
+      `ln: cannot create link '${positional[1]}': ${e?.message || "failed"}\n`,
     );
   }
 };

@@ -234,9 +234,10 @@ function* parseTar(raw: Uint8Array): Generator<TarEntry> {
         byteSize > 0
           ? raw.slice(cursor, cursor + byteSize)
           : new Uint8Array(0);
-      if (byteSize > 0) {
-        cursor += Math.ceil(byteSize / BLOCK) * BLOCK;
-      }
+    }
+    // Always advance past payload blocks so PAX/GNU/link entries don't desync.
+    if (byteSize > 0) {
+      cursor += Math.ceil(byteSize / BLOCK) * BLOCK;
     }
 
     yield { filepath, kind, byteSize, payload };

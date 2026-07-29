@@ -344,9 +344,49 @@ export function createConnection(
 export const connect = createConnection;
 
 export function isIP(addr: string): number {
-  if (/^(\d{1,3}\.){3}\d{1,3}$/.test(addr)) return 4;
-  if (/^([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}$/.test(addr)) return 6;
+  if (typeof addr !== "string" || addr.length === 0) return 0;
+  if (isIPv4Literal(addr)) return 4;
+  if (isIPv6Literal(addr)) return 6;
   return 0;
+}
+
+function isIPv4Literal(addr: string): boolean {
+  const parts = addr.split(".");
+  if (parts.length !== 4) return false;
+  for (const p of parts) {
+    if (!/^\d{1,3}$/.test(p)) return false;
+    // no leading zeros (except "0" itself)
+    if (p.length > 1 && p[0] === "0") return false;
+    const n = Number(p);
+    if (n < 0 || n > 255) return false;
+  }
+  return true;
+}
+
+function isIPv6Literal(addr: string): boolean {
+  // Reject obvious non-IPv6
+  if (addr.includes(":::")) return false;
+  // IPv4-mapped / embedded
+  const v4Tail = addr.match(/:(\d{1,3}(?:\.\d{1,3}){3})$/);
+  let core = addr;
+  if (v4Tail) {
+    if (!isIPv4Literal(v4Tail[1]!)) return false;
+    core = addr.slice(0, -v4Tail[1]!.length) + "0:0";
+  }
+  if (core.includes(".")) return false;
+  const sides = core.split("::");
+  if (sides.length > 2) return false;
+  const checkGroup = (g: string) => /^[0-9a-fA-F]{1,4}$/.test(g);
+  if (sides.length === 1) {
+    const groups = sides[0]!.split(":");
+    return groups.length === 8 && groups.every(checkGroup);
+  }
+  const left = sides[0] === "" ? [] : sides[0]!.split(":");
+  const right = sides[1] === "" ? [] : sides[1]!.split(":");
+  if (left.some((g) => g !== "" && !checkGroup(g))) return false;
+  if (right.some((g) => g !== "" && !checkGroup(g))) return false;
+  if (left.length + right.length >= 8) return false;
+  return true;
 }
 
 export function isIPv4(addr: string): boolean {

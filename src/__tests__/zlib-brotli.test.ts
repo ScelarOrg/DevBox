@@ -20,6 +20,11 @@ import {
   brotliCompressSync,
   brotliDecompressSync,
   preloadBrotli,
+  createBrotliCompress,
+  createBrotliDecompress,
+  createGzip,
+  createGunzip,
+  promises as zlibPromises,
 } from "../polyfills/zlib";
 import { Buffer } from "../polyfills/buffer";
 
@@ -133,5 +138,64 @@ describe("brotli (issue #17)", () => {
       const decompressed = brotliDecompressSync(compressed);
       expect(decompressed.toString()).toBe(input);
     }
+  });
+
+  it("brotli stream roundtrips multi-chunk input (buffer-until-flush)", async () => {
+    const original = "abcdefghijklmnopqrstuvwxyz0123456789";
+    const compress = createBrotliCompress();
+    const chunks: Buffer[] = [];
+    compress.on("data", (c: Buffer) => chunks.push(Buffer.from(c)));
+    const done = new Promise<void>((resolve, reject) => {
+      compress.on("end", () => resolve());
+      compress.on("error", reject);
+    });
+    compress.write(original.slice(0, 10));
+    compress.write(original.slice(10, 20));
+    compress.end(original.slice(20));
+    await done;
+    const compressed = Buffer.concat(chunks);
+
+    const decompress = createBrotliDecompress();
+    const out: Buffer[] = [];
+    decompress.on("data", (c: Buffer) => out.push(Buffer.from(c)));
+    const done2 = new Promise<void>((resolve, reject) => {
+      decompress.on("end", () => resolve());
+      decompress.on("error", reject);
+    });
+    // Split compressed bytes across writes
+    const mid = Math.floor(compressed.length / 2) || 1;
+    decompress.write(compressed.subarray(0, mid));
+    decompress.end(compressed.subarray(mid));
+    await done2;
+    expect(Buffer.concat(out).toString()).toBe(original);
+  });
+
+  it("zlib/promises.gzip roundtrips", async () => {
+    const compressed = await zlibPromises.gzip("hello promises");
+    const decompressed = await zlibPromises.gunzip(compressed);
+    expect(decompressed.toString()).toBe("hello promises");
+  });
+});
+
+describe("Gunzip windowBits", () => {
+  it("createGunzip works with explicit windowBits: 15", async () => {
+    const gzip = createGzip();
+    const parts: Buffer[] = [];
+    gzip.on("data", (c: Buffer) => parts.push(Buffer.from(c)));
+    const compressed = await new Promise<Buffer>((resolve, reject) => {
+      gzip.on("end", () => resolve(Buffer.concat(parts)));
+      gzip.on("error", reject);
+      gzip.end("gzip-windowbits");
+    });
+
+    const gunzip = createGunzip({ windowBits: 15 });
+    const out: Buffer[] = [];
+    gunzip.on("data", (c: Buffer) => out.push(Buffer.from(c)));
+    await new Promise<void>((resolve, reject) => {
+      gunzip.on("end", () => resolve());
+      gunzip.on("error", reject);
+      gunzip.end(compressed);
+    });
+    expect(Buffer.concat(out).toString()).toBe("gzip-windowbits");
   });
 });

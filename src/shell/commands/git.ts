@@ -283,9 +283,42 @@ class GitRepo {
     return hash;
   }
 
+  /** Store an object under an explicit hash (e.g. remote GitHub SHA). */
+  writeObjectAt(hash: string, type: string, content: string): void {
+    const store = this.readStore();
+    store[hash] = { type, data: content };
+    this.writeStore(store);
+  }
+
   readObject(hash: string): { type: string; data: string } | null {
     const store = this.readStore();
     return store[hash] ?? null;
+  }
+
+  /** True if `ancestor` appears in the parent chain of `tip` (inclusive). */
+  isAncestor(ancestor: string | null, tip: string | null): boolean {
+    if (!ancestor || !tip) return !ancestor;
+    if (ancestor === tip) return true;
+    const seen = new Set<string>();
+    const queue = [tip];
+    while (queue.length) {
+      const h = queue.shift()!;
+      if (seen.has(h)) continue;
+      seen.add(h);
+      if (h === ancestor) return true;
+      const c = this.readCommit(h);
+      if (!c) continue;
+      if (c.parent) queue.push(c.parent);
+      if (c.parent2) queue.push(c.parent2);
+    }
+    return false;
+  }
+
+  updateRemoteRef(remote: string, branch: string, hash: string): void {
+    const refPath = this.gitDir + "/refs/remotes/" + remote + "/" + branch;
+    const dir = refPath.substring(0, refPath.lastIndexOf("/"));
+    if (!this.vol.existsSync(dir)) this.vol.mkdirSync(dir, { recursive: true });
+    this.vol.writeFileSync(refPath, hash + "\n");
   }
 
   /* -- index (staging area) -- */
@@ -340,22 +373,53 @@ class GitRepo {
   }
 
   resolveRef(ref: string): string | null {
-    if (/^[0-9a-f]{40}$/.test(ref)) return ref;
+    if (ref === "HEAD" || ref === "@") return this.resolveHEAD();
+    if (/^[0-9a-f]{40}$/i.test(ref)) return this.peelToCommit(ref.toLowerCase());
     if (ref.startsWith("ref: ")) {
       const target = ref.slice(5);
       try {
-        return (this.vol.readFileSync(this.gitDir + "/" + target, "utf8" as any) as string).trim();
+        const hash = (this.vol.readFileSync(this.gitDir + "/" + target, "utf8" as any) as string).trim();
+        return this.peelToCommit(hash);
       } catch {
         return null;
       }
     }
     // try branch, then tag
     try {
-      return (this.vol.readFileSync(this.gitDir + "/refs/heads/" + ref, "utf8" as any) as string).trim();
+      const hash = (this.vol.readFileSync(this.gitDir + "/refs/heads/" + ref, "utf8" as any) as string).trim();
+      return this.peelToCommit(hash);
     } catch { /* */ }
     try {
-      return (this.vol.readFileSync(this.gitDir + "/refs/tags/" + ref, "utf8" as any) as string).trim();
+      const hash = (this.vol.readFileSync(this.gitDir + "/refs/tags/" + ref, "utf8" as any) as string).trim();
+      return this.peelToCommit(hash);
     } catch { /* */ }
+    // short SHA
+    if (/^[0-9a-f]{4,39}$/i.test(ref)) {
+      const store = this.readStore();
+      const matches = Object.keys(store).filter(
+        (h) => h.startsWith(ref.toLowerCase()) && store[h].type === "commit",
+      );
+      if (matches.length === 1) return matches[0];
+      if (matches.length === 0) {
+        const any = Object.keys(store).filter((h) => h.startsWith(ref.toLowerCase()));
+        if (any.length === 1) return this.peelToCommit(any[0]);
+      }
+    }
+    return null;
+  }
+
+  peelToCommit(hash: string): string | null {
+    const obj = this.readObject(hash);
+    if (!obj) return null;
+    if (obj.type === "commit") return hash;
+    if (obj.type === "tag") {
+      try {
+        const tag = JSON.parse(obj.data) as { object: string };
+        return this.peelToCommit(tag.object);
+      } catch {
+        return null;
+      }
+    }
     return null;
   }
 
@@ -586,6 +650,93 @@ class GitRepo {
     const obj = this.readObject(hash);
     if (!obj || obj.type !== "blob") return null;
     return obj.data;
+  }
+
+  checkoutTree(tree: Map<string, string>, vol: MemoryVolume): void {
+    // remove tracked files not in tree
+    const index = this.readIndex();
+    for (const e of index) {
+      if (!tree.has(e.path)) {
+        const full = this.workDir + "/" + e.path;
+        try {
+          if (vol.existsSync(full)) vol.unlinkSync(full);
+        } catch {
+          /* */
+        }
+      }
+    }
+    const newIndex: IndexEntry[] = [];
+    for (const [path, blobHash] of tree) {
+      const content = this.getBlobContent(blobHash);
+      if (content === null) continue;
+      const fullPath = this.workDir + "/" + path;
+      const dir = fullPath.substring(0, fullPath.lastIndexOf("/"));
+      if (dir && !vol.existsSync(dir)) vol.mkdirSync(dir, { recursive: true });
+      vol.writeFileSync(fullPath, content);
+      newIndex.push({ path, hash: blobHash, mode: 100644, mtime: Date.now() });
+    }
+    newIndex.sort((a, b) => a.path.localeCompare(b.path));
+    this.writeIndex(newIndex);
+  }
+
+  findMergeBase(a: string, b: string): string | null {
+    const ancestorsA = new Set<string>();
+    let cur: string | null = a;
+    for (let i = 0; i < 5000 && cur; i++) {
+      ancestorsA.add(cur);
+      const c = this.readCommit(cur);
+      if (!c) break;
+      cur = c.parent;
+    }
+    cur = b;
+    for (let i = 0; i < 5000 && cur; i++) {
+      if (ancestorsA.has(cur)) return cur;
+      const c = this.readCommit(cur);
+      if (!c) break;
+      cur = c.parent;
+    }
+    return null;
+  }
+
+  listTags(): string[] {
+    try {
+      return this.vol.readdirSync(this.gitDir + "/refs/tags") as string[];
+    } catch {
+      return [];
+    }
+  }
+
+  updateTagRef(name: string, hash: string): void {
+    const refPath = this.gitDir + "/refs/tags/" + name;
+    const dir = refPath.substring(0, refPath.lastIndexOf("/"));
+    if (!this.vol.existsSync(dir)) this.vol.mkdirSync(dir, { recursive: true });
+    this.vol.writeFileSync(refPath, hash + "\n");
+  }
+
+  deleteTag(name: string): boolean {
+    try {
+      const refPath = this.gitDir + "/refs/tags/" + name;
+      if (this.vol.existsSync(refPath)) {
+        this.vol.unlinkSync(refPath);
+        return true;
+      }
+    } catch {
+      /* */
+    }
+    return false;
+  }
+
+  writeAnnotatedTag(name: string, commitHash: string, message: string): string {
+    const tagger = `${this.getConfigValue("user.name") ?? "nodepod-user"} <${this.getConfigValue("user.email") ?? "user@nodepod.dev"}>`;
+    const data = JSON.stringify({
+      object: commitHash,
+      type: "commit",
+      tag: name,
+      tagger,
+      timestamp: Date.now(),
+      message,
+    });
+    return this.writeObject("tag", data);
   }
 
   /* -- diff helpers -- */
@@ -1488,6 +1639,113 @@ function gitRemote(args: string[], ctx: ShellContext): ShellResult {
   return ok(out);
 }
 
+function threeWayMergeFile(
+  base: string | null,
+  ours: string | null,
+  theirs: string | null,
+): { content: string; conflict: boolean } {
+  if (ours === theirs) return { content: ours ?? "", conflict: false };
+  if (base === ours) return { content: theirs ?? "", conflict: false };
+  if (base === theirs) return { content: ours ?? "", conflict: false };
+  const o = ours ?? "";
+  const t = theirs ?? "";
+  const content =
+    `<<<<<<< HEAD\n${o}${o.endsWith("\n") || o === "" ? "" : "\n"}=======\n${t}${t.endsWith("\n") || t === "" ? "" : "\n"}>>>>>>> theirs\n`;
+  return { content, conflict: true };
+}
+
+function applyThreeWayTrees(
+  repo: GitRepo,
+  vol: MemoryVolume,
+  baseTree: Map<string, string>,
+  oursTree: Map<string, string>,
+  theirsTree: Map<string, string>,
+): { conflicts: string[]; merged: Map<string, string> } {
+  const paths = new Set([...baseTree.keys(), ...oursTree.keys(), ...theirsTree.keys()]);
+  const merged = new Map<string, string>();
+  const conflicts: string[] = [];
+
+  const writeBlob = (path: string, blobHash: string) => {
+    const content = repo.getBlobContent(blobHash);
+    if (content === null) return;
+    const full = repo.workDir + "/" + path;
+    const dir = full.substring(0, full.lastIndexOf("/"));
+    if (dir && !vol.existsSync(dir)) vol.mkdirSync(dir, { recursive: true });
+    vol.writeFileSync(full, content);
+  };
+
+  for (const path of paths) {
+    const baseH = baseTree.get(path) ?? null;
+    const oursH = oursTree.get(path) ?? null;
+    const theirsH = theirsTree.get(path) ?? null;
+    const base = baseH ? repo.getBlobContent(baseH) : null;
+    const ours = oursH ? repo.getBlobContent(oursH) : null;
+    const theirs = theirsH ? repo.getBlobContent(theirsH) : null;
+
+    // deleted both / unchanged
+    if (oursH === theirsH) {
+      if (oursH) {
+        merged.set(path, oursH);
+        writeBlob(path, oursH);
+      }
+      continue;
+    }
+    if (oursH === baseH && theirsH) {
+      merged.set(path, theirsH);
+      writeBlob(path, theirsH);
+      continue;
+    }
+    if (theirsH === baseH && oursH) {
+      merged.set(path, oursH);
+      writeBlob(path, oursH);
+      continue;
+    }
+    if (!oursH && !theirsH) continue;
+
+    const result = threeWayMergeFile(base, ours, theirs);
+    if (result.conflict) {
+      conflicts.push(path);
+      const full = repo.workDir + "/" + path;
+      const dir = full.substring(0, full.lastIndexOf("/"));
+      if (dir && !vol.existsSync(dir)) vol.mkdirSync(dir, { recursive: true });
+      vol.writeFileSync(full, result.content);
+      const hash = repo.writeObject("blob", result.content);
+      merged.set(path, hash);
+    } else if (result.content === "" && !oursH && !theirsH) {
+      /* deleted */
+    } else {
+      const hash = repo.writeObject("blob", result.content);
+      merged.set(path, hash);
+      const full = repo.workDir + "/" + path;
+      const dir = full.substring(0, full.lastIndexOf("/"));
+      if (dir && !vol.existsSync(dir)) vol.mkdirSync(dir, { recursive: true });
+      vol.writeFileSync(full, result.content);
+    }
+  }
+
+  // write index from merged
+  const newIndex: IndexEntry[] = [];
+  for (const [path, blobHash] of merged) {
+    newIndex.push({ path, hash: blobHash, mode: 100644, mtime: Date.now() });
+  }
+  newIndex.sort((a, b) => a.path.localeCompare(b.path));
+  repo.writeIndex(newIndex);
+
+  // remove files deleted in merge
+  for (const path of baseTree.keys()) {
+    if (!merged.has(path) && !conflicts.includes(path)) {
+      const full = repo.workDir + "/" + path;
+      try {
+        if (vol.existsSync(full)) vol.unlinkSync(full);
+      } catch {
+        /* */
+      }
+    }
+  }
+
+  return { conflicts, merged };
+}
+
 function gitMerge(args: string[], ctx: ShellContext): ShellResult {
   const r = requireRepo(ctx.volume, ctx.cwd);
   if ("error" in r) return r.error;
@@ -1495,9 +1753,15 @@ function gitMerge(args: string[], ctx: ShellContext): ShellResult {
 
   if (args.includes("--abort")) {
     try {
+      const mergeHead = (ctx.volume.readFileSync(repo.gitDir + "/MERGE_HEAD", "utf8" as any) as string).trim();
+      void mergeHead;
+      const head = repo.resolveHEAD();
+      if (head) repo.checkoutTree(repo.getCommitTree(head), ctx.volume);
       ctx.volume.unlinkSync(repo.gitDir + "/MERGE_HEAD");
-      ctx.volume.unlinkSync(repo.gitDir + "/MERGE_MSG");
-    } catch { /* */ }
+      try { ctx.volume.unlinkSync(repo.gitDir + "/MERGE_MSG"); } catch { /* */ }
+    } catch {
+      return fail("fatal: There is no merge to abort\n", 128);
+    }
     return ok("Merge aborted.\n");
   }
 
@@ -1511,6 +1775,7 @@ function gitMerge(args: string[], ctx: ShellContext): ShellResult {
   if (!currentHash) {
     const branch = repo.getCurrentBranch();
     if (branch) repo.updateBranchRef(branch, targetHash);
+    repo.checkoutTree(repo.getCommitTree(targetHash), ctx.volume);
     return ok(`Fast-forward\n`);
   }
 
@@ -1532,25 +1797,25 @@ function gitMerge(args: string[], ctx: ShellContext): ShellResult {
     const branch = repo.getCurrentBranch();
     if (branch) repo.updateBranchRef(branch, targetHash);
     else repo.setHEAD(targetHash);
-
-    const targetTree = repo.getCommitTree(targetHash);
-    for (const [path, blobHash] of targetTree) {
-      const content = repo.getBlobContent(blobHash);
-      if (content !== null) {
-        const fullPath = repo.workDir + "/" + path;
-        const dir = fullPath.substring(0, fullPath.lastIndexOf("/"));
-        if (dir && !ctx.volume.existsSync(dir)) ctx.volume.mkdirSync(dir, { recursive: true });
-        ctx.volume.writeFileSync(fullPath, content);
-      }
-    }
-
-    const newIndex: IndexEntry[] = [];
-    for (const [path, blobHash] of targetTree) {
-      newIndex.push({ path, hash: blobHash, mode: 100644, mtime: Date.now() });
-    }
-    repo.writeIndex(newIndex);
-
+    repo.checkoutTree(repo.getCommitTree(targetHash), ctx.volume);
     return ok(`Updating ${currentHash.slice(0, 7)}..${targetHash.slice(0, 7)}\nFast-forward\n`);
+  }
+
+  const base = repo.findMergeBase(currentHash, targetHash);
+  const baseTree = base ? repo.getCommitTree(base) : new Map<string, string>();
+  const oursTree = repo.getCommitTree(currentHash);
+  const theirsTree = repo.getCommitTree(targetHash);
+  const { conflicts } = applyThreeWayTrees(repo, ctx.volume, baseTree, oursTree, theirsTree);
+
+  if (conflicts.length > 0) {
+    ctx.volume.writeFileSync(repo.gitDir + "/MERGE_HEAD", targetHash + "\n");
+    ctx.volume.writeFileSync(
+      repo.gitDir + "/MERGE_MSG",
+      `Merge branch '${target}'\n\nConflicts:\n${conflicts.map((c) => `\t${c}`).join("\n")}\n`,
+    );
+    let out = `Auto-merging failed; fix conflicts and then commit the result.\n`;
+    for (const c of conflicts) out += `CONFLICT (content): Merge conflict in ${c}\n`;
+    return { stdout: out, stderr: "", exitCode: 1 };
   }
 
   const entries = repo.readIndex();
@@ -1563,6 +1828,448 @@ function gitMerge(args: string[], ctx: ShellContext): ShellResult {
   else repo.setHEAD(mergeHash);
 
   return ok(`Merge made by the 'recursive' strategy.\n`);
+}
+
+function gitTag(args: string[], ctx: ShellContext): ShellResult {
+  const r = requireRepo(ctx.volume, ctx.cwd);
+  if ("error" in r) return r.error;
+  const { repo } = r;
+
+  if (args.includes("-d") || args.includes("--delete")) {
+    const name = args.filter((a) => !a.startsWith("-"))[0];
+    if (!name) return fail("error: tag name required\n");
+    if (repo.deleteTag(name)) return ok(`Deleted tag '${name}'\n`);
+    return fail(`error: tag '${name}' not found.\n`);
+  }
+
+  const annotate = args.includes("-a") || args.includes("-m");
+  let message = "";
+  const mIdx = args.indexOf("-m");
+  if (mIdx >= 0) message = args[mIdx + 1] ?? "";
+
+  const positional = args.filter((a, i) => {
+    if (a.startsWith("-")) return false;
+    if (mIdx >= 0 && i === mIdx + 1) return false;
+    return true;
+  });
+
+  if (positional.length === 0) {
+    return ok(repo.listTags().sort().map((t) => t + "\n").join(""));
+  }
+
+  const name = positional[0];
+  const commitRef = positional[1] ?? "HEAD";
+  const commitHash = repo.resolveRef(commitRef);
+  if (!commitHash) return fail(`fatal: Failed to resolve '${commitRef}' as a valid ref.\n`, 128);
+
+  if (annotate || message) {
+    const tagHash = repo.writeAnnotatedTag(name, commitHash, message || name);
+    repo.updateTagRef(name, tagHash);
+  } else {
+    repo.updateTagRef(name, commitHash);
+  }
+  return ok("");
+}
+
+function gitShow(args: string[], ctx: ShellContext): ShellResult {
+  const r = requireRepo(ctx.volume, ctx.cwd);
+  if ("error" in r) return r.error;
+  const { repo } = r;
+
+  const ref = args.filter((a) => !a.startsWith("-"))[0] ?? "HEAD";
+  let hash = repo.resolveRef(ref);
+  if (!hash && /^[0-9a-f]{4,40}$/i.test(ref)) {
+    hash = repo.peelToCommit(ref) ?? repo.resolveRef(ref);
+  }
+  // also try raw object for tags
+  let objHash = hash;
+  try {
+    const tagRaw = (ctx.volume.readFileSync(repo.gitDir + "/refs/tags/" + ref, "utf8" as any) as string).trim();
+    objHash = tagRaw;
+  } catch {
+    /* */
+  }
+
+  if (!hash && !objHash) return fail(`fatal: ambiguous argument '${ref}'\n`, 128);
+
+  const showHash = hash ?? objHash!;
+  const commit = repo.readCommit(showHash);
+  if (commit) {
+    let out = `${YELLOW}commit ${showHash}${RESET}\n`;
+    out += `Author: ${commit.author}\n`;
+    out += `Date:   ${new Date(commit.timestamp).toUTCString()}\n\n`;
+    out += `    ${commit.message}\n\n`;
+    const parentTree = commit.parent
+      ? repo.getCommitTree(commit.parent)
+      : new Map<string, string>();
+    const tree = repo.getCommitTree(showHash);
+    const paths = new Set([...parentTree.keys(), ...tree.keys()]);
+    for (const path of [...paths].sort()) {
+      const oldH = parentTree.get(path);
+      const newH = tree.get(path);
+      if (oldH === newH) continue;
+      const oldC = oldH ? repo.getBlobContent(oldH) ?? "" : "";
+      const newC = newH ? repo.getBlobContent(newH) ?? "" : "";
+      out += `${BOLD}diff --git a/${path} b/${path}${RESET}\n`;
+      const ops = myersDiff(oldC.split("\n"), newC.split("\n"));
+      for (const hunk of buildHunks(ops, 3)) {
+        out += `${CYAN}@@ -${hunk.oldStart},${hunk.oldCount} +${hunk.newStart},${hunk.newCount} @@${RESET}\n`;
+        for (const op of hunk.lines) {
+          if (op.kind === "equal") out += ` ${op.line}\n`;
+          else if (op.kind === "delete") out += `${RED}-${op.line}${RESET}\n`;
+          else out += `${GREEN}+${op.line}${RESET}\n`;
+        }
+      }
+    }
+    return ok(out);
+  }
+
+  const obj = repo.readObject(showHash);
+  if (obj?.type === "tag") {
+    const tag = JSON.parse(obj.data);
+    return ok(
+      `tag ${tag.tag}\nTagger: ${tag.tagger}\n\n${tag.message}\n\n` +
+        (gitShow([tag.object], ctx).stdout || ""),
+    );
+  }
+  if (obj?.type === "blob") return ok(obj.data);
+
+  return fail(`fatal: bad object ${ref}\n`, 128);
+}
+
+function gitRestore(args: string[], ctx: ShellContext): ShellResult {
+  const r = requireRepo(ctx.volume, ctx.cwd);
+  if ("error" in r) return r.error;
+  const { repo } = r;
+
+  const staged = args.includes("--staged");
+  const sourceIdx = args.indexOf("--source");
+  const source = sourceIdx >= 0 ? args[sourceIdx + 1] : "HEAD";
+  const paths = args.filter((a, i) => {
+    if (a.startsWith("-")) return false;
+    if (sourceIdx >= 0 && i === sourceIdx + 1) return false;
+    return true;
+  });
+  if (paths.length === 0) return fail("error: pathspec required\n");
+
+  const srcHash = repo.resolveRef(source);
+  const srcTree = srcHash ? repo.getCommitTree(srcHash) : new Map<string, string>();
+
+  for (const p of paths) {
+    const absPath = pathModule.resolve(ctx.cwd, p);
+    const relPath = pathModule.relative(repo.workDir, absPath);
+    if (staged) {
+      const blob = srcTree.get(relPath);
+      if (blob) {
+        const entries = repo.readIndex();
+        const idx = entries.findIndex((e) => e.path === relPath);
+        const entry: IndexEntry = { path: relPath, hash: blob, mode: 100644, mtime: Date.now() };
+        if (idx >= 0) entries[idx] = entry;
+        else entries.push(entry);
+        entries.sort((a, b) => a.path.localeCompare(b.path));
+        repo.writeIndex(entries);
+      } else {
+        repo.removeFromIndex(relPath);
+      }
+    } else {
+      const blob = srcTree.get(relPath);
+      if (blob) {
+        const content = repo.getBlobContent(blob);
+        if (content !== null) {
+          const dir = absPath.substring(0, absPath.lastIndexOf("/"));
+          if (dir && !ctx.volume.existsSync(dir))
+            ctx.volume.mkdirSync(dir, { recursive: true });
+          ctx.volume.writeFileSync(absPath, content);
+        }
+      }
+    }
+  }
+  return ok("");
+}
+
+function gitClean(args: string[], ctx: ShellContext): ShellResult {
+  const r = requireRepo(ctx.volume, ctx.cwd);
+  if ("error" in r) return r.error;
+  const { repo } = r;
+
+  const force = args.includes("-f") || args.includes("--force");
+  const dryRun = args.includes("-n") || args.includes("--dry-run");
+  const dirs = args.includes("-d");
+  if (!force && !dryRun) {
+    return fail("fatal: clean.requireForce defaults to true; use -f or -n\n", 128);
+  }
+
+  const untracked = repo.getUntrackedFiles();
+  let out = "";
+  for (const p of untracked) {
+    out += `Removing ${p}\n`;
+    if (!dryRun) {
+      try {
+        ctx.volume.unlinkSync(repo.workDir + "/" + p);
+      } catch {
+        /* */
+      }
+    }
+  }
+  if (dirs && !dryRun) {
+    // best-effort: remove empty dirs under workDir (except .git)
+    const tryRmEmpty = (dir: string) => {
+      let entries: string[];
+      try {
+        entries = ctx.volume.readdirSync(dir) as string[];
+      } catch {
+        return;
+      }
+      for (const name of entries) {
+        if (name === ".git") continue;
+        const full = dir + "/" + name;
+        try {
+          if (ctx.volume.statSync(full).isDirectory()) tryRmEmpty(full);
+        } catch {
+          /* */
+        }
+      }
+      if (dir === repo.workDir) return;
+      try {
+        const left = ctx.volume.readdirSync(dir) as string[];
+        if (left.length === 0) ctx.volume.rmdirSync(dir);
+      } catch {
+        /* */
+      }
+    };
+    tryRmEmpty(repo.workDir);
+  }
+  return ok(out);
+}
+
+function gitCherryPick(args: string[], ctx: ShellContext): ShellResult {
+  const r = requireRepo(ctx.volume, ctx.cwd);
+  if ("error" in r) return r.error;
+  const { repo } = r;
+
+  if (args.includes("--abort")) {
+    try {
+      ctx.volume.unlinkSync(repo.gitDir + "/CHERRY_PICK_HEAD");
+      const head = repo.resolveHEAD();
+      if (head) repo.checkoutTree(repo.getCommitTree(head), ctx.volume);
+    } catch {
+      return fail("fatal: no cherry-pick in progress\n", 128);
+    }
+    return ok("");
+  }
+
+  const ref = args.filter((a) => !a.startsWith("-"))[0];
+  if (!ref) return fail("error: commit required\n");
+  const pickHash = repo.resolveRef(ref);
+  if (!pickHash) return fail(`fatal: bad revision '${ref}'\n`, 128);
+  const pick = repo.readCommit(pickHash);
+  if (!pick) return fail(`fatal: bad revision '${ref}'\n`, 128);
+
+  const head = repo.resolveHEAD();
+  if (!head) return fail("fatal: not a valid HEAD\n", 128);
+
+  const baseTree = pick.parent
+    ? repo.getCommitTree(pick.parent)
+    : new Map<string, string>();
+  const theirsTree = repo.getCommitTree(pickHash);
+  const oursTree = repo.getCommitTree(head);
+  const { conflicts } = applyThreeWayTrees(repo, ctx.volume, baseTree, oursTree, theirsTree);
+
+  if (conflicts.length > 0) {
+    ctx.volume.writeFileSync(repo.gitDir + "/CHERRY_PICK_HEAD", pickHash + "\n");
+    let out = "";
+    for (const c of conflicts) out += `error: could not apply ${pickHash.slice(0, 7)}... ${pick.message.split("\n")[0]}\nCONFLICT in ${c}\n`;
+    return { stdout: out, stderr: "", exitCode: 1 };
+  }
+
+  const treeHash = repo.buildTree(repo.readIndex());
+  const newHash = repo.createCommit(pick.message, head, treeHash);
+  const branch = repo.getCurrentBranch();
+  if (branch) repo.updateBranchRef(branch, newHash);
+  else repo.setHEAD(newHash);
+  return ok(`[${branch ?? "detached"} ${newHash.slice(0, 7)}] ${pick.message.split("\n")[0]}\n`);
+}
+
+function gitRevert(args: string[], ctx: ShellContext): ShellResult {
+  const r = requireRepo(ctx.volume, ctx.cwd);
+  if ("error" in r) return r.error;
+  const { repo } = r;
+
+  const ref = args.filter((a) => !a.startsWith("-"))[0];
+  if (!ref) return fail("error: commit required\n");
+  const revHash = repo.resolveRef(ref);
+  if (!revHash) return fail(`fatal: bad revision '${ref}'\n`, 128);
+  const rev = repo.readCommit(revHash);
+  if (!rev) return fail(`fatal: bad revision '${ref}'\n`, 128);
+
+  const head = repo.resolveHEAD();
+  if (!head) return fail("fatal: not a valid HEAD\n", 128);
+
+  // invert: base=commit, ours=HEAD, theirs=parent
+  const baseTree = repo.getCommitTree(revHash);
+  const theirsTree = rev.parent
+    ? repo.getCommitTree(rev.parent)
+    : new Map<string, string>();
+  const oursTree = repo.getCommitTree(head);
+  const { conflicts } = applyThreeWayTrees(repo, ctx.volume, baseTree, oursTree, theirsTree);
+  if (conflicts.length > 0) {
+    let out = "";
+    for (const c of conflicts) out += `CONFLICT in ${c}\n`;
+    return { stdout: out, stderr: "", exitCode: 1 };
+  }
+  const treeHash = repo.buildTree(repo.readIndex());
+  const msg = `Revert "${rev.message.split("\n")[0]}"\n\nThis reverts commit ${revHash}.\n`;
+  const newHash = repo.createCommit(msg, head, treeHash);
+  const branch = repo.getCurrentBranch();
+  if (branch) repo.updateBranchRef(branch, newHash);
+  else repo.setHEAD(newHash);
+  return ok(`[${branch ?? "detached"} ${newHash.slice(0, 7)}] ${msg.split("\n")[0]}\n`);
+}
+
+function gitBlame(args: string[], ctx: ShellContext): ShellResult {
+  const r = requireRepo(ctx.volume, ctx.cwd);
+  if ("error" in r) return r.error;
+  const { repo } = r;
+
+  const file = args.filter((a) => !a.startsWith("-"))[0];
+  if (!file) return fail("usage: git blame <file>\n");
+  const absPath = pathModule.resolve(ctx.cwd, file);
+  const relPath = pathModule.relative(repo.workDir, absPath);
+  let content: string;
+  try {
+    content = ctx.volume.readFileSync(absPath, "utf8" as any) as string;
+  } catch {
+    return fail(`fatal: no such path '${file}'\n`, 128);
+  }
+  const lines = content.split("\n");
+  if (lines.length && lines[lines.length - 1] === "") lines.pop();
+
+  const head = repo.resolveHEAD();
+  const history = head ? repo.walkLog(head, 500) : [];
+  // attribution: walk from oldest to newest
+  const blame: Array<{ hash: string; author: string; line: string }> = lines.map((line) => ({
+    hash: "0000000",
+    author: "unknown",
+    line,
+  }));
+
+  let prevTree = new Map<string, string>();
+  for (let i = history.length - 1; i >= 0; i--) {
+    const c = history[i];
+    const tree = repo.getCommitTree(c.hash);
+    const oldC = prevTree.has(relPath)
+      ? repo.getBlobContent(prevTree.get(relPath)!) ?? ""
+      : "";
+    const newC = tree.has(relPath)
+      ? repo.getBlobContent(tree.get(relPath)!) ?? ""
+      : "";
+    if (oldC !== newC) {
+      const newLines = newC.split("\n");
+      if (newLines.length && newLines[newLines.length - 1] === "") newLines.pop();
+      const ops = myersDiff(oldC.split("\n").filter((_, idx, arr) => !(idx === arr.length - 1 && arr[idx] === "")), newLines);
+      // simpler: if line content appears in this commit's file and differs from previous, attribute
+      for (let li = 0; li < lines.length; li++) {
+        if (newLines[li] === lines[li] && (oldC.split("\n")[li] !== lines[li] || !prevTree.has(relPath))) {
+          blame[li] = {
+            hash: c.hash.slice(0, 7),
+            author: c.author.split(" <")[0],
+            line: lines[li],
+          };
+        }
+      }
+    }
+    prevTree = tree;
+  }
+
+  let out = "";
+  for (const b of blame) {
+    out += `${b.hash} (${b.author}) ${b.line}\n`;
+  }
+  return ok(out);
+}
+
+function gitRebase(args: string[], ctx: ShellContext): ShellResult {
+  const r = requireRepo(ctx.volume, ctx.cwd);
+  if ("error" in r) return r.error;
+  const { repo } = r;
+
+  if (args.includes("--abort")) {
+    try {
+      const onto = (ctx.volume.readFileSync(repo.gitDir + "/REBASE_HEAD", "utf8" as any) as string).trim();
+      void onto;
+      const orig = (ctx.volume.readFileSync(repo.gitDir + "/REBASE_ORIG_HEAD", "utf8" as any) as string).trim();
+      repo.checkoutTree(repo.getCommitTree(orig), ctx.volume);
+      const branch = repo.getCurrentBranch();
+      if (branch) repo.updateBranchRef(branch, orig);
+      else repo.setHEAD(orig);
+      try { ctx.volume.unlinkSync(repo.gitDir + "/REBASE_HEAD"); } catch { /* */ }
+      try { ctx.volume.unlinkSync(repo.gitDir + "/REBASE_ORIG_HEAD"); } catch { /* */ }
+    } catch {
+      return fail("fatal: no rebase in progress\n", 128);
+    }
+    return ok("Rebase aborted.\n");
+  }
+
+  const ontoRef = args.filter((a) => !a.startsWith("-"))[0];
+  if (!ontoRef) return fail("usage: git rebase <upstream>\n");
+  const onto = repo.resolveRef(ontoRef);
+  const head = repo.resolveHEAD();
+  if (!onto || !head) return fail("fatal: invalid rebase refs\n", 128);
+  if (onto === head) return ok("Current branch is up to date.\n");
+
+  const base = repo.findMergeBase(head, onto);
+  if (!base) return fail("fatal: cannot find merge base\n", 128);
+
+  // collect commits from base..head (oldest first)
+  const toReplay: Array<{ hash: string } & CommitData> = [];
+  let cur: string | null = head;
+  while (cur && cur !== base) {
+    const c = repo.readCommit(cur);
+    if (!c) break;
+    toReplay.push({ hash: cur, ...c });
+    cur = c.parent;
+  }
+  toReplay.reverse();
+
+  ctx.volume.writeFileSync(repo.gitDir + "/REBASE_ORIG_HEAD", head + "\n");
+  ctx.volume.writeFileSync(repo.gitDir + "/REBASE_HEAD", onto + "\n");
+
+  // reset to onto
+  const branch = repo.getCurrentBranch();
+  if (branch) repo.updateBranchRef(branch, onto);
+  else repo.setHEAD(onto);
+  repo.checkoutTree(repo.getCommitTree(onto), ctx.volume);
+
+  let tip = onto;
+  for (const c of toReplay) {
+    const baseTree = c.parent ? repo.getCommitTree(c.parent) : new Map<string, string>();
+    const theirsTree = repo.getCommitTree(c.hash);
+    const oursTree = repo.getCommitTree(tip);
+    const { conflicts } = applyThreeWayTrees(repo, ctx.volume, baseTree, oursTree, theirsTree);
+    if (conflicts.length > 0) {
+      let out = `error: could not apply ${c.hash.slice(0, 7)}... ${c.message.split("\n")[0]}\n`;
+      for (const p of conflicts) out += `CONFLICT in ${p}\n`;
+      out += "Resolve conflicts and run `git rebase --abort` or commit to continue.\n";
+      return { stdout: out, stderr: "", exitCode: 1 };
+    }
+    const treeHash = repo.buildTree(repo.readIndex());
+    tip = repo.createCommit(c.message, tip, treeHash);
+    if (branch) repo.updateBranchRef(branch, tip);
+    else repo.setHEAD(tip);
+  }
+
+  try { ctx.volume.unlinkSync(repo.gitDir + "/REBASE_HEAD"); } catch { /* */ }
+  try { ctx.volume.unlinkSync(repo.gitDir + "/REBASE_ORIG_HEAD"); } catch { /* */ }
+  return ok(`Successfully rebased ${toReplay.length} commit(s).\n`);
+}
+
+/** Parse stash index: bare N, stash@{N}, or default 0. Null if invalid. */
+function parseStashIndex(arg: string | undefined): number | null {
+  if (arg === undefined) return 0;
+  const ref = arg.match(/^stash@\{(\d+)\}$/);
+  if (ref) return parseInt(ref[1], 10);
+  if (/^\d+$/.test(arg)) return parseInt(arg, 10);
+  return null;
 }
 
 function gitStash(args: string[], ctx: ShellContext): ShellResult {
@@ -1625,7 +2332,10 @@ function gitStash(args: string[], ctx: ShellContext): ShellResult {
   }
 
   if (sub === "pop" || sub === "apply") {
-    const idxArg = args[1] ? parseInt(args[1], 10) : 0;
+    const idxArg = parseStashIndex(args[1]);
+    if (idxArg === null) {
+      return fail(`error: '${args[1]}' is not a valid reference\n`);
+    }
     const list = repo.readStashList();
     if (idxArg >= list.length) return fail(`error: stash@{${idxArg}} does not exist\n`);
 
@@ -1651,7 +2361,10 @@ function gitStash(args: string[], ctx: ShellContext): ShellResult {
   }
 
   if (sub === "drop") {
-    const idxArg = args[1] ? parseInt(args[1], 10) : 0;
+    const idxArg = parseStashIndex(args[1]);
+    if (idxArg === null) {
+      return fail(`error: '${args[1]}' is not a valid reference\n`);
+    }
     const list = repo.readStashList();
     if (idxArg >= list.length) return fail(`error: stash@{${idxArg}} does not exist\n`);
     list.splice(idxArg, 1);
@@ -1848,8 +2561,27 @@ async function gitClone(args: string[], ctx: ShellContext): Promise<ShellResult>
   });
   const entries = clonedRepo.readIndex();
   const treeHash = clonedRepo.buildTree(entries);
-  const cloneCommitHash = clonedRepo.createCommit(`Clone of ${url}`, null, treeHash);
-  clonedRepo.updateBranchRef(branch, cloneCommitHash);
+  const author =
+    commitResp.data.commit?.author?.name && commitResp.data.commit?.author?.email
+      ? `${commitResp.data.commit.author.name} <${commitResp.data.commit.author.email}>`
+      : `${clonedRepo.getConfigValue("user.name") ?? "nodepod-user"} <${clonedRepo.getConfigValue("user.email") ?? "user@nodepod.dev"}>`;
+  const commitData: CommitData = {
+    tree: treeHash,
+    parent: commitResp.data.parents?.[0]?.sha ?? null,
+    author,
+    committer: author,
+    timestamp: commitResp.data.commit?.author?.date
+      ? Date.parse(commitResp.data.commit.author.date)
+      : Date.now(),
+    message: commitResp.data.message ?? `Clone of ${url}`,
+  };
+  if (commitResp.data.parents?.[1]?.sha) {
+    commitData.parent2 = commitResp.data.parents[1].sha;
+  }
+  // Store under the remote SHA so refs match GitHub even though tree/blob OIDs are local
+  clonedRepo.writeObjectAt(commitSha, "commit", JSON.stringify(commitData));
+  clonedRepo.updateBranchRef(branch, commitSha);
+  clonedRepo.updateRemoteRef("origin", branch, commitSha);
 
   return ok(`Cloning into '${nonFlags[1] ?? gh.repo}'...\nremote: Enumerating objects: ${fileCount}\nReceiving objects: 100% (${fileCount}/${fileCount}), done.\n`);
 }
@@ -2004,10 +2736,40 @@ async function gitPull(args: string[], ctx: ShellContext): Promise<ShellResult> 
   });
   const entries = repo.readIndex();
   const treeHash = repo.buildTree(entries);
-  const pullCommit = repo.createCommit(`Pull from ${remoteName}/${remoteBranch}`, localHead, treeHash);
-  repo.updateBranchRef(currentBranch, pullCommit);
+  const author =
+    commitResp.data.commit?.author?.name && commitResp.data.commit?.author?.email
+      ? `${commitResp.data.commit.author.name} <${commitResp.data.commit.author.email}>`
+      : `${repo.getConfigValue("user.name") ?? "nodepod-user"} <${repo.getConfigValue("user.email") ?? "user@nodepod.dev"}>`;
+  const remoteParent: string | null = commitResp.data.parents?.[0]?.sha ?? null;
+  const commitData: CommitData = {
+    tree: treeHash,
+    parent: remoteParent,
+    author,
+    committer: author,
+    timestamp: commitResp.data.commit?.author?.date
+      ? Date.parse(commitResp.data.commit.author.date)
+      : Date.now(),
+    message: commitResp.data.message ?? `Pull from ${remoteName}/${remoteBranch}`,
+  };
+  if (commitResp.data.parents?.[1]?.sha) {
+    commitData.parent2 = commitResp.data.parents[1].sha;
+  }
+  // Fast-forward only when local tip is an ancestor of the remote tip (or empty)
+  const wasFf =
+    !localHead ||
+    localHead === remoteParent ||
+    repo.isAncestor(localHead, remoteParent);
 
-  return ok(`From ${remoteUrl}\nUpdating ${(localHead ?? "000000").slice(0, 7)}..${remoteCommitSha.slice(0, 7)}\nFast-forward\n ${updated} file${updated !== 1 ? "s" : ""} changed\n`);
+  repo.writeObjectAt(remoteCommitSha, "commit", JSON.stringify(commitData));
+  repo.updateBranchRef(currentBranch, remoteCommitSha);
+  repo.updateRemoteRef(remoteName, remoteBranch, remoteCommitSha);
+
+  const updateLine = wasFf
+    ? `Fast-forward\n`
+    : `Updating work tree to ${remoteCommitSha.slice(0, 7)}\n`;
+  return ok(
+    `From ${remoteUrl}\nUpdating ${(localHead ?? "0000000").slice(0, 7)}..${remoteCommitSha.slice(0, 7)}\n${updateLine} ${updated} file${updated !== 1 ? "s" : ""} changed\n`,
+  );
 }
 
 async function gitFetch(args: string[], ctx: ShellContext): Promise<ShellResult> {
@@ -2079,11 +2841,19 @@ export function createGitCommand(): ShellCommand {
             `  status     Show the working tree status\n` +
             `  commit     Record changes to the repository\n` +
             `  log        Show commit logs\n` +
+            `  show       Show various types of objects\n` +
             `  diff       Show changes\n` +
             `  branch     List, create, or delete branches\n` +
             `  checkout   Switch branches or restore files\n` +
             `  switch     Switch branches\n` +
+            `  restore    Restore working tree files\n` +
+            `  clean      Remove untracked files\n` +
             `  merge      Join two development histories together\n` +
+            `  cherry-pick Apply the changes introduced by some existing commits\n` +
+            `  revert     Revert some existing commits\n` +
+            `  rebase     Reapply commits on top of another base tip\n` +
+            `  tag        Create, list, or delete tags\n` +
+            `  blame      Show what revision and author last modified each line\n` +
             `  remote     Manage set of tracked repositories\n` +
             `  push       Update remote refs (GitHub)\n` +
             `  pull       Fetch and integrate remote changes (GitHub)\n` +
@@ -2116,6 +2886,22 @@ export function createGitCommand(): ShellCommand {
           return gitSwitch(subArgs, effectiveCtx);
         case "merge":
           return gitMerge(subArgs, effectiveCtx);
+        case "tag":
+          return gitTag(subArgs, effectiveCtx);
+        case "show":
+          return gitShow(subArgs, effectiveCtx);
+        case "restore":
+          return gitRestore(subArgs, effectiveCtx);
+        case "clean":
+          return gitClean(subArgs, effectiveCtx);
+        case "cherry-pick":
+          return gitCherryPick(subArgs, effectiveCtx);
+        case "revert":
+          return gitRevert(subArgs, effectiveCtx);
+        case "blame":
+          return gitBlame(subArgs, effectiveCtx);
+        case "rebase":
+          return gitRebase(subArgs, effectiveCtx);
         case "remote":
           return gitRemote(subArgs, effectiveCtx);
         case "push":

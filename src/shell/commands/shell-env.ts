@@ -162,7 +162,13 @@ function evalTest(args: string[], ctx: ShellContext): boolean {
       try { return ctx.volume.statSync(p).isDirectory(); } catch { return false; }
     }
     if (flag === "-e") return ctx.volume.existsSync(p);
-    if (flag === "-L" || flag === "-h") return ctx.volume.existsSync(p);
+    if (flag === "-L" || flag === "-h") {
+      try {
+        return ctx.volume.lstatSync(p).isSymbolicLink();
+      } catch {
+        return false;
+      }
+    }
     if (flag === "-s") {
       try { return ctx.volume.readFileSync(p).length > 0; } catch { return false; }
     }

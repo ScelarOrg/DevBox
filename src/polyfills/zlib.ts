@@ -321,8 +321,30 @@ ZlibTransform.prototype.close = function close(cb?: () => void): void {
   if (cb) queueMicrotask(cb);
 };
 
-ZlibTransform.prototype.flush = function flush(cb?: (err: Error | null) => void): void {
-  if (cb) queueMicrotask(() => cb(null));
+ZlibTransform.prototype.flush = function flush(
+  kindOrCb?: number | ((err: Error | null) => void),
+  cb?: (err: Error | null) => void,
+): void {
+  const callback = typeof kindOrCb === "function" ? kindOrCb : cb;
+  try {
+    const engine = this._engine as { push?: (data: Uint8Array, mode?: boolean | number) => void; err?: number; msg?: string; result?: Uint8Array | null } | undefined;
+    if (engine && typeof engine.push === "function") {
+      // Z_SYNC_FLUSH-style: push empty with finish=false to emit buffered output
+      engine.push(new Uint8Array(0), false);
+      if (engine.err) {
+        const err = new Error(engine.msg || "zlib flush error");
+        if (callback) queueMicrotask(() => callback(err));
+        return;
+      }
+      const out = drainEngine(engine as any);
+      if (out && out.length > 0 && typeof this.push === "function") {
+        this.push(out);
+      }
+    }
+    if (callback) queueMicrotask(() => callback(null));
+  } catch (e) {
+    if (callback) queueMicrotask(() => callback(e as Error));
+  }
 };
 
 ZlibTransform.prototype.reset = function reset(): void {
@@ -433,7 +455,13 @@ interface GunzipConstructor {
 export const Gunzip = function Gunzip(this: any, opts?: any) {
   if (!this) return;
   ZlibTransform.call(this, opts);
-  this._engine = new pako.Inflate({ ...(opts || {}) });
+  // Node gunzip always expects a gzip header. pako only auto-adds +32 when
+  // windowBits is omitted; an explicit windowBits:15 would stay zlib-only.
+  const baseBits = opts?.windowBits ?? 15;
+  this._engine = new pako.Inflate({
+    ...(opts || {}),
+    windowBits: baseBits + 16,
+  });
 } as unknown as GunzipConstructor;
 
 Object.setPrototypeOf(Gunzip.prototype, ZlibTransform.prototype);
@@ -755,6 +783,7 @@ interface BrotliCompressStreamConstructor {
 export const BrotliCompressStream = function BrotliCompressStream(this: any, opts?: any) {
   if (!this) return;
   ZlibTransform.call(this, opts);
+  this._chunks = [] as Uint8Array[];
 } as unknown as BrotliCompressStreamConstructor;
 
 Object.setPrototypeOf(BrotliCompressStream.prototype, ZlibTransform.prototype);
@@ -764,13 +793,30 @@ BrotliCompressStream.prototype._transform = function _transform(
   _enc: string,
   done: (err: Error | null, data?: any) => void,
 ): void {
+  const data = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+  (this._chunks as Uint8Array[]).push(data);
+  done(null);
+};
+
+BrotliCompressStream.prototype._flush = function _flush(
+  done: (err: Error | null, data?: any) => void,
+): void {
   if (!brotliInstance) {
     done(new Error("Brotli WASM not loaded"));
     return;
   }
   try {
-    const data = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
-    done(null, Buffer.from(brotliInstance.compress(data)));
+    const parts = this._chunks as Uint8Array[];
+    let total = 0;
+    for (const p of parts) total += p.length;
+    const merged = new Uint8Array(total);
+    let pos = 0;
+    for (const p of parts) {
+      merged.set(p, pos);
+      pos += p.length;
+    }
+    this._chunks = [];
+    done(null, Buffer.from(brotliInstance.compress(merged)));
   } catch (e) {
     done(e as Error);
   }
@@ -791,6 +837,7 @@ interface BrotliDecompressStreamConstructor {
 export const BrotliDecompressStream = function BrotliDecompressStream(this: any, opts?: any) {
   if (!this) return;
   ZlibTransform.call(this, opts);
+  this._chunks = [] as Uint8Array[];
 } as unknown as BrotliDecompressStreamConstructor;
 
 Object.setPrototypeOf(BrotliDecompressStream.prototype, ZlibTransform.prototype);
@@ -800,13 +847,30 @@ BrotliDecompressStream.prototype._transform = function _transform(
   _enc: string,
   done: (err: Error | null, data?: any) => void,
 ): void {
-  if (!brotliInstance) {
-    done(new Error("Brotli WASM not loaded"));
-    return;
+  const data = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+  (this._chunks as Uint8Array[]).push(data);
+  done(null);
+};
+
+BrotliDecompressStream.prototype._flush = function _flush(
+  done: (err: Error | null, data?: any) => void,
+): void {
+  const parts = this._chunks as Uint8Array[];
+  let total = 0;
+  for (const p of parts) total += p.length;
+  const merged = new Uint8Array(total);
+  let pos = 0;
+  for (const p of parts) {
+    merged.set(p, pos);
+    pos += p.length;
   }
+  this._chunks = [];
   try {
-    const data = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
-    done(null, Buffer.from(brotliInstance.decompress(data)));
+    if (brotliInstance) {
+      done(null, Buffer.from(brotliInstance.decompress(merged)));
+      return;
+    }
+    done(null, Buffer.from(brotliDecompressJs(merged)));
   } catch (e) {
     done(e as Error);
   }
@@ -914,6 +978,31 @@ export const constants = {
   BROTLI_MAX_INPUT_BLOCK_BITS: 24,
 };
 
+function promisifyZlib(
+  fn: (input: any, cb: CompressCallback) => void,
+): (input: Buffer | string) => Promise<Buffer> {
+  return (input: Buffer | string) =>
+    new Promise((resolve, reject) => {
+      fn(input, (err, result) => {
+        if (err) reject(err);
+        else resolve(result);
+      });
+    });
+}
+
+export const promises = {
+  gzip: promisifyZlib(gzip),
+  gunzip: promisifyZlib(gunzip as (input: any, cb: CompressCallback) => void),
+  deflate: promisifyZlib(deflate),
+  inflate: promisifyZlib(inflate as (input: any, cb: CompressCallback) => void),
+  deflateRaw: promisifyZlib(deflateRaw),
+  inflateRaw: promisifyZlib(inflateRaw as (input: any, cb: CompressCallback) => void),
+  brotliCompress: promisifyZlib(brotliCompress),
+  brotliDecompress: promisifyZlib(
+    brotliDecompress as (input: any, cb: CompressCallback) => void,
+  ),
+};
+
 export default {
   gzip,
   gunzip,
@@ -953,4 +1042,5 @@ export default {
   createBrotliDecompress,
   // Constants
   constants,
+  promises,
 };

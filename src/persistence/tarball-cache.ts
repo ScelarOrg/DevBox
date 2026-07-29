@@ -20,6 +20,7 @@ export interface TarballCache {
   get(url: string): Promise<ArrayBuffer | null>;
   put(url: string, bytes: ArrayBuffer, integrity?: string): Promise<void>;
   prune(maxBytes?: number, maxAgeMs?: number): Promise<void>;
+  clear(): Promise<void>;
   close(): void;
 }
 
@@ -87,6 +88,19 @@ export async function openTarballCache(): Promise<TarballCache | null> {
       } catch {
         /* quota or transaction failure — cache is optional */
       }
+    },
+
+    clear(): Promise<void> {
+      return new Promise((resolve) => {
+        try {
+          const tx = db.transaction(STORE_NAME, "readwrite");
+          tx.objectStore(STORE_NAME).clear();
+          tx.oncomplete = () => resolve();
+          tx.onerror = () => resolve();
+        } catch {
+          resolve();
+        }
+      });
     },
 
     // Evict expired entries, then oldest-first until under the byte budget.

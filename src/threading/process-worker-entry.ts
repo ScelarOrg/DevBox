@@ -581,7 +581,9 @@ function handleVFSSync(msg: { path: string; content: ArrayBuffer | null; isDirec
       if (_volume.existsSync(msg.path)) {
         const stat = _volume.statSync(msg.path);
         if (stat.isDirectory()) {
-          _volume.rmdirSync(msg.path);
+          // recursive — match main-thread VFSBridge._rmTree; non-recursive
+          // rmdirSync fails (swallowed) and leaves peer dirs stale
+          _volume.removeTreeSync(msg.path);
         } else {
           _volume.unlinkSync(msg.path);
         }

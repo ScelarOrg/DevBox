@@ -53,6 +53,24 @@ describe("MemoryVolume", () => {
     volume.symlinkSync("loop-b", "/root/loop-a");
     volume.symlinkSync("loop-a", "/root/loop-b");
     expect(() => volume.statSync("/root/loop-a")).toThrow(/ELOOP/);
+    expect(() => volume.writeFileSync("/root/loop-a", "x")).toThrow(/ELOOP/);
+  });
+
+  it("skips binary snapshot entries with out-of-bounds offsets", () => {
+    const volume = new MemoryVolume();
+    const data = new Uint8Array([1, 2, 3, 4]);
+    const mounted = volume.mountBinarySnapshot({
+      data: data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength),
+      manifest: [
+        { path: "/ok.txt", offset: 0, length: 2, isDirectory: false },
+        { path: "/bad-neg.txt", offset: -1, length: 2, isDirectory: false },
+        { path: "/bad-oob.txt", offset: 3, length: 10, isDirectory: false },
+      ],
+    });
+    expect(mounted).toBe(1);
+    expect(volume.readFileSync("/ok.txt")).toEqual(new Uint8Array([1, 2]));
+    expect(volume.existsSync("/bad-neg.txt")).toBe(false);
+    expect(volume.existsSync("/bad-oob.txt")).toBe(false);
   });
 
   it("preserves hard links, symlinks, modes, and timestamps in snapshots", () => {

@@ -26,6 +26,7 @@ describe("dependency extraction ordering", () => {
     const volume = new MemoryVolume();
     const dependency = (name: string): ResolvedDependency => ({
       name,
+      fetchName: name,
       version: "1.0.0",
       tarballUrl: `https://example.invalid/${name}.tgz`,
       dependencies: {},

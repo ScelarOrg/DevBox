@@ -53,6 +53,11 @@ interface TestOpts {
   only?: boolean;
 }
 
+function markFailed(): void {
+  const proc = (globalThis as any).process;
+  if (proc) proc.exitCode = 1;
+}
+
 export function describe(name: string, fn: () => void | Promise<void>): void;
 export function describe(
   options: TestOpts,
@@ -79,10 +84,12 @@ export function describe(
     const result = body();
     if (result && typeof (result as Promise<void>).then === "function") {
       (result as Promise<void>).catch((err) => {
+        markFailed();
         globalThis.console.error(`Suite "${name}" failed:`, err);
       });
     }
   } catch (err) {
+    markFailed();
     globalThis.console.error(`Suite "${name}" failed:`, err);
   }
 }
@@ -107,10 +114,12 @@ export function it(nameOrOpts: string | TestOpts, fn?: TestFn): void {
     const result = fn(ctx);
     if (result && typeof (result as Promise<void>).then === "function") {
       (result as Promise<void>).catch((err) => {
+        markFailed();
         globalThis.console.error(`Test "${name}" failed:`, err);
       });
     }
   } catch (err) {
+    markFailed();
     globalThis.console.error(`Test "${name}" failed:`, err);
   }
 }
@@ -119,29 +128,61 @@ export { it as test };
 
 export function before(fn: HookFn): void {
   try {
-    fn();
-  } catch {
+    const result = fn();
+    if (result && typeof (result as Promise<void>).then === "function") {
+      (result as Promise<void>).catch((err) => {
+        markFailed();
+        globalThis.console.error("before hook failed:", err);
+      });
+    }
+  } catch (err) {
+    markFailed();
+    globalThis.console.error("before hook failed:", err);
   }
 }
 
 export function after(fn: HookFn): void {
   try {
-    fn();
-  } catch {
+    const result = fn();
+    if (result && typeof (result as Promise<void>).then === "function") {
+      (result as Promise<void>).catch((err) => {
+        markFailed();
+        globalThis.console.error("after hook failed:", err);
+      });
+    }
+  } catch (err) {
+    markFailed();
+    globalThis.console.error("after hook failed:", err);
   }
 }
 
 export function beforeEach(fn: HookFn): void {
   try {
-    fn();
-  } catch {
+    const result = fn();
+    if (result && typeof (result as Promise<void>).then === "function") {
+      (result as Promise<void>).catch((err) => {
+        markFailed();
+        globalThis.console.error("beforeEach hook failed:", err);
+      });
+    }
+  } catch (err) {
+    markFailed();
+    globalThis.console.error("beforeEach hook failed:", err);
   }
 }
 
 export function afterEach(fn: HookFn): void {
   try {
-    fn();
-  } catch {
+    const result = fn();
+    if (result && typeof (result as Promise<void>).then === "function") {
+      (result as Promise<void>).catch((err) => {
+        markFailed();
+        globalThis.console.error("afterEach hook failed:", err);
+      });
+    }
+  } catch (err) {
+    markFailed();
+    globalThis.console.error("afterEach hook failed:", err);
   }
 }
 

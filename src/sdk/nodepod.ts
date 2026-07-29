@@ -10,6 +10,7 @@ import type { VolumeSnapshot } from "../engine-types";
 import { Buffer } from "../polyfills/buffer";
 import type {
   NodepodOptions,
+  NodepodRequestOptions,
   TerminalOptions,
   Snapshot,
   SnapshotOptions,
@@ -33,8 +34,10 @@ import {
 import { NodepodFSClient } from "./nodepod-fs-client";
 import { SyncChannelController } from "../threading/sync-channel";
 import { MemoryHandler } from "../memory-handler";
-import { openSnapshotCache } from "../persistence/idb-cache";
-import { openOPFSSnapshotCache } from "../persistence/opfs-snapshot-cache";
+import "../host/browser-host"; // registers default RuntimeHost factory
+import { getRuntimeHost } from "../host/runtime-host";
+import type { HttpIngress } from "../host/types";
+import type { CompletedResponse } from "../polyfills/http";
 import { getEsbuild } from "../helpers/esbuild-engine";
 import { disposeEsbuild } from "../helpers/esbuild-engine";
 import { disposePool, poolStats } from "../threading/offload";
@@ -121,6 +124,8 @@ export class Nodepod {
   private _disposed = false;
   private _unsubscribePressure: (() => void) | null = null;
   private _performance: PerformanceTracker;
+  private _httpIngress: HttpIngress | null = null;
+  private _headless = false;
 
   /* ---- Construction (use Nodepod.boot()) ---- */
 
@@ -160,8 +165,7 @@ export class Nodepod {
     this._processManager = new ProcessManager(volume, performanceTracker);
     this._vfsBridge = new VFSBridge(volume);
 
-    this._vfsBridge.setBroadcaster((path, content, excludePid) => {
-      const isDirectory = content !== null && content.byteLength === 0;
+    this._vfsBridge.setBroadcaster((path, content, isDirectory, excludePid) => {
       this._processManager.broadcastVFSChange(
         path,
         content,
@@ -242,9 +246,12 @@ export class Nodepod {
   static async boot(opts: NodepodOptions = {}): Promise<Nodepod> {
     const performanceTracker = new PerformanceTracker();
     const stopBoot = performanceTracker.start("boot.total");
-    if (typeof Worker === "undefined") {
+    const host = getRuntimeHost();
+    const headless = opts.headless === true || host.defaultHeadless === true;
+
+    if (!host.canCreateWorkers()) {
       throw new Error(
-        "[Nodepod] Web Workers are required. Nodepod cannot run without Web Worker support.",
+        "[Nodepod] Workers are required. Nodepod cannot run without Worker / worker_threads support.",
       );
     }
 
@@ -269,21 +276,24 @@ export class Nodepod {
     handler.startMonitoring();
     const volume = new MemoryVolume(handler);
 
-    // Open IDB snapshot cache for faster re-boots (opt-out via enableSnapshotCache: false)
+    // Snapshot cache via host (IDB/OPFS in browser, fs cache on Node headless)
     let snapshotCache = null;
     if (opts.enableSnapshotCache !== false && opts.packageStore !== "memory") {
       const stopCacheOpen = performanceTracker.start("boot.snapshotCache");
       try {
-        if (opts.packageStore === "opfs") {
-          snapshotCache = await openOPFSSnapshotCache();
-          if (snapshotCache) performanceTracker.increment("storage.opfs");
-        }
-        if (!snapshotCache) {
-          snapshotCache = await openSnapshotCache();
-          if (snapshotCache) performanceTracker.increment("storage.indexedDb");
+        if (host.openSnapshotCache) {
+          snapshotCache = await host.openSnapshotCache({
+            packageStore: opts.packageStore,
+            enableSnapshotCache: opts.enableSnapshotCache,
+          });
+          if (snapshotCache) {
+            performanceTracker.increment(
+              host.kind === "node" ? "storage.fs" : "storage.indexedDb",
+            );
+          }
         }
       } catch {
-        /* IDB unavailable */
+        /* cache unavailable */
       } finally {
         stopCacheOpen();
       }
@@ -316,6 +326,7 @@ export class Nodepod {
       makeInstanceId(),
       performanceTracker,
     );
+    nodepod._headless = headless;
 
     if (opts.spawnSnapshot) {
       // ProcessManager double-checks SAB availability per spawn and falls
@@ -353,13 +364,40 @@ export class Nodepod {
       }
     }
 
-    // SW is default-on as of 1.2. Pass `serviceWorker: false` to opt out
-    // (SSR, Node tests). Pre-1.2 required `swUrl` to enable it, which
-    // silently broke preview iframes for anyone who installed from npm.
+    // Headless defaults: no SW / watermark unless the caller forces them on.
+    const swDefaultOff = headless;
     const swEnabled =
-      opts.serviceWorker !== false &&
+      (swDefaultOff ? opts.serviceWorker === true : opts.serviceWorker !== false) &&
       typeof navigator !== "undefined" &&
       "serviceWorker" in navigator;
+
+    if (headless && opts.watermark !== true) {
+      proxy.setWatermark(false);
+    } else if (opts.watermark === false) {
+      proxy.setWatermark(false);
+    }
+
+    if (host.createHttpIngress) {
+      const ingress = host.createHttpIngress({
+        proxy,
+        headless,
+        onServerReady: opts.onServerReady,
+      });
+      if (ingress) {
+        nodepod._httpIngress = ingress;
+        if (ingress.start) {
+          const stopIngress = performanceTracker.start("boot.httpIngress");
+          try {
+            await ingress.start();
+            if (ingress.baseUrl) proxy.setBaseUrl(ingress.baseUrl);
+          } finally {
+            stopIngress();
+          }
+        } else if (ingress.baseUrl) {
+          proxy.setBaseUrl(ingress.baseUrl);
+        }
+      }
+    }
 
     if (swEnabled) {
       const stopServiceWorker = performanceTracker.start("boot.serviceWorker");
@@ -368,10 +406,6 @@ export class Nodepod {
           swUrl: opts.swUrl,
           skipPreflight: opts.skipSWPreflight,
         });
-        // Watermark is on by default, only disable if explicitly set to false
-        if (opts.watermark === false) {
-          proxy.setWatermark(false);
-        }
       } catch (e) {
         // Setup errors have an actionable hint attached, rethrow them.
         // Anything else (weird host envs, navigator vanishing mid-boot)
@@ -391,6 +425,50 @@ export class Nodepod {
 
     stopBoot();
     return nodepod;
+  }
+
+  /** Whether this instance was booted in headless mode. */
+  get isHeadless(): boolean {
+    return this._headless;
+  }
+
+  /**
+   * Programmatic HTTP against a virtual server registered on this instance.
+   * Works without Service Worker / preview iframes (headless-friendly).
+   */
+  async request(
+    port: number,
+    init: NodepodRequestOptions = {},
+  ): Promise<CompletedResponse> {
+    this._assertActive();
+    const method = (init.method ?? "GET").toUpperCase();
+    const path = init.path ?? "/";
+    const headers = { ...(init.headers ?? {}) };
+    let body: ArrayBuffer | undefined;
+    if (init.body != null) {
+      if (typeof init.body === "string") {
+        const encoded = new TextEncoder().encode(init.body);
+        body = encoded.buffer.slice(
+          encoded.byteOffset,
+          encoded.byteOffset + encoded.byteLength,
+        ) as ArrayBuffer;
+      } else if (init.body instanceof ArrayBuffer) {
+        body = init.body;
+      } else {
+        body = init.body.buffer.slice(
+          init.body.byteOffset,
+          init.body.byteOffset + init.body.byteLength,
+        ) as ArrayBuffer;
+      }
+    }
+    return this._proxy.handleRequest(
+      this.instanceId,
+      port,
+      method,
+      path,
+      headers,
+      body,
+    );
   }
 
   /* ---- spawn() ---- */
@@ -815,6 +893,11 @@ export class Nodepod {
     if (this._unwatchVFS) {
       this._unwatchVFS();
       this._unwatchVFS = null;
+    }
+    const ingress = this._httpIngress;
+    this._httpIngress = null;
+    if (ingress?.stop) {
+      void ingress.stop().catch(() => {});
     }
     // release our slot so sibling Nodepods on the same page keep working
     try {

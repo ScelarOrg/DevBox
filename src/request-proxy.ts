@@ -12,7 +12,6 @@ import {
   Server,
   setServerListenCallback,
   setServerCloseCallback,
-  getServer,
   encodeFrame,
   decodeFrame,
 } from "./polyfills/http";
@@ -144,6 +143,20 @@ export class RequestProxy extends EventEmitter {
     // to DEFAULT_INSTANCE. Nodepod SDK uses register(instanceId, ...) instead
     setServerListenCallback((port, srv) => this.register(srv, port));
     setServerCloseCallback((port) => this.unregister(port));
+  }
+
+  /** Update the origin used by `serverUrl()` / `onServerReady` (e.g. Node local HTTP). */
+  setBaseUrl(url: string): void {
+    this.baseUrl = url.replace(/\/$/, "");
+  }
+
+  getBaseUrl(): string {
+    return this.baseUrl;
+  }
+
+  /** True after a successful Service Worker registration. */
+  get isServiceWorkerReady(): boolean {
+    return this.swReady;
   }
 
   private _getOrCreateInstance(instanceId: string): InstanceState {
@@ -827,7 +840,8 @@ export class RequestProxy extends EventEmitter {
           }
 
           let bodyB64 = "";
-          if (resp.body?.length) {
+          // HEAD must not carry a body even if the app wrote one
+          if (method?.toUpperCase() !== "HEAD" && resp.body?.length) {
             const bytes =
               resp.body instanceof Uint8Array ? resp.body : new Uint8Array(0);
             bodyB64 = bytesToBase64(bytes);
@@ -928,7 +942,7 @@ export class RequestProxy extends EventEmitter {
           headers: resp.headers,
         },
       });
-      if (resp.body?.length) {
+      if (method?.toUpperCase() !== "HEAD" && resp.body?.length) {
         const bytes =
           resp.body instanceof Uint8Array ? resp.body : new Uint8Array(0);
         this.channel?.port1.postMessage({
@@ -988,7 +1002,15 @@ export class RequestProxy extends EventEmitter {
     const inst = this._instances.get(instanceId);
     if (!inst) return;
 
-    const server = getServer(port);
+    // Prefer the instance registry (same as HTTP) — never global getServer(port),
+    // which ignores instanceId and can route to another Nodepod's listener.
+    const entry = inst.registry.get(port);
+    const registered = entry?.server;
+    const server =
+      registered &&
+      typeof (registered as Server).dispatchUpgrade === "function"
+        ? (registered as Server)
+        : undefined;
 
     const wsKey = btoa(
       String.fromCharCode(...crypto.getRandomValues(new Uint8Array(16))),
@@ -1003,7 +1025,7 @@ export class RequestProxy extends EventEmitter {
     };
     if (protocols) headers["sec-websocket-protocol"] = protocols;
 
-    // no local server, try the instance's process manager (worker mode)
+    // no local upgradable server, try the instance's process manager (worker mode)
     if (!server) {
       if (inst.processManager) {
         const pid = inst.processManager.dispatchWsUpgrade(
@@ -1333,10 +1355,12 @@ export class RequestProxy extends EventEmitter {
       // the jar is the only place these cookies survive for the next request.
       this._storeResponseCookies(instanceId, port, resp.headers);
       let body: BodyInit | null = null;
-      if (resp.body instanceof Uint8Array) {
-        body = new Uint8Array(resp.body.buffer as ArrayBuffer, resp.body.byteOffset, resp.body.byteLength) as Uint8Array<ArrayBuffer>;
-      } else if (typeof resp.body === "string") {
-        body = resp.body;
+      if (req.method?.toUpperCase() !== "HEAD") {
+        if (resp.body instanceof Uint8Array) {
+          body = new Uint8Array(resp.body.buffer as ArrayBuffer, resp.body.byteOffset, resp.body.byteLength) as Uint8Array<ArrayBuffer>;
+        } else if (typeof resp.body === "string") {
+          body = resp.body;
+        }
       }
       return new Response(body, {
         status: resp.statusCode,

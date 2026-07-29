@@ -21,6 +21,13 @@ describe("expandVariables", () => {
     expect(expandVariables("${FOO:-fallback}", ENV, 0)).toBe("bar");
   });
 
+  it("${VAR-default} keeps empty value; ${VAR:-default} substitutes", () => {
+    const env = { ...ENV, EMPTY: "" };
+    expect(expandVariables("${EMPTY-fallback}", env, 0)).toBe("");
+    expect(expandVariables("${EMPTY:-fallback}", env, 0)).toBe("fallback");
+    expect(expandVariables("${MISSING-fallback}", env, 0)).toBe("fallback");
+  });
+
   it("expands $? to last exit code", () => {
     expect(expandVariables("$?", ENV, 42)).toBe("42");
   });
@@ -57,12 +64,18 @@ describe("tokenize", () => {
     expect(words).toEqual(["echo", "hello", "world"]);
   });
 
-  it("handles single-quoted strings", () => {
-    // tokenizer does a post-expansion pass on the whole word, so single
-    // quotes dont actually prevent expansion here. kinda wrong but thats how it works
+  it("handles single-quoted strings without expansion", () => {
     const tokens = tokenize("echo '$FOO'", ENV, 0);
     const words = tokens.filter((t) => t.type === "word").map((t) => t.value);
-    expect(words).toContain("bar");
+    expect(words).toContain("$FOO");
+    expect(words).not.toContain("bar");
+  });
+
+  it("treats bare & as a command separator (does not hang)", () => {
+    const tokens = tokenize("echo a & echo b", ENV, 0);
+    expect(tokens.some((t) => t.type === "semi" && t.value === "&")).toBe(true);
+    const words = tokens.filter((t) => t.type === "word").map((t) => t.value);
+    expect(words).toEqual(["echo", "a", "echo", "b"]);
   });
 
   it("handles double-quoted strings (with expansion)", () => {
@@ -159,6 +172,19 @@ describe("parse", () => {
     const ast = parse("echo hello 2>&1", ENV, 0);
     const cmd = ast.entries[0].pipeline.commands[0];
     expect(cmd.redirects.some((r) => r.type === "stderr-to-stdout")).toBe(true);
+  });
+
+  it("parses 2> and 2>>", () => {
+    const a = parse("cmd 2> err.txt", ENV, 0);
+    expect(a.entries[0].pipeline.commands[0].redirects[0]).toEqual({
+      type: "stderr-write",
+      target: "err.txt",
+    });
+    const b = parse("cmd 2>> err.txt", ENV, 0);
+    expect(b.entries[0].pipeline.commands[0].redirects[0]).toEqual({
+      type: "stderr-append",
+      target: "err.txt",
+    });
   });
 
   it("parses VAR=value assignments before command", () => {

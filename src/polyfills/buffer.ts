@@ -78,7 +78,7 @@ class BufferPolyfill extends Uint8Array {
         return new BufferPolyfill(octets);
       }
 
-      if (enc === 'latin1' || enc === 'binary') {
+      if (enc === 'latin1' || enc === 'binary' || enc === 'ascii') {
         const octets = new Uint8Array(source.length);
         for (let i = 0; i < source.length; i++) {
           octets[i] = source.charCodeAt(i) & 0xff;
@@ -107,10 +107,29 @@ class BufferPolyfill extends Uint8Array {
     return new BufferPolyfill(source as Uint8Array);
   }
 
-  static alloc(len: number, fillValue?: number): BufferPolyfill {
+  static alloc(
+    len: number,
+    fillValue?: number | string | Uint8Array,
+    encoding?: string,
+  ): BufferPolyfill {
     const buf = new BufferPolyfill(len);
-    if (fillValue !== undefined) {
-      buf.fill(fillValue);
+    if (fillValue === undefined) return buf;
+
+    if (typeof fillValue === "number") {
+      buf.fill(fillValue & 0xff);
+      return buf;
+    }
+
+    const fillBytes =
+      typeof fillValue === "string"
+        ? BufferPolyfill.from(fillValue, encoding || "utf8")
+        : fillValue instanceof Uint8Array
+          ? fillValue
+          : BufferPolyfill.from(fillValue as ArrayLike<number>);
+
+    if (fillBytes.length === 0) return buf;
+    for (let i = 0; i < len; i++) {
+      buf[i] = fillBytes[i % fillBytes.length];
     }
     return buf;
   }
@@ -123,16 +142,37 @@ class BufferPolyfill extends Uint8Array {
     return new BufferPolyfill(len);
   }
 
-  static concat(list: (Uint8Array | BufferPolyfill)[]): BufferPolyfill {
-    let totalLen = 0;
-    for (const chunk of list) totalLen += chunk.length;
-    const merged = new BufferPolyfill(totalLen);
+  static concat(
+    list: (Uint8Array | BufferPolyfill)[],
+    totalLength?: number,
+  ): BufferPolyfill {
+    let sumLen = 0;
+    for (const chunk of list) sumLen += chunk.length;
+    const targetLen = totalLength !== undefined ? totalLength : sumLen;
+    const merged = new BufferPolyfill(targetLen);
     let pos = 0;
     for (const chunk of list) {
-      merged.set(chunk, pos);
-      pos += chunk.length;
+      if (pos >= targetLen) break;
+      const copyLen = Math.min(chunk.length, targetLen - pos);
+      if (copyLen === chunk.length) {
+        merged.set(chunk, pos);
+      } else {
+        merged.set(chunk.subarray(0, copyLen), pos);
+      }
+      pos += copyLen;
     }
     return merged;
+  }
+
+  static compare(a: Uint8Array, b: Uint8Array): number {
+    const bound = Math.min(a.length, b.length);
+    for (let i = 0; i < bound; i++) {
+      if (a[i] < b[i]) return -1;
+      if (a[i] > b[i]) return 1;
+    }
+    if (a.length < b.length) return -1;
+    if (a.length > b.length) return 1;
+    return 0;
   }
 
   // Real Node returns false for plain Uint8Arrays. Code branches on this to
@@ -164,6 +204,9 @@ class BufferPolyfill extends Uint8Array {
     if (lower === 'utf16le' || lower === 'utf-16le' || lower === 'ucs2' || lower === 'ucs-2') {
       return text.length * 2;
     }
+    if (lower === 'latin1' || lower === 'binary' || lower === 'ascii') {
+      return text.length;
+    }
     return textEnc.encode(text).length;
   }
 
@@ -189,7 +232,9 @@ class BufferPolyfill extends Uint8Array {
 
     if (lower === 'hex') return bytesToHex(view);
 
-    if (lower === 'latin1' || lower === 'binary') return bytesToLatin1(view);
+    if (lower === 'latin1' || lower === 'binary' || lower === 'ascii') {
+      return bytesToLatin1(view);
+    }
 
     if (lower === 'utf16le' || lower === 'utf-16le' || lower === 'ucs2' || lower === 'ucs-2') {
       return decodeUtf16Le(view);
@@ -273,6 +318,38 @@ class BufferPolyfill extends Uint8Array {
       let match = true;
       for (let j = 0; j < search.length; j++) {
         if (this[i + j] !== search[j]) { match = false; break; }
+      }
+      if (match) return i;
+    }
+    return -1;
+  }
+
+  lastIndexOf(needle: number | Uint8Array | string, fromIndex?: number): number {
+    const end =
+      fromIndex === undefined
+        ? this.length
+        : Math.min(Math.max(fromIndex, 0), this.length);
+
+    if (typeof needle === "number") {
+      const byte = needle & 0xff;
+      for (let i = end - 1; i >= 0; i--) {
+        if (this[i] === byte) return i;
+      }
+      return -1;
+    }
+
+    const search = typeof needle === "string" ? BufferPolyfill.from(needle) : needle;
+    if (search.length === 0) return end;
+    if (search.length > this.length) return -1;
+
+    const maxStart = Math.min(end, this.length - search.length);
+    for (let i = maxStart; i >= 0; i--) {
+      let match = true;
+      for (let j = 0; j < search.length; j++) {
+        if (this[i + j] !== search[j]) {
+          match = false;
+          break;
+        }
       }
       if (match) return i;
     }

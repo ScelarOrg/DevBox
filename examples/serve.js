@@ -58,12 +58,14 @@ createServer((req, res) => {
   console.log(`  Tailwind v4 (#54):    http://localhost:${port}/examples/issue-54-tailwind-v4/`);
   console.log(`  Tailwind v3 + vite 8: http://localhost:${port}/examples/tailwind-v3-test/`);
   console.log(`  typebox 1.x (#56):    http://localhost:${port}/examples/issue-56-typebox-1x/`);
+  console.log(`  TS inline generic?:   http://localhost:${port}/examples/ts-inline-generic-optional/`);
   console.log(`  Vite HMR test:        http://localhost:${port}/examples/vite-hmr-test/`);
   console.log(`  Dev playground:       http://localhost:${port}/examples/dev-playground/`);
   console.log(`  SQLite test:          http://localhost:${port}/examples/sqlite-test/`);
   console.log(`  Better Auth + Vite:   http://localhost:${port}/examples/better-auth-vite/  (React Router demo in app/)`);
   console.log(`  Vite dev exit 1:      http://localhost:${port}/examples/vite-dev-exit-1/  (auth+sqlite repro)`);
   console.log(`  Scelar auth template: http://localhost:${port}/examples/scelar-auth-template/`);
+  console.log(`  Notion Navigator:     http://localhost:${port}/examples/notion-navigator/`);
   console.log(`  Scelar Vite repro:    http://localhost:${port}/examples/scelar-vite-config-repro/`);
   console.log(`  import.meta.glob:     http://localhost:${port}/examples/import-meta-glob-test/`);
   console.log(`  Terminal + preview:   http://localhost:${port}/examples/terminal/`);

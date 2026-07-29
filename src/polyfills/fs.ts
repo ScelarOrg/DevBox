@@ -40,16 +40,37 @@ export interface Dirent {
 }
 
 interface DirentConstructor {
-  new (entryName: string, isDir: boolean, isFile: boolean, parentPath?: string): Dirent;
-  (this: any, entryName: string, isDir: boolean, isFile: boolean, parentPath?: string): void;
+  new (
+    entryName: string,
+    isDir: boolean,
+    isFile: boolean,
+    parentPath?: string,
+    isSymlink?: boolean,
+  ): Dirent;
+  (
+    this: any,
+    entryName: string,
+    isDir: boolean,
+    isFile: boolean,
+    parentPath?: string,
+    isSymlink?: boolean,
+  ): void;
   prototype: any;
 }
 
-export const Dirent = function Dirent(this: any, entryName: string, isDir: boolean, isFile: boolean, parentPath?: string) {
+export const Dirent = function Dirent(
+  this: any,
+  entryName: string,
+  isDir: boolean,
+  isFile: boolean,
+  parentPath?: string,
+  isSymlink = false,
+) {
   if (!this) return;
   this.name = entryName;
   this._dir = isDir;
   this._file = isFile;
+  this._symlink = isSymlink;
   this.parentPath = parentPath ?? "";
   this.path = this.parentPath;
 } as unknown as DirentConstructor;
@@ -72,8 +93,8 @@ Dirent.prototype.isFIFO = function isFIFO(): boolean {
 Dirent.prototype.isSocket = function isSocket(): boolean {
   return false;
 };
-Dirent.prototype.isSymbolicLink = function isSymbolicLink(): boolean {
-  return false;
+Dirent.prototype.isSymbolicLink = function isSymbolicLink(this: any): boolean {
+  return !!this._symlink;
 };
 
 export interface Dir {
@@ -338,7 +359,7 @@ export interface FsBridge {
     native: (target: PathArg) => string;
   };
   accessSync(target: PathArg, mode?: number): void;
-  copyFileSync(src: PathArg, dest: PathArg): void;
+  copyFileSync(src: PathArg, dest: PathArg, mode?: number): void;
   symlinkSync(target: PathArg, path: PathArg, type?: string): void;
   readlinkSync(target: PathArg): string;
   linkSync(existingPath: PathArg, newPath: PathArg): void;
@@ -542,18 +563,37 @@ export function buildFileSystemBridge(
   function numericFlagsToString(f: number): string {
     const O_WRONLY = 1;
     const O_RDWR = 2;
-    const O_CREAT = 64;
     const O_TRUNC = 512;
     const O_APPEND = 1024;
     const readWrite = (f & O_RDWR) === O_RDWR;
     const writeOnly = (f & O_WRONLY) === O_WRONLY;
     const append = (f & O_APPEND) === O_APPEND;
+    const trunc = (f & O_TRUNC) === O_TRUNC;
     if (append) return readWrite ? "a+" : "a";
-    if (writeOnly) return "w";
-    if (readWrite) return (f & O_CREAT) || (f & O_TRUNC) ? "w+" : "r+";
+    // O_WRONLY without O_TRUNC must not truncate (Node preserves); map to "r+"
+    if (writeOnly) return trunc ? "w" : "r+";
+    if (readWrite) return trunc ? "w+" : "r+";
     return "r";
   }
   const abs = (target: unknown) => resolvePath(target, getCwd);
+  // symlink targets: keep relative strings; only absolutize absolute targets
+  const symlinkTargetArg = (target: unknown): string => {
+    const t = String(target ?? "");
+    if (t.startsWith("/")) return abs(t);
+    return t;
+  };
+
+  function persistWritableFd(fd: number): void {
+    const entry = openFiles.get(fd);
+    if (!entry) return;
+    if (
+      entry.mode.includes("w") ||
+      entry.mode.includes("a") ||
+      entry.mode.includes("+")
+    ) {
+      volume.writeFileSync(entry.filePath, entry.data);
+    }
+  }
 
   const fsConst: FsConstantsShape = {
     F_OK: 0,
@@ -608,14 +648,16 @@ export function buildFileSystemBridge(
         : dirPath + "/" + name;
       let isDir = false;
       let isFile = false;
+      let isSymlink = false;
       try {
-        const st = volume.statSync(full);
-        isDir = st.isDirectory();
-        isFile = st.isFile();
+        const st = volume.lstatSync(full);
+        isSymlink = st.isSymbolicLink();
+        isDir = !isSymlink && st.isDirectory();
+        isFile = !isSymlink && st.isFile();
       } catch {
         isFile = true;
       }
-      return new Dirent(name, isDir, isFile, dirPath);
+      return new Dirent(name, isDir, isFile, dirPath, isSymlink);
     });
   }
   class FileHandle {
@@ -646,11 +688,8 @@ export function buildFileSystemBridge(
 
     close(): Promise<void> {
       try {
-        const entry = openFiles.get(this.fd);
-        if (entry) {
-          if (entry.mode.includes("w") || entry.mode.includes("a") || entry.mode.includes("+")) {
-            volume.writeFileSync(entry.filePath, entry.data);
-          }
+        if (openFiles.has(this.fd)) {
+          persistWritableFd(this.fd);
           openFiles.delete(this.fd);
         }
         return Promise.resolve();
@@ -703,7 +742,12 @@ export function buildFileSystemBridge(
     }
 
     datasync(): Promise<void> {
-      return Promise.resolve();
+      try {
+        persistWritableFd(this.fd);
+        return Promise.resolve();
+      } catch (e) {
+        return Promise.reject(e);
+      }
     }
 
     read(
@@ -805,7 +849,12 @@ export function buildFileSystemBridge(
     }
 
     sync(): Promise<void> {
-      return Promise.resolve();
+      try {
+        persistWritableFd(this.fd);
+        return Promise.resolve();
+      } catch (e) {
+        return Promise.reject(e);
+      }
     }
 
     truncate(len: number = 0): Promise<void> {
@@ -1017,10 +1066,10 @@ export function buildFileSystemBridge(
         }
       });
     },
-    copyFile(src: unknown, dest: unknown): Promise<void> {
+    copyFile(src: unknown, dest: unknown, mode: number = 0): Promise<void> {
       return new Promise((ok, fail) => {
         try {
-          volume.copyFileSync(abs(src), abs(dest));
+          volume.copyFileSync(abs(src), abs(dest), mode);
           ok();
         } catch (e) {
           fail(e);
@@ -1040,7 +1089,7 @@ export function buildFileSystemBridge(
     symlink(target: unknown, path: unknown, type?: string): Promise<void> {
       return new Promise((ok, fail) => {
         try {
-          volume.symlinkSync(abs(target), abs(path), type);
+          volume.symlinkSync(symlinkTargetArg(target), abs(path), type);
           ok();
         } catch (e) {
           fail(e);
@@ -1508,17 +1557,16 @@ export function buildFileSystemBridge(
 
     realpathSync: realpathSyncFn as FsBridge["realpathSync"],
 
-    accessSync(target: unknown, _mode?: number): void {
-      volume.accessSync(abs(target));
+    accessSync(target: unknown, mode?: number): void {
+      volume.accessSync(abs(target), mode);
     },
 
-    copyFileSync(src: unknown, dest: unknown): void {
-      const bytes = volume.readFileSync(abs(src));
-      volume.writeFileSync(abs(dest), bytes);
+    copyFileSync(src: unknown, dest: unknown, mode: number = 0): void {
+      volume.copyFileSync(abs(src), abs(dest), mode);
     },
 
     symlinkSync(target: unknown, path: unknown, _type?: string): void {
-      volume.symlinkSync(abs(target), abs(path), _type);
+      volume.symlinkSync(symlinkTargetArg(target), abs(path), _type);
     },
 
     readlinkSync(target: unknown): string {
@@ -1572,12 +1620,30 @@ export function buildFileSystemBridge(
     },
     openSync(target: unknown, flags: string | number, _mode?: number): number {
       const p = abs(target);
-      const flagStr = typeof flags === "number" ? numericFlagsToString(flags) : flags;
+      const numeric = typeof flags === "number" ? flags : null;
+      const flagStr = numeric !== null ? numericFlagsToString(numeric) : String(flags);
       const exists = volume.existsSync(p);
+      const O_CREAT = 64;
+      const O_EXCL = 128;
+      const wantsExcl =
+        (numeric !== null && (numeric & O_EXCL) !== 0) || flagStr.includes("x");
+      const wantsCreat =
+        (numeric !== null && (numeric & O_CREAT) !== 0) ||
+        /[wax]/i.test(flagStr);
       const isWrite = flagStr.includes("w") || flagStr.includes("a");
       const isReadOnly = flagStr.includes("r") && !flagStr.includes("+");
 
-      if (!exists && isReadOnly) {
+      if (wantsExcl && exists) {
+        const err = new Error(
+          `EEXIST: file already exists, open '${p}'`,
+        ) as Error & { code: string; errno: number; path: string };
+        err.code = "EEXIST";
+        err.errno = -17;
+        err.path = p;
+        throw err;
+      }
+
+      if (!exists && (isReadOnly || (flagStr === "r+" && !wantsCreat))) {
         const err = new Error(
           `ENOENT: no such file or directory, open '${p}'`,
         ) as Error & { code: string; errno: number; path: string };
@@ -1592,7 +1658,7 @@ export function buildFileSystemBridge(
         content = volume.readFileSync(p);
       } else {
         content = new Uint8Array(0);
-        if (isWrite) {
+        if (isWrite || wantsCreat) {
           const parent = p.substring(0, p.lastIndexOf("/")) || "/";
           if (!volume.existsSync(parent)) {
             volume.mkdirSync(parent, { recursive: true });
@@ -1613,13 +1679,7 @@ export function buildFileSystemBridge(
     closeSync(fd: number): void {
       const entry = openFiles.get(fd);
       if (!entry) return;
-      if (
-        entry.mode.includes("w") ||
-        entry.mode.includes("a") ||
-        entry.mode.includes("+")
-      ) {
-        volume.writeFileSync(entry.filePath, entry.data);
-      }
+      persistWritableFd(fd);
       openFiles.delete(fd);
     },
 
@@ -1725,11 +1785,31 @@ export function buildFileSystemBridge(
       }
     },
 
-    fsyncSync(_fd: number): void {
-      /* no-op */
+    fsyncSync(fd: number): void {
+      const entry = openFiles.get(fd);
+      if (!entry) {
+        const err = new Error("EBADF: bad file descriptor, fsync") as Error & {
+          code: string;
+          errno: number;
+        };
+        err.code = "EBADF";
+        err.errno = -9;
+        throw err;
+      }
+      persistWritableFd(fd);
     },
-    fdatasyncSync(_fd: number): void {
-      /* no-op */
+    fdatasyncSync(fd: number): void {
+      const entry = openFiles.get(fd);
+      if (!entry) {
+        const err = new Error("EBADF: bad file descriptor, fdatasync") as Error & {
+          code: string;
+          errno: number;
+        };
+        err.code = "EBADF";
+        err.errno = -9;
+        throw err;
+      }
+      persistWritableFd(fd);
     },
 
     mkdtempSync(prefix: string): string {
@@ -1997,7 +2077,7 @@ export function buildFileSystemBridge(
     ): void {
       const actualCb = typeof typeOrCb === "function" ? typeOrCb : cb;
       try {
-        volume.symlinkSync(abs(target), abs(path));
+        volume.symlinkSync(symlinkTargetArg(target), abs(path));
         if (actualCb) setTimeout(() => actualCb(null), 0);
       } catch (e) {
         if (actualCb) setTimeout(() => actualCb(e as Error), 0);
@@ -2522,6 +2602,7 @@ export function buildFileSystemBridge(
 
       FsWriteStream.prototype._flushChunks = function () {
         if (!this._chunks || this._chunks.length === 0) return;
+        if (this.fd === null) return;
         const totalLen = this._chunks.reduce((sum: number, c: Uint8Array) => sum + c.length, 0);
         const merged = new Uint8Array(totalLen);
         let pos = 0;
@@ -2529,12 +2610,14 @@ export function buildFileSystemBridge(
           merged.set(c, pos);
           pos += c.length;
         }
-        const isAppend = this.flags === "a";
-        if (isAppend) {
-          volume.appendFileSync(this.path, merged);
-        } else {
-          volume.writeFileSync(this.path, merged);
+        // write into the FD buffer so closeSync persists the same bytes
+        // (bypass writeFileSync — that would be wiped by closeSync's empty FD)
+        const isAppend = typeof this.flags === "string" && this.flags.includes("a");
+        const writePos = isAppend ? null : 0;
+        if (!isAppend) {
+          bridge.ftruncateSync(this.fd, 0);
         }
+        bridge.writeSync(this.fd, merged as unknown as Buffer, 0, merged.length, writePos);
         this._chunks = [];
       };
 
@@ -2739,13 +2822,21 @@ export function buildFileSystemBridge(
       if (cb) setTimeout(() => cb(null), 0);
     },
     fdatasync(fd: number, cb: (err: Error | null) => void): void {
-      // VFS is always sync — no-op
-      if (cb) setTimeout(() => cb(null), 0);
+      try {
+        bridge.fdatasyncSync(fd);
+        if (cb) setTimeout(() => cb(null), 0);
+      } catch (e) {
+        if (cb) setTimeout(() => cb(e as Error), 0);
+      }
     },
 
     fsync(fd: number, cb: (err: Error | null) => void): void {
-      // VFS is always sync — no-op
-      if (cb) setTimeout(() => cb(null), 0);
+      try {
+        bridge.fsyncSync(fd);
+        if (cb) setTimeout(() => cb(null), 0);
+      } catch (e) {
+        if (cb) setTimeout(() => cb(e as Error), 0);
+      }
     },
 
     ftruncate(

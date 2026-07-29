@@ -38,6 +38,7 @@ let storedConfig: PoolConfig | undefined;
 // --- Environment detection ---
 
 function canUseWorkers(): boolean {
+  // Do not import RuntimeHost here — process-worker bundles archive-extractor → offload.
   return (
     typeof Worker !== "undefined" &&
     typeof Blob !== "undefined" &&

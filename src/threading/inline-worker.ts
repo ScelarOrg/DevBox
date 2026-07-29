@@ -4,6 +4,8 @@
 
 import { CDN_ESBUILD_ESM, CDN_ESBUILD_BINARY } from "../constants/cdn-urls";
 import { CDN_PAKO } from "../constants/config";
+import { getRuntimeHost } from "../host/runtime-host";
+import type { HostWorker } from "../host/types";
 
 const WORKER_SOURCE = /* js */ `
 "use strict";
@@ -468,16 +470,12 @@ const endpoint = {
 miniExpose(endpoint);
 `;
 
-let cachedBlobUrl: string | null = null;
-
-// blob URL is cached and reused across workers
-export function createInlineWorker(): Worker | null {
+// Source workers are created per-call via the active RuntimeHost.
+export function createInlineWorker(): HostWorker | null {
   try {
-    if (!cachedBlobUrl) {
-      const blob = new Blob([WORKER_SOURCE], { type: "application/javascript" });
-      cachedBlobUrl = URL.createObjectURL(blob);
-    }
-    return new Worker(cachedBlobUrl);
+    const host = getRuntimeHost();
+    if (!host.canCreateWorkers()) return null;
+    return host.createWorker({ type: "source", source: WORKER_SOURCE });
   } catch {
     return null;
   }
@@ -485,8 +483,5 @@ export function createInlineWorker(): Worker | null {
 
 // call when the pool is permanently disposed
 export function revokeInlineWorkerUrl(): void {
-  if (cachedBlobUrl) {
-    URL.revokeObjectURL(cachedBlobUrl);
-    cachedBlobUrl = null;
-  }
+  getRuntimeHost().disposeGlobalResources?.();
 }

@@ -46,6 +46,11 @@ export * as npm from "./packages/installer";
 export { DependencyInstaller, install } from "./packages/installer";
 export { RequestProxy, getProxyInstance, resetProxy, NodepodSWSetupError } from "./request-proxy";
 export type { ProxyOptions, ServiceWorkerConfig, NodepodSWFrameworkHint } from "./request-proxy";
+export {
+  setProxy as setCorsProxy,
+  getProxy as getCorsProxy,
+  setAllowedDomains,
+} from "./cross-origin";
 export * as chokidar from "./polyfills/chokidar";
 export * as ws from "./polyfills/ws";
 export * as fsevents from "./polyfills/fsevents";
@@ -178,6 +183,7 @@ export {
 } from "./sdk/preview-inspector";
 export type {
   NodepodOptions,
+  NodepodRequestOptions,
   TerminalOptions,
   TerminalTheme,
   StatResult,
@@ -186,6 +192,13 @@ export type {
   PerformanceStats,
   PerformanceTiming,
 } from "./sdk/types";
+export {
+  getRuntimeHost,
+  setRuntimeHost,
+  resetRuntimeHost,
+  createBrowserHost,
+} from "./host";
+export type { RuntimeHost, HostWorker, HttpIngress, WorkerSpec } from "./host";
 export type {
   InspectWaitUntil,
   InspectTarget,

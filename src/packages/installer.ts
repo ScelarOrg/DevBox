@@ -22,6 +22,7 @@ import {
 import { getTarballCache } from "../persistence/tarball-cache";
 import type { PerformanceTracker } from "../performance-tracker";
 import { resolveWithCache } from "./resolution-cache";
+import { writeNpmPackageLock } from "./pm-cli";
 
 const RESOLVER_CACHE_VERSION = 1;
 const SNAPSHOT_CACHE_VERSION = 2;
@@ -59,6 +60,8 @@ export interface InstallFlags {
    * every installed file at install time like before.
    */
   transformModules?: boolean | "eager";
+  /** Prefer lockfile tarball URL + SRI for the root package being installed. */
+  lockEntry?: { resolved?: string; integrity?: string };
 }
 
 // "eager" | true → install-time transforms; false | undefined → lazy (default)
@@ -212,6 +215,15 @@ export class DependencyInstaller {
     const tree = resolved.tree;
     if (resolved.hit) this._performance?.increment("install.resolutionCacheHits");
     stopResolution?.();
+
+    // Prefer package-lock resolved URL + SRI for the root package (npm ci)
+    if (flags.lockEntry) {
+      const root = tree.get(targetName);
+      if (root) {
+        if (flags.lockEntry.resolved) root.tarballUrl = flags.lockEntry.resolved;
+        if (flags.lockEntry.integrity) root.integrity = flags.lockEntry.integrity;
+      }
+    }
 
     // snapshot cache keyed by the resolved package set — skips download,
     // extract, and transform on warm runs (resolution still hit the registry).
@@ -484,6 +496,7 @@ export class DependencyInstaller {
               await downloadAndExtract(dep.tarballUrl, this.vol, targetDir, {
                 stripComponents: 1,
                 expectedShasum: dep.shasum,
+                expectedIntegrity: dep.integrity,
               });
               const manifestPath = path.join(targetDir, "package.json");
               if (!this.vol.existsSync(manifestPath)) {
@@ -588,7 +601,22 @@ export class DependencyInstaller {
       "node_modules",
       ".package-lock.json",
     );
+    this.vol.mkdirSync(path.join(this.workingDir, "node_modules"), {
+      recursive: true,
+    });
     this.vol.writeFileSync(lockPath, JSON.stringify(entries, null, 2));
+
+    let rootPkg: { name?: string; version?: string } | undefined;
+    try {
+      const pjPath = path.join(this.workingDir, "package.json");
+      if (this.vol.existsSync(pjPath)) {
+        const pj = JSON.parse(this.vol.readFileSync(pjPath, "utf8"));
+        rootPkg = { name: pj.name, version: pj.version };
+      }
+    } catch {
+      /* */
+    }
+    writeNpmPackageLock(this.vol, this.workingDir, tree, rootPkg);
   }
 
   private async patchManifest(

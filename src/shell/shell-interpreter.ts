@@ -33,6 +33,7 @@ export class NodepodShell {
   private commands = new Map<string, ShellCommand>();
   private lastExit = 0;
   private aliases = new Map<string, string>();
+  private history: string[] = [];
   // serializes concurrent exec() calls to prevent cwd save/restore races
   private _execQueue: Promise<ShellResult> = Promise.resolve({ stdout: "", stderr: "", exitCode: 0 });
 
@@ -46,6 +47,7 @@ export class NodepodShell {
     this.cwd = opts?.cwd ?? "/";
     this.env = opts?.env ? { ...opts.env } : {};
     this.env.PWD = this.cwd;
+    this.loadHistory();
   }
 
   registerCommand(cmd: ShellCommand): void {
@@ -116,6 +118,11 @@ export class NodepodShell {
     }
 
     try {
+      const trimmed = command.trim();
+      if (trimmed && !opts?.cwd && !opts?.env) {
+        this.recordHistory(trimmed);
+      }
+
       const expanded = await this.expandCommandSubstitution(command);
 
       const ast = parse(expanded, this.env, this.lastExit);
@@ -265,7 +272,7 @@ export class NodepodShell {
     } else if (name === "source" || name === ".") {
       result = await this.handleSource(args);
     } else if (name === "history") {
-      result = { stdout: "", stderr: "", exitCode: 0 };
+      result = this.handleHistory(args);
     } else if (this.commands.has(name)) {
       try {
         result = await this.commands.get(name)!.execute(args, ctx);
@@ -393,20 +400,29 @@ export class NodepodShell {
         continue;
       }
 
-      if (r.type === "write" || r.type === "append") {
+      if (
+        r.type === "write" ||
+        r.type === "append" ||
+        r.type === "stderr-write" ||
+        r.type === "stderr-append"
+      ) {
+        const isStderr = r.type === "stderr-write" || r.type === "stderr-append";
+        const append = r.type === "append" || r.type === "stderr-append";
+        const content = isStderr ? stderr : stdout;
         const p = this.resolvePath(r.target);
         try {
-          if (r.type === "append" && this.volume.existsSync(p)) {
+          if (append && this.volume.existsSync(p)) {
             const existing = this.volume.readFileSync(p, "utf8");
-            this.volume.writeFileSync(p, existing + stdout);
+            this.volume.writeFileSync(p, existing + content);
           } else {
             const dir = this.normalizePath(p.substring(0, p.lastIndexOf("/")));
             if (dir && dir !== "/" && !this.volume.existsSync(dir)) {
               this.volume.mkdirSync(dir, { recursive: true });
             }
-            this.volume.writeFileSync(p, stdout);
+            this.volume.writeFileSync(p, content);
           }
-          stdout = "";
+          if (isStderr) stderr = "";
+          else stdout = "";
         } catch (e) {
           stderr += `shell: ${r.target}: ${e instanceof Error ? e.message : "Cannot write"}\n`;
           exitCode = 1;
@@ -415,6 +431,55 @@ export class NodepodShell {
     }
 
     return { stdout, stderr, exitCode };
+  }
+
+  private historyPath(): string {
+    const hist = this.env.HISTFILE;
+    if (hist) return hist.startsWith("/") ? hist : this.resolvePath(hist);
+    const home = this.env.HOME || "/home/user";
+    return `${home}/.nodepod_history`;
+  }
+
+  private loadHistory(): void {
+    try {
+      const p = this.historyPath();
+      if (!this.volume.existsSync(p)) return;
+      const raw = this.volume.readFileSync(p, "utf8");
+      this.history = raw.split("\n").filter((l) => l.length > 0);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  private persistHistory(): void {
+    try {
+      const p = this.historyPath();
+      const dir = this.normalizePath(p.substring(0, p.lastIndexOf("/")));
+      if (dir && dir !== "/" && !this.volume.existsSync(dir)) {
+        this.volume.mkdirSync(dir, { recursive: true });
+      }
+      const max = parseInt(this.env.HISTSIZE || "1000", 10) || 1000;
+      if (this.history.length > max) {
+        this.history = this.history.slice(-max);
+      }
+      this.volume.writeFileSync(p, this.history.join("\n") + (this.history.length ? "\n" : ""));
+    } catch {
+      /* ignore */
+    }
+  }
+
+  private recordHistory(command: string): void {
+    if (!command || command === "history") return;
+    this.history.push(command);
+    this.persistHistory();
+  }
+
+  private handleHistory(_args: string[]): ShellResult {
+    let out = "";
+    for (let i = 0; i < this.history.length; i++) {
+      out += `  ${String(i + 1).padStart(4)}  ${this.history[i]}\n`;
+    }
+    return { stdout: out, stderr: "", exitCode: 0 };
   }
 
   private async expandCommandSubstitution(input: string): Promise<string> {

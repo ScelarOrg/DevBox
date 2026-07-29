@@ -31,6 +31,21 @@ import { VERSIONS, NPM_REGISTRY_URL_SLASH, DEFAULT_ENV, MOCK_PID } from "../cons
 import { closeAllServers, getAllServers } from "./http";
 import { disposeAllTimers } from "./timers";
 import type { SyncChannelWorker } from "../threading/sync-channel";
+import {
+  rejectGlobal,
+  npmConfig as pmNpmConfig,
+  npmPkg as pmNpmPkg,
+  npmPack as pmNpmPack,
+  npmPing,
+  npmWhoami,
+  npmFund,
+  npmOutdated,
+  npmAudit,
+  clearPmCaches,
+  readPackageLock,
+  packageJsonDepsMatchLock,
+  resolveRegistry,
+} from "../packages/pm-cli";
 
 let _shell: NodepodShell | null = null;
 let _vol: MemoryVolume | null = null;
@@ -186,7 +201,7 @@ export type SpawnChildCallback = (
 
 let _spawnChildFn: SpawnChildCallback | null = null;
 
-export function setSpawnChildCallback(fn: SpawnChildCallback): void {
+export function setSpawnChildCallback(fn: SpawnChildCallback | null): void {
   _spawnChildFn = fn;
 }
 
@@ -325,8 +340,16 @@ export function initShellExec(volume: MemoryVolume, opts?: { cwd?: string; env?:
     runScript,
     npmInitOrCreate,
     npmInfo,
-    npmPack,
-    npmConfig,
+    npmPack: (ctx) => pmNpmPack(_vol!, ctx),
+    npmConfig: (args, ctx) => pmNpmConfig(_vol!, args, ctx),
+    npmPkg: (args, ctx) => pmNpmPkg(_vol!, args, ctx),
+    npmCi,
+    npmOutdated: (ctx) => npmOutdated(_vol!, ctx),
+    npmAudit: (ctx) => npmAudit(_vol!, ctx),
+    npmFund: (ctx) => npmFund(_vol!, ctx),
+    npmPing: (ctx) => npmPing(_vol!, ctx),
+    npmWhoami: (ctx) => npmWhoami(_vol!, ctx),
+    npmCacheClean: () => clearPmCaches(),
     npxExecute,
     executeNodeBinary,
     evalCode: (code, ctx) => evalNodeCode(code, ctx),
@@ -340,6 +363,7 @@ export function initShellExec(volume: MemoryVolume, opts?: { cwd?: string; env?:
     hasFile: (p) => !!_vol && _vol.existsSync(p),
     readFile: (p) => _vol!.readFileSync(p, "utf8") as string,
     writeFile: (p, data) => _vol!.writeFileSync(p, data),
+    rejectGlobal,
   };
 
   _shell.registerCommand(createNodeCommand(pmDeps));
@@ -446,9 +470,10 @@ async function runScript(
     return { stdout: "", stderr: msg, exitCode: 1 };
   }
 
-  // append extra args after "--" to the script command (real npm behavior)
+  // append extra args after "--" to the script command (real npm behavior).
+  // shell-quote so metacharacters in user args cannot alter the script pipeline.
   if (extraArgs.length > 0) {
-    cmd += " " + extraArgs.map(a => a.includes(" ") ? `"${a}"` : a).join(" ");
+    cmd += " " + extraArgs.map(shellQuote).join(" ");
   }
 
   // prepend cwd's node_modules/.bin to PATH (matches real npm behavior)
@@ -649,18 +674,85 @@ async function getShellSnapshotCache() {
   return _shellSnapshotCache;
 }
 
+/** Flags whose following argv token is a value, not a package name. */
+const INSTALL_VALUE_FLAGS = new Set([
+  "--registry",
+  "--prefix",
+  "--cwd",
+  "--cache",
+  "--userconfig",
+  "--globalconfig",
+  "--tag",
+  "--workspace",
+  "-C",
+]);
+
+/** @internal exported for unit tests */
+export function shellQuote(arg: string): string {
+  if (arg === "") return "''";
+  // leave plain tokens unquoted so sync builtins (git/cat/ls) still match
+  if (/^[a-zA-Z0-9_./:@%+=,-]+$/.test(arg)) return arg;
+  return `'${arg.replace(/'/g, `'\\''`)}'`;
+}
+
+/** Build a shell command string that preserves argv (spaces/metachars). */
+export function shellCommandFromArgv(command: string, args: string[]): string {
+  if (!args.length) return shellQuote(command);
+  return `${shellQuote(command)} ${args.map(shellQuote).join(" ")}`;
+}
+
+/** Parent env for spawn when options.env is omitted (Node parity). */
+function resolveSpawnEnv(): Record<string, string> {
+  const fromProcess = (globalThis as any).process?.env;
+  if (fromProcess && typeof fromProcess === "object") {
+    return { ...(fromProcess as Record<string, string>) };
+  }
+  if (_shell) {
+    try {
+      return { ..._shell.getEnv() };
+    } catch {
+      /* ignore */
+    }
+  }
+  return {};
+}
+
+/** Package names from install argv, skipping flags and flag-values. */
+export function installPackageNames(args: string[]): string[] {
+  const names: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--") {
+      names.push(...args.slice(i + 1).filter((x) => !x.startsWith("-")));
+      break;
+    }
+    if (a.startsWith("-")) {
+      if (a.includes("=")) continue;
+      if (INSTALL_VALUE_FLAGS.has(a) && i + 1 < args.length) {
+        i++;
+      }
+      continue;
+    }
+    names.push(a);
+  }
+  return names;
+}
+
 async function installPackages(
   args: string[],
   ctx: ShellContext,
   pm: PkgManager = "npm",
+  opts?: { persist?: boolean },
 ): Promise<ShellResult> {
+  const globalReject = rejectGlobal(args, pm);
+  if (globalReject) return globalReject;
+
   const { DependencyInstaller } = await import("../packages/installer");
   const snapshotCache = await getShellSnapshotCache();
   const installer = new DependencyInstaller(_vol!, { cwd: ctx.cwd, snapshotCache });
   let out = "";
   const write = _stdoutSink ?? ((_s: string) => {});
   const startTime = Date.now();
-  const accent = PM_COLORS[pm];
 
   const spinnerText =
     pm === "bun"
@@ -669,7 +761,7 @@ async function installPackages(
   const spinner = createSpinner(spinnerText, write);
 
   try {
-    const names = args.filter((a: string) => !a.startsWith("-"));
+    const names = installPackageNames(args);
     const onProgress = (m: string) => {
       const colored = formatProgress(m, pm);
       out += m + "\n";
@@ -680,11 +772,11 @@ async function installPackages(
       (a: string) =>
         a === "-D" || a === "--save-dev" || a === "--dev",
     );
-    const noSave = args.some(
-      (a: string) => a === "--no-save",
-    );
+    const noSave =
+      opts?.persist === false ||
+      args.some((a: string) => a === "--no-save");
 
-    let registryUrl: string | undefined;
+    let registryUrl: string | undefined = resolveRegistry(_vol!, ctx.cwd, ctx.env);
     for (let i = 0; i < args.length; i++) {
       const a = args[i];
       if (a === "--registry" && args[i + 1]) {
@@ -965,67 +1057,76 @@ async function npmInfo(
   }
 }
 
-function npmPack(ctx: ShellContext): ShellResult {
-  const r = loadManifest(ctx.cwd);
-  if ("fail" in r) return r.fail;
-
-  const notice = `${A_DIM}npm notice${A_RESET}`;
-  let out = `${notice}\n`;
-  out += `${notice} ${A_BOLD}package:${A_RESET} ${r.pkg.name}@${r.pkg.version}\n`;
-
-  const files: string[] = [];
-  const walk = (dir: string) => {
-    try {
-      for (const name of _vol!.readdirSync(dir)) {
-        if (name === "node_modules" || name.startsWith(".")) continue;
-        const full = `${dir}/${name}`;
-        const st = _vol!.statSync(full);
-        if (st.isDirectory()) walk(full);
-        else files.push(full);
-      }
-    } catch {
-      /* */
-    }
-  };
-  walk(ctx.cwd);
-
-  for (const f of files) out += `${notice} ${f}\n`;
-  out += `${notice} ${A_BOLD}total files:${A_RESET} ${files.length}\n`;
-  return { stdout: out, stderr: "", exitCode: 0 };
-}
-
-function npmConfig(args: string[], ctx: ShellContext): ShellResult {
-  const sub = args[0];
-  if (!sub || sub === "list") {
-    let out = "; nodepod project config\n";
-    out += `prefix = "${ctx.cwd}"\n`;
-    out += `registry = "${NPM_REGISTRY_URL_SLASH}"\n`;
-    return { stdout: out, stderr: "", exitCode: 0 };
-  }
-  if (sub === "get") {
-    const key = args[1];
-    if (key === "prefix")
-      return { stdout: ctx.cwd + "\n", stderr: "", exitCode: 0 };
-    if (key === "registry")
-      return {
-        stdout: NPM_REGISTRY_URL_SLASH + "\n",
-        stderr: "",
-        exitCode: 0,
-      };
-    return { stdout: "undefined\n", stderr: "", exitCode: 0 };
-  }
-  if (sub === "set") {
+async function npmCi(
+  ctx: ShellContext,
+  pm: PkgManager = "npm",
+): Promise<ShellResult> {
+  const lock = readPackageLock(_vol!, ctx.cwd);
+  if (!lock || lock.packages.length === 0) {
     return {
       stdout: "",
-      stderr: formatWarn("config set: not supported in nodepod", "npm"),
-      exitCode: 0,
+      stderr: formatErr(
+        "ci can only install packages with an existing package-lock.json",
+        pm,
+      ),
+      exitCode: 1,
     };
   }
-  return {
-    stdout: "",
-    stderr: formatErr(`config: unknown subcommand "${sub}"`, "npm"),
-    exitCode: 1,
-  };
+  const match = packageJsonDepsMatchLock(_vol!, ctx.cwd, lock.packages);
+  if (!match.ok) {
+    return {
+      stdout: "",
+      stderr: formatErr(`ci: ${match.reason}`, pm),
+      exitCode: 1,
+    };
+  }
+
+  try {
+    const nm = `${ctx.cwd}/node_modules`.replace(/\/+/g, "/");
+    if (_vol!.existsSync(nm)) removeDir(_vol!, nm);
+  } catch {
+    /* */
+  }
+
+  const { DependencyInstaller } = await import("../packages/installer");
+  const snapshotCache = await getShellSnapshotCache();
+  const installer = new DependencyInstaller(_vol!, {
+    cwd: ctx.cwd,
+    snapshotCache,
+  });
+  const registryUrl = resolveRegistry(_vol!, ctx.cwd, ctx.env);
+  let out = "";
+  const write = _stdoutSink ?? ((_s: string) => {});
+  const spinner = createSpinner(`${A_DIM}npm ci${A_RESET}`, write);
+  const startTime = Date.now();
+
+  try {
+    let totalAdded = 0;
+    for (const pkg of lock.packages) {
+      const ir = await installer.install(pkg.name, pkg.version, {
+        persist: false,
+        registry: registryUrl,
+        lockEntry: {
+          resolved: pkg.resolved,
+          integrity: pkg.integrity,
+        },
+        onProgress: (m) => {
+          out += m + "\n";
+          spinner.update(formatProgress(m, pm));
+        },
+      });
+      totalAdded += ir.newPackages.length;
+    }
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+    const summary = formatInstallSummary(totalAdded, elapsed, pm);
+    spinner.succeed(summary);
+    out += `added ${totalAdded} packages in ${elapsed}s\n`;
+    return { stdout: out, stderr: "", exitCode: 0 };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    spinner.fail(`${A_RED}${msg}${A_RESET}`);
+    return { stdout: out, stderr: formatErr(msg, pm), exitCode: 1 };
+  }
 }
 
 // Direct node binary execution (shared by node command & npx)
@@ -1172,8 +1273,9 @@ export async function executeNodeBinary(
   const exitPromise = new Promise<void>((r) => { exitResolve = r; });
 
   proc.exit = ((c = 0) => {
-    // suppress exit when dev servers are active (SES/error handlers call exit(1) but we want to keep serving)
+    // suppress tear-down when dev servers are active (SES/error handlers call exit(1) but we want to keep serving)
     if (getAllServers().size > 0 && c !== 0) {
+      proc.exitCode = c;
       return;
     }
     if (!didExit) {
@@ -1637,9 +1739,11 @@ async function npxExecute(
 
   let resolvedBin = findBinary(cmdName, _vol, ctx.cwd);
 
-  // not found locally -- try installing
+  // not found locally -- try installing (npx must not mutate package.json)
   if (!resolvedBin && autoInstall) {
-    const installResult = await installPackages([actualPkg], ctx);
+    const installResult = await installPackages([actualPkg], ctx, "npm", {
+      persist: false,
+    });
     if (installResult.exitCode !== 0) return installResult;
     resolvedBin = findBinary(cmdName, _vol, ctx.cwd);
   }
@@ -1797,6 +1901,15 @@ export function exec(
   return child;
 }
 
+function throwExecSyncFailed(cmd: string, status: number, stdout: string, stderr = ""): never {
+  const err: any = new Error(`Command failed: ${cmd}\n${stderr || stdout}`);
+  err.status = status;
+  err.stderr = Buffer.from(stderr);
+  err.stdout = Buffer.from(stdout);
+  err.output = [null, err.stdout, err.stderr];
+  throw err;
+}
+
 export function execSync(cmd: string, opts?: RunOptions): string | Buffer {
   const trimmed = cmd.trim();
   const encoding = opts?.encoding;
@@ -1804,8 +1917,11 @@ export function execSync(cmd: string, opts?: RunOptions): string | Buffer {
   // fast path: trivially synchronous commands (version checks, echo, pwd)
   const result = handleSyncCommand(trimmed, opts);
   if (result !== null) {
-    if (encoding === "buffer") return Buffer.from(result);
-    return result;
+    if (result.status !== 0) {
+      throwExecSyncFailed(trimmed, result.status, result.stdout, result.stderr ?? "");
+    }
+    if (encoding === "buffer") return Buffer.from(result.stdout);
+    return result.stdout;
   }
 
   // true blocking path via Atomics.wait()
@@ -1940,19 +2056,33 @@ function _readGitConfigKey(gitDir: string, key: string): string | null {
   return null;
 }
 
-function handleSyncCommand(cmd: string, opts?: RunOptions): string | null {
-  if (/^node\s+(--version|-v)\s*$/.test(cmd)) return VERSIONS.NODE + "\n";
-  if (/^npm\s+(--version|-v)\s*$/.test(cmd)) return VERSIONS.NPM + "\n";
-  if (/^pnpm\s+(--version|-v)\s*$/.test(cmd)) return VERSIONS.PNPM + "\n";
-  if (/^yarn\s+(--version|-v)\s*$/.test(cmd)) return VERSIONS.YARN + "\n";
-  if (/^bun\s+(--version|-v)\s*$/.test(cmd)) return VERSIONS.BUN + "\n";
+interface SyncCommandResult {
+  stdout: string;
+  status: number;
+  stderr?: string;
+}
+
+function syncOk(stdout: string): SyncCommandResult {
+  return { stdout, status: 0 };
+}
+
+function syncFail(stderr: string, status = 1): SyncCommandResult {
+  return { stdout: "", status, stderr };
+}
+
+function handleSyncCommand(cmd: string, opts?: RunOptions): SyncCommandResult | null {
+  if (/^node\s+(--version|-v)\s*$/.test(cmd)) return syncOk(VERSIONS.NODE + "\n");
+  if (/^npm\s+(--version|-v)\s*$/.test(cmd)) return syncOk(VERSIONS.NPM + "\n");
+  if (/^pnpm\s+(--version|-v)\s*$/.test(cmd)) return syncOk(VERSIONS.PNPM + "\n");
+  if (/^yarn\s+(--version|-v)\s*$/.test(cmd)) return syncOk(VERSIONS.YARN + "\n");
+  if (/^bun\s+(--version|-v)\s*$/.test(cmd)) return syncOk(VERSIONS.BUN + "\n");
 
   // which / command -v
   const whichMatch = cmd.match(/^(?:which|command\s+-v)\s+(\S+)\s*$/);
   if (whichMatch) {
     const binName = whichMatch[1];
     const binPath = isBinaryAvailable(binName);
-    if (binPath) return binPath + "\n";
+    if (binPath) return syncOk(binPath + "\n");
     throwCommandNotFound(cmd);
   }
 
@@ -1974,18 +2104,18 @@ function handleSyncCommand(cmd: string, opts?: RunOptions): string | null {
 
   // registry queries (Next.js uses this to find npm registry)
   if (/^(?:npm|yarn|pnpm)\s+config\s+get\s+registry\s*$/.test(cmd)) {
-    return NPM_REGISTRY_URL_SLASH.replace(/\/$/, "") + "\n";
+    return syncOk(NPM_REGISTRY_URL_SLASH.replace(/\/$/, "") + "\n");
   }
 
   const echoMatch = cmd.match(/^echo\s+["']?(.*?)["']?\s*$/);
-  if (echoMatch) return echoMatch[1] + "\n";
-  if (/^uname\s+-s\s*$/.test(cmd)) return "Linux\n";
-  if (/^uname\s+-m\s*$/.test(cmd)) return "x86_64\n";
+  if (echoMatch) return syncOk(echoMatch[1] + "\n");
+  if (/^uname\s+-s\s*$/.test(cmd)) return syncOk("Linux\n");
+  if (/^uname\s+-m\s*$/.test(cmd)) return syncOk("x86_64\n");
   if (/^uname\s+-a\s*$/.test(cmd))
-    return "Linux nodepod 5.10.0 #1 SMP x86_64 GNU/Linux\n";
+    return syncOk("Linux nodepod 5.10.0 #1 SMP x86_64 GNU/Linux\n");
   // git fast-path for sync commands
   if (/^git\s+(--version|-v)\s*$/.test(cmd) || cmd === "git --version") {
-    return "git version " + VERSIONS.GIT + "\n";
+    return syncOk("git version " + VERSIONS.GIT + "\n");
   }
   if (_vol) {
     const gitRevParseMatch = cmd.match(/^git\s+rev-parse\s+(.+)$/);
@@ -1993,24 +2123,24 @@ function handleSyncCommand(cmd: string, opts?: RunOptions): string | null {
       const gitArgs = gitRevParseMatch[1].trim();
       const cwd = opts?.cwd || "/";
       const gd = _findGitDir(cwd);
-      if (gitArgs === "--show-toplevel") return gd ? gd.workDir + "\n" : "";
-      if (gitArgs === "--is-inside-work-tree") return gd ? "true\n" : "false\n";
-      if (gitArgs === "--git-dir") return gd ? ".git\n" : "";
-      if (gitArgs === "--is-bare-repository") return "false\n";
-      if (gitArgs === "--abbrev-ref HEAD" && gd) return _readHeadBranch(gd.gitDir) + "\n";
+      if (gitArgs === "--show-toplevel") return syncOk(gd ? gd.workDir + "\n" : "");
+      if (gitArgs === "--is-inside-work-tree") return syncOk(gd ? "true\n" : "false\n");
+      if (gitArgs === "--git-dir") return syncOk(gd ? ".git\n" : "");
+      if (gitArgs === "--is-bare-repository") return syncOk("false\n");
+      if (gitArgs === "--abbrev-ref HEAD" && gd) return syncOk(_readHeadBranch(gd.gitDir) + "\n");
       if ((gitArgs === "HEAD" || gitArgs === "--verify HEAD") && gd) {
         const h = _resolveHeadHash(gd.gitDir);
-        return h ? h + "\n" : "";
+        return syncOk(h ? h + "\n" : "");
       }
       if (gitArgs === "--short HEAD" && gd) {
         const h = _resolveHeadHash(gd.gitDir);
-        return h ? h.slice(0, 7) + "\n" : "";
+        return syncOk(h ? h.slice(0, 7) + "\n" : "");
       }
     }
     if (/^git\s+branch\s+--show-current\s*$/.test(cmd)) {
       const cwd = opts?.cwd || "/";
       const gd = _findGitDir(cwd);
-      if (gd) return _readHeadBranch(gd.gitDir) + "\n";
+      if (gd) return syncOk(_readHeadBranch(gd.gitDir) + "\n");
     }
     const gitConfigGetMatch = cmd.match(/^git\s+config\s+(?:--get\s+)?(\S+)\s*$/);
     if (gitConfigGetMatch) {
@@ -2018,21 +2148,24 @@ function handleSyncCommand(cmd: string, opts?: RunOptions): string | null {
       const gd = _findGitDir(cwd);
       if (gd) {
         const val = _readGitConfigKey(gd.gitDir, gitConfigGetMatch[1]);
-        return val !== null ? val + "\n" : "";
+        return syncOk(val !== null ? val + "\n" : "");
       }
-      return "";
+      return syncOk("");
     }
   }
-  // catch-all for git
-  if (/^git\s/.test(cmd)) return "";
-  if (cmd === "true" || cmd === ":") return "";
-  if (cmd === "pwd") return (opts?.cwd || "/") + "\n";
+  // catch-all for unmatched sync git — fail instead of empty success
+  if (/^git\s/.test(cmd)) {
+    const sub = cmd.replace(/^git\s+/, "").split(/\s+/)[0] || "";
+    return syncFail(`fatal: '${sub}' is not a sync-supported git command in Nodepod\n`, 1);
+  }
+  if (cmd === "true" || cmd === ":") return syncOk("");
+  if (cmd === "pwd") return syncOk((opts?.cwd || "/") + "\n");
   if (cmd.startsWith("cat ") && _vol) {
     const path = cmd.slice(4).trim().replace(/['"]/g, "");
     try {
-      return _vol.readFileSync(path, "utf8" as any);
+      return syncOk(_vol.readFileSync(path, "utf8" as any));
     } catch {
-      return "";
+      return syncFail(`cat: ${path}: No such file or directory\n`, 1);
     }
   }
   if ((cmd === "ls" || cmd.startsWith("ls ")) && _vol) {
@@ -2041,9 +2174,9 @@ function handleSyncCommand(cmd: string, opts?: RunOptions): string | null {
         ? opts?.cwd || "/"
         : cmd.slice(3).trim().replace(/['"]/g, "");
     try {
-      return _vol.readdirSync(dir).join("\n") + "\n";
+      return syncOk(_vol.readdirSync(dir).join("\n") + "\n");
     } catch {
-      return "";
+      return syncFail(`ls: cannot access '${dir}': No such file or directory\n`, 1);
     }
   }
   const testMatch = cmd.match(
@@ -2054,12 +2187,12 @@ function handleSyncCommand(cmd: string, opts?: RunOptions): string | null {
     const path = testMatch[2];
     try {
       const st = _vol.statSync(path);
-      if (flag === "-f" && st.isFile()) return "";
-      if (flag === "-d" && st.isDirectory()) return "";
+      if (flag === "-f" && st.isFile()) return syncOk("");
+      if (flag === "-d" && st.isDirectory()) return syncOk("");
     } catch {
       /* */
     }
-    return "";
+    return syncFail("", 1);
   }
   return null;
 }
@@ -2114,8 +2247,11 @@ export function spawn(
   // inline since it collects all output at the end.
   if (_spawnChildFn) {
     const cwd = cfg.cwd ?? getShellCwd();
-    const env = (cfg.env as Record<string, string>) ?? {};
-    const fullCmd = spawnArgs.length ? `${command} ${spawnArgs.join(" ")}` : command;
+    // omitted env inherits parent (Node); explicit {} stays empty
+    const env =
+      cfg.env !== undefined
+        ? (cfg.env as Record<string, string>)
+        : resolveSpawnEnv();
 
     // keep parent alive while child is running. stash the Handle on the
     // ShellProcess so its .ref()/.unref() can forward to it.
@@ -2168,10 +2304,11 @@ export function spawn(
   } else if (_shell) {
     // fallback: inline execution (no streaming)
     const cwd = cfg.cwd ?? getShellCwd();
-    const env = (cfg.env as Record<string, string>) ?? undefined;
-    const fullCmd = spawnArgs.length
-      ? `${command} ${spawnArgs.map((a) => a.includes(" ") ? `"${a}"` : a).join(" ")}`
-      : command;
+    const env =
+      cfg.env !== undefined
+        ? (cfg.env as Record<string, string>)
+        : resolveSpawnEnv();
+    const fullCmd = shellCommandFromArgv(command, spawnArgs);
 
     _shell.exec(fullCmd, { cwd, env }).then(
       (result) => {
@@ -2222,16 +2359,21 @@ export function spawnSync(
     cfg = args;
   }
 
-  const full = spawnArgs.length ? `${cmd} ${spawnArgs.join(" ")}` : cmd;
-  const syncResult = handleSyncCommand(full, { cwd: cfg.cwd, env: cfg.env });
+  // Keep argv intact for sync builtins and the Atomics path — never join/split
+  // on whitespace (that destroys args that contain spaces).
+  const shellCommand = shellCommandFromArgv(cmd, spawnArgs);
+  const syncResult = handleSyncCommand(shellCommand, {
+    cwd: cfg.cwd,
+    env: cfg.env,
+  });
 
   if (syncResult !== null) {
-    const stdout = Buffer.from(syncResult);
-    const stderr = Buffer.from("");
+    const stdout = Buffer.from(syncResult.stdout);
+    const stderr = Buffer.from(syncResult.stderr ?? "");
     return {
       stdout,
       stderr,
-      status: 0,
+      status: syncResult.status,
       signal: null,
       pid: MOCK_PID.BASE + Math.floor(Math.random() * MOCK_PID.RANGE),
       output: [null, stdout, stderr],
@@ -2248,7 +2390,10 @@ export function spawnSync(
 
   const slot = _syncChannel.allocateSlot();
   const cwd = cfg.cwd ?? (globalThis as any).process?.cwd?.() ?? "/";
-  const env = (cfg.env as Record<string, string>) ?? {};
+  const env =
+    cfg.env !== undefined
+      ? (cfg.env as Record<string, string>)
+      : resolveSpawnEnv();
   // carry stdio to the main thread so it knows whether terminal stdin should
   // be forwarded to the child (inherit) vs ignored (pipe). see the spawn-sync
   // handler in process-manager.ts.
@@ -2257,12 +2402,12 @@ export function spawnSync(
   (self as any).postMessage({
     type: "spawn-sync",
     requestId: _nextSyncRequestId++,
-    command: full.split(/\s+/)[0],
-    args: full.split(/\s+/).slice(1),
+    command: cmd,
+    args: spawnArgs,
     cwd,
     env,
     syncSlot: slot,
-    shellCommand: full,
+    shellCommand,
     stdio: stdioArr,
   });
 
@@ -2299,8 +2444,22 @@ export function execFileSync(
   args?: string[],
   opts?: RunOptions,
 ): string | Buffer {
-  const cmd = args?.length ? `${file} ${args.join(" ")}` : file;
-  return execSync(cmd, opts);
+  const fileArgs = args ?? [];
+  const encoding = opts?.encoding;
+  const result = spawnSync(file, fileArgs, {
+    cwd: opts?.cwd,
+    env: opts?.env as Record<string, string> | undefined,
+  });
+  if (result.status !== 0 || result.error) {
+    throwExecSyncFailed(
+      shellCommandFromArgv(file, fileArgs),
+      result.status ?? 1,
+      result.stdout?.toString() ?? "",
+      result.stderr?.toString() ?? "",
+    );
+  }
+  if (encoding === "buffer") return result.stdout;
+  return result.stdout.toString(encoding as BufferEncoding | undefined);
 }
 
 export function execFile(
@@ -2327,9 +2486,116 @@ export function execFile(
     done = optsOrCb as RunCallback;
   }
 
-  const cmd = fileArgs.length ? `${file} ${fileArgs.join(" ")}` : file;
-  return exec(cmd, options, done);
+  // Node execFile does not use a shell — keep argv intact via spawn.
+  const child = spawn(file, fileArgs, {
+    cwd: options.cwd,
+    env: options.env as Record<string, string> | undefined,
+  });
+
+  if (done) {
+    let stdout = "";
+    let stderr = "";
+    child.stdout?.on("data", (chunk: unknown) => {
+      stdout += typeof chunk === "string" ? chunk : Buffer.from(chunk as any).toString();
+    });
+    child.stderr?.on("data", (chunk: unknown) => {
+      stderr += typeof chunk === "string" ? chunk : Buffer.from(chunk as any).toString();
+    });
+    child.once("error", (err: Error) => {
+      done!(err, stdout, stderr);
+    });
+    child.once("close", (code: number | null) => {
+      if (code !== 0 && code !== null) {
+        const e = new Error(`Command failed: ${shellCommandFromArgv(file, fileArgs)}`);
+        (e as any).code = code;
+        done!(e, stdout, stderr);
+      } else {
+        done!(null, stdout, stderr);
+      }
+    });
+  }
+
+  return child;
 }
+
+/** Promisified child_process API (node:child_process/promises). */
+export const promises = {
+  exec(
+    command: string,
+    opts?: RunOptions,
+  ): Promise<{ stdout: string | Buffer; stderr: string | Buffer }> {
+    return new Promise((resolve, reject) => {
+      exec(command, opts ?? {}, (err, stdout, stderr) => {
+        if (err) {
+          (err as any).stdout = stdout;
+          (err as any).stderr = stderr;
+          reject(err);
+        } else {
+          resolve({ stdout, stderr });
+        }
+      });
+    });
+  },
+
+  execFile(
+    file: string,
+    args?: string[] | RunOptions,
+    opts?: RunOptions,
+  ): Promise<{ stdout: string | Buffer; stderr: string | Buffer }> {
+    const fileArgs = Array.isArray(args) ? args : [];
+    const options = (Array.isArray(args) ? opts : args) ?? {};
+    return new Promise((resolve, reject) => {
+      execFile(file, fileArgs, options, (err, stdout, stderr) => {
+        if (err) {
+          (err as any).stdout = stdout;
+          (err as any).stderr = stderr;
+          reject(err);
+        } else {
+          resolve({ stdout, stderr });
+        }
+      });
+    });
+  },
+
+  spawn(
+    command: string,
+    args?: string[] | SpawnConfig,
+    opts?: SpawnConfig,
+  ): Promise<{ stdout: string; stderr: string }> & ShellProcess {
+    const child = spawn(command, args as any, opts);
+    const settled = new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+      let stdout = "";
+      let stderr = "";
+      child.stdout?.on("data", (chunk: unknown) => {
+        stdout += typeof chunk === "string" ? chunk : Buffer.from(chunk as any).toString();
+      });
+      child.stderr?.on("data", (chunk: unknown) => {
+        stderr += typeof chunk === "string" ? chunk : Buffer.from(chunk as any).toString();
+      });
+      child.once("error", reject);
+      child.once("close", (code: number | null) => {
+        if (code !== 0 && code !== null) {
+          const err: any = new Error(
+            `Command failed: ${command}`,
+          );
+          err.code = code;
+          err.stdout = stdout;
+          err.stderr = stderr;
+          reject(err);
+        } else {
+          resolve({ stdout, stderr });
+        }
+      });
+    });
+    // Node returns a ChildProcess that is also thenable via the promises API's
+    // AbortSignal path in newer versions; we expose Promise methods on the child.
+    return Object.assign(child, {
+      then: settled.then.bind(settled),
+      catch: settled.catch.bind(settled),
+      finally: settled.finally.bind(settled),
+    }) as Promise<{ stdout: string; stderr: string }> & ShellProcess;
+  },
+};
 
 export function fork(
   modulePath: string,
@@ -2494,6 +2760,7 @@ export default {
   spawn,
   spawnSync,
   fork,
+  promises,
   ShellProcess,
   initShellExec,
   shellExec,

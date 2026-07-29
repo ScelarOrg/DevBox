@@ -230,6 +230,49 @@ describe("MemoryVolume lazy hydration", () => {
     expect(boundedHandler.calls.readFile.length).toBe(before + 1);
   });
 
+  it("evicts all hardlink paths together so sibling reads rehydrate", () => {
+    const source = new MemoryVolume();
+    source.mkdirSync("/node_modules/pkg", { recursive: true });
+    source.writeFileSync("/node_modules/pkg/a.bin", new Uint8Array([1, 2, 3, 4, 5]));
+    source.linkSync("/node_modules/pkg/a.bin", "/node_modules/pkg/a-link.bin");
+    source.writeFileSync("/node_modules/pkg/b.bin", new Uint8Array([6, 7, 8, 9, 10]));
+    const snap = new VFSBridge(source).createSnapshot({ excludeDirNames: ["node_modules"] });
+    const bounded = new MemoryVolume(null, 6);
+    bounded.mkdirSync("/node_modules", { recursive: true });
+    const boundedHandler = volumeBackedHandler(source);
+    bounded.setMissHandler(boundedHandler, snap.lazyDirNames!);
+
+    expect([...bounded.readFileSync("/node_modules/pkg/a.bin")]).toEqual([1, 2, 3, 4, 5]);
+    // materialize hardlink locally sharing inode
+    bounded.linkSync("/node_modules/pkg/a.bin", "/node_modules/pkg/a-link.bin");
+    expect([...bounded.readFileSync("/node_modules/pkg/b.bin")]).toEqual([6, 7, 8, 9, 10]);
+    // a.bin was evicted; hardlink sibling must rehydrate, not return empty
+    expect([...bounded.readFileSync("/node_modules/pkg/a-link.bin")]).toEqual([1, 2, 3, 4, 5]);
+  });
+
+  it("failed hydrate keeps stub lazy so a later read can retry", () => {
+    const source = new MemoryVolume();
+    source.mkdirSync("/node_modules/pkg", { recursive: true });
+    source.writeFileSync("/node_modules/pkg/flaky.js", "ok");
+    const snap = new VFSBridge(source).createSnapshot({ excludeDirNames: ["node_modules"] });
+    const workerVol = new MemoryVolume();
+    workerVol.mkdirSync("/node_modules", { recursive: true });
+    let failOnce = true;
+    const handler = volumeBackedHandler(source);
+    const origRead = handler.readFile.bind(handler);
+    handler.readFile = (p: string) => {
+      if (failOnce && p.endsWith("flaky.js")) {
+        failOnce = false;
+        throw new Error("transient");
+      }
+      return origRead(p);
+    };
+    workerVol.setMissHandler(handler, snap.lazyDirNames!);
+    workerVol.readdirSync("/node_modules/pkg");
+    expect(() => workerVol.readFileSync("/node_modules/pkg/flaky.js")).toThrow();
+    expect(workerVol.readFileSync("/node_modules/pkg/flaky.js", "utf8")).toBe("ok");
+  });
+
   it("markLazyInvalidated drops the local copy and re-pulls fresh content, even outside lazy dirs", () => {
     // /project/index.js is outside node_modules and fully local
     expect(worker.readFileSync("/project/index.js", "utf8")).toBe("require('lodash')");

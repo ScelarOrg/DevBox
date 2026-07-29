@@ -6,6 +6,12 @@ import { LS_BLOCK_SIZE } from "../../constants/config";
 /*  Helpers                                                            */
 /* ------------------------------------------------------------------ */
 
+function shellQuote(arg: string): string {
+  if (arg === "") return "''";
+  if (/^[A-Za-z0-9_\-./:=@%+,]+$/.test(arg)) return arg;
+  return "'" + arg.replace(/'/g, "'\\''") + "'";
+}
+
 function matchSize(fileSize: number, spec: string): boolean {
   const m = spec.match(/^([+-]?)(\d+)([cwbkMG]?)$/);
   if (!m) return true;
@@ -180,7 +186,7 @@ const find_cmd: BuiltinFn = async (args, ctx) => {
   if (execCmd) {
     for (const path of results) {
       const expandedArgs = execArgs.map((a) => (a === "{}" ? path : a));
-      const fullCmd = [execCmd, ...expandedArgs].join(" ");
+      const fullCmd = [execCmd, ...expandedArgs].map(shellQuote).join(" ");
       const result = await ctx.exec(fullCmd, { cwd: ctx.cwd, env: ctx.env });
       execOut += result.stdout;
     }
@@ -214,17 +220,17 @@ const xargs_cmd: BuiltinFn = async (args, ctx, stdin) => {
 
   const delim = nullDelim ? "\0" : /\s+/;
   const items = stdin.trim().split(delim).filter(Boolean);
-  const cmd = cmdParts.join(" ");
+  const cmd = cmdParts.map(shellQuote).join(" ");
   let out = "";
   let err = "";
   let lastCode = 0;
 
   if (placeholder) {
     for (const item of items) {
-      const expanded = cmd.replace(
-        new RegExp(placeholder.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g"),
-        item,
-      );
+      const expanded = cmdParts
+        .map((part) => (part.includes(placeholder) ? part.split(placeholder).join(item) : part))
+        .map(shellQuote)
+        .join(" ");
       const result = await ctx.exec(expanded, { cwd: ctx.cwd, env: ctx.env });
       out += result.stdout;
       err += result.stderr;
@@ -232,7 +238,7 @@ const xargs_cmd: BuiltinFn = async (args, ctx, stdin) => {
     }
   } else if (maxArgs < Infinity) {
     for (let i = 0; i < items.length; i += maxArgs) {
-      const batch = items.slice(i, i + maxArgs).join(" ");
+      const batch = items.slice(i, i + maxArgs).map(shellQuote).join(" ");
       const result = await ctx.exec(`${cmd} ${batch}`, {
         cwd: ctx.cwd,
         env: ctx.env,
@@ -242,7 +248,7 @@ const xargs_cmd: BuiltinFn = async (args, ctx, stdin) => {
       lastCode = result.exitCode;
     }
   } else {
-    const result = await ctx.exec(`${cmd} ${items.join(" ")}`, {
+    const result = await ctx.exec(`${cmd} ${items.map(shellQuote).join(" ")}`, {
       cwd: ctx.cwd,
       env: ctx.env,
     });

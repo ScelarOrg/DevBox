@@ -15,14 +15,67 @@ export interface Url {
   href?: string;
 }
 
+function hasScheme(raw: string): boolean {
+  // Absolute URL with a scheme (http:, https:, file:, etc.)
+  return /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(raw);
+}
+
+function parsePathOnly(raw: string, parseQuery: boolean): Url {
+  let pathname = raw;
+  let search: string | null = null;
+  let hash: string | null = null;
+  const hashPos = pathname.indexOf("#");
+  if (hashPos >= 0) {
+    hash = pathname.substring(hashPos);
+    pathname = pathname.substring(0, hashPos);
+  }
+  const searchPos = pathname.indexOf("?");
+  if (searchPos >= 0) {
+    search = pathname.substring(searchPos);
+    pathname = pathname.substring(0, searchPos);
+  }
+  let query: string | Record<string, string | string[]> | null = null;
+  if (search) {
+    const qs = search.substring(1);
+    if (parseQuery) {
+      query = Object.fromEntries(new globalThis.URLSearchParams(qs));
+    } else {
+      query = qs;
+    }
+  }
+  return {
+    protocol: null,
+    slashes: null,
+    auth: null,
+    host: null,
+    port: null,
+    hostname: null,
+    hash,
+    search,
+    query,
+    pathname,
+    path: pathname + (search || ""),
+    href: raw,
+  };
+}
+
 export function parse(
   raw: string,
   parseQuery: boolean = false,
   _slashesHost: boolean = false,
 ): Url {
+  // Node url.parse keeps path-only inputs hostless (no localhost injection)
+  if (!hasScheme(raw)) {
+    return parsePathOnly(raw, parseQuery);
+  }
+
   try {
-    const u = new globalThis.URL(raw, "http://localhost");
-    const authPart = u.username ? `${u.username}:${u.password}` : null;
+    const u = new globalThis.URL(raw);
+    const authPart = u.username
+      ? u.password
+        ? `${u.username}:${u.password}`
+        : u.username
+      : null;
     const queryVal = parseQuery
       ? Object.fromEntries(u.searchParams)
       : u.search
@@ -44,20 +97,7 @@ export function parse(
       href: u.href,
     };
   } catch {
-    return {
-      protocol: null,
-      slashes: null,
-      auth: null,
-      host: null,
-      port: null,
-      hostname: null,
-      hash: null,
-      search: null,
-      query: null,
-      pathname: raw,
-      path: raw,
-      href: raw,
-    };
+    return parsePathOnly(raw, parseQuery);
   }
 }
 
@@ -121,25 +161,32 @@ export function resolve(base: string, target: string): string {
 export const URL = globalThis.URL;
 export const URLSearchParams = globalThis.URLSearchParams;
 
+function throwInvalidUrlScheme(protocol: string): never {
+  const err = new TypeError(
+    `The URL must be of scheme file: got ${protocol}`,
+  ) as TypeError & { code: string };
+  err.code = "ERR_INVALID_URL_SCHEME";
+  throw err;
+}
+
 export function fileURLToPath(input: string | URL): string {
   if (typeof input === "string") {
     // Bare filesystem path — return as-is
-    if (input.startsWith("/")) return input;
+    if (input.startsWith("/") && !hasScheme(input)) return input;
     try {
       const urlObj = new globalThis.URL(input);
-      if (urlObj.protocol === "file:") {
-        return decodeURIComponent(urlObj.pathname);
+      if (urlObj.protocol !== "file:") {
+        throwInvalidUrlScheme(urlObj.protocol);
       }
-      // Non-file URL (http:, blob:, etc.) — return the pathname portion
       return decodeURIComponent(urlObj.pathname);
-    } catch {
+    } catch (e) {
+      if ((e as { code?: string }).code === "ERR_INVALID_URL_SCHEME") throw e;
       // Not a valid URL at all — return as-is
       return input;
     }
   }
-  // URL object
-  if (input.protocol === "file:") {
-    return decodeURIComponent(input.pathname);
+  if (input.protocol !== "file:") {
+    throwInvalidUrlScheme(input.protocol);
   }
   return decodeURIComponent(input.pathname);
 }

@@ -26,6 +26,14 @@ export interface PmDeps {
   npmInfo: (args: string[], ctx: ShellContext) => Promise<ShellResult>;
   npmPack: (ctx: ShellContext) => ShellResult;
   npmConfig: (args: string[], ctx: ShellContext) => ShellResult;
+  npmPkg: (args: string[], ctx: ShellContext) => ShellResult;
+  npmCi: (ctx: ShellContext, pm?: PkgManager) => Promise<ShellResult>;
+  npmOutdated: (ctx: ShellContext) => Promise<ShellResult>;
+  npmAudit: (ctx: ShellContext) => Promise<ShellResult>;
+  npmFund: (ctx: ShellContext) => Promise<ShellResult>;
+  npmPing: (ctx: ShellContext) => Promise<ShellResult>;
+  npmWhoami: (ctx: ShellContext) => Promise<ShellResult>;
+  npmCacheClean: () => Promise<ShellResult>;
   npxExecute: (params: string[], ctx: ShellContext) => Promise<ShellResult>;
   executeNodeBinary: (
     filePath: string,
@@ -41,5 +49,8 @@ export interface PmDeps {
   hasFile: (path: string) => boolean;
   readFile: (path: string) => string;
   writeFile: (path: string, data: string) => void;
-  npmPkg?: (args: string[], ctx: ShellContext) => ShellResult;
+  rejectGlobal: (args: string[], pm: PkgManager) => ShellResult | null;
 }
+
+// re-export so factories can import ShellCommand from one place if needed
+export type { ShellCommand };

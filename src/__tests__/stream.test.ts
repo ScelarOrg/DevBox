@@ -140,3 +140,58 @@ describe("async iteration", () => {
     expect(chunks).toEqual(["a", "b"]);
   });
 });
+
+describe("Node parity", () => {
+  it("read(0) returns null without draining the buffer", () => {
+    const r = new Readable({ read() {} });
+    r.pause();
+    r.push("hello");
+    expect(r.read(0)).toBeNull();
+    expect(String(r.read())).toBe("hello");
+  });
+
+  it("unpipe removes only pipe listeners", () => {
+    const r = new Readable({ read() {} });
+    const userData = vi.fn();
+    r.on("data", userData);
+    const w = new Writable({
+      write(_chunk: any, _enc: string, cb: () => void) {
+        cb();
+      },
+    });
+    r.pipe(w);
+    r.unpipe(w);
+    r.push("kept");
+    r.push(null);
+    expect(userData).toHaveBeenCalled();
+  });
+
+  it("objectMode write preserves string chunks", () => {
+    const seen: unknown[] = [];
+    const w = new Writable({
+      objectMode: true,
+      write(chunk: any, _enc: string, cb: () => void) {
+        seen.push(chunk);
+        cb();
+      },
+    });
+    w.write("hello");
+    w.end();
+    expect(seen).toEqual(["hello"]);
+    expect(typeof seen[0]).toBe("string");
+  });
+
+  it("Transform pushes falsy-but-defined outputs", () => {
+    const t = new Transform({
+      objectMode: true,
+      transform(_chunk: any, _enc: string, cb: (err: null, data: unknown) => void) {
+        cb(null, "");
+      },
+    });
+    const chunks: unknown[] = [];
+    t.on("data", (chunk: unknown) => chunks.push(chunk));
+    t.write("x");
+    t.end();
+    expect(chunks).toContain("");
+  });
+});

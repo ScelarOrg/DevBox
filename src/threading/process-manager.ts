@@ -27,9 +27,9 @@ import type {
   WorkerToMain_SqlitePreload,
 } from "./worker-protocol";
 import type { VFSBridge } from "./vfs-bridge";
-import { PROCESS_WORKER_BUNDLE_GZIP_BASE64 } from "virtual:process-worker-bundle";
-import { ungzip } from "pako";
-import { SLOT_SIZE } from "./sync-channel";
+import { getRuntimeHost } from "../host/runtime-host";
+import type { HostWorker } from "../host/types";
+import { SLOT_SIZE, decodeSyncSlot } from "./sync-channel";
 import type { PerformanceTracker } from "../performance-tracker";
 
 const MAX_PROCESS_DEPTH = 10;
@@ -39,8 +39,17 @@ const MAX_PROCESSES = 50;
 // lazily by the worker. Mirrors the SDK's shallow-snapshot exclude set.
 const LEAN_EXCLUDE_DIR_NAMES = ["node_modules", ".npm", ".cache"];
 
+function revokeHostWorkerUrl(url: string | null | undefined): void {
+  if (!url) return;
+  try {
+    getRuntimeHost().revokeObjectUrl?.(url);
+  } catch {
+    /* ignore */
+  }
+}
+
 interface WasiBrokerChild {
-  worker: Worker;
+  worker: HostWorker;
   url: string;
   readyTimer: ReturnType<typeof setTimeout>;
 }
@@ -166,9 +175,13 @@ export class ProcessManager extends EventEmitter {
     const stopWorker = this._performance?.start("process.workerConstruct");
     const worker = this._createWorker();
     stopWorker?.();
-    const directWorker = Boolean((worker as Worker & { __nodepodDirect?: boolean }).__nodepodDirect);
+    if (worker.__nodepodDirect) {
+      this._performance?.increment("process.directWorkers");
+    } else {
+      this._performance?.increment("process.embeddedWorkers");
+    }
+    const directWorker = Boolean(worker.__nodepodDirect);
     const handle = new ProcessHandle(worker, spawnConfig, directWorker ? () => {
-      ProcessManager._externalWorkerUrl = null;
       this._performance?.increment("process.workerFallbacks");
       return this._createEmbeddedWorker();
     } : undefined);
@@ -343,12 +356,12 @@ export class ProcessManager extends EventEmitter {
     for (const [key, owned] of this._wasiWorkers) {
       if (owned.parentPid !== pid) continue;
       try { owned.worker.terminate(); } catch { /* ignore */ }
-      try { URL.revokeObjectURL(owned.url); } catch { /* ignore */ }
+      revokeHostWorkerUrl(owned.url);
       clearTimeout(owned.readyTimer);
       for (const child of owned.children.values()) {
         clearTimeout(child.readyTimer);
         try { child.worker.terminate(); } catch { /* ignore */ }
-        try { URL.revokeObjectURL(child.url); } catch { /* ignore */ }
+        revokeHostWorkerUrl(child.url);
       }
       owned.children.clear();
       const parent = this._processes.get(pid);
@@ -369,11 +382,11 @@ export class ProcessManager extends EventEmitter {
     parent.removeListener("ipc-message", owned.ipcListener);
     clearTimeout(owned.readyTimer);
     try { owned.worker.terminate(); } catch { /* ignore */ }
-    try { URL.revokeObjectURL(owned.url); } catch { /* ignore */ }
+    revokeHostWorkerUrl(owned.url);
     for (const child of owned.children.values()) {
       clearTimeout(child.readyTimer);
       try { child.worker.terminate(); } catch { /* ignore */ }
-      try { URL.revokeObjectURL(child.url); } catch { /* ignore */ }
+      revokeHostWorkerUrl(child.url);
     }
     owned.children.clear();
     if (!parent.workerExited) {
@@ -549,10 +562,6 @@ export class ProcessManager extends EventEmitter {
     handle.postMessage({ type: "ws-close", uid, code });
   }
 
-  private static _workerBlobUrl: string | null = null;
-  private static _externalWorkerUrl: string | null = null;
-  private static _workerProbePromise: Promise<void> | null = null;
-
   /**
    * Try to load the worker bundle from a same-origin asset
    * (dist/__worker__.js) so spawns don't need the embedded string copy.
@@ -560,46 +569,16 @@ export class ProcessManager extends EventEmitter {
    * the embedded bundle. Explicit `workerUrl` wins over auto-detection.
    */
   static probeExternalWorkerBundle(workerUrl?: string): Promise<void> {
-    if (ProcessManager._workerProbePromise) return ProcessManager._workerProbePromise;
-
-    ProcessManager._workerProbePromise = (async () => {
-      if (typeof fetch === "undefined") return;
-      let url: string | null = workerUrl ?? null;
-      if (!url) {
-        try {
-          // resolves next to the built library (dist/index.mjs → dist/__worker__.js)
-          url = new URL("./__worker__.js", import.meta.url).href;
-        } catch {
-          return;
-        }
-        // blob:/data: base URLs can't host a sibling asset
-        if (!/^https?:/.test(url)) return;
-      }
-      try {
-        const resp = await fetch(url, { method: "HEAD" });
-        if (!resp.ok) return;
-        const contentType = resp.headers.get("content-type") || "";
-        // guard against SPA index.html fallbacks answering for missing paths
-        if (contentType && !/javascript|ecmascript/i.test(contentType)) return;
-        ProcessManager._externalWorkerUrl = url;
-      } catch {
-        /* asset not served — embedded fallback keeps working */
-      }
-    })();
-
-    return ProcessManager._workerProbePromise;
+    const host = getRuntimeHost();
+    if (!host.probeProcessWorkerUrl) return Promise.resolve();
+    return host.probeProcessWorkerUrl(workerUrl).then(() => undefined);
   }
 
   static disposeGlobalResources(): void {
-    if (ProcessManager._workerBlobUrl) {
-      try { URL.revokeObjectURL(ProcessManager._workerBlobUrl); } catch { /* ignore */ }
-    }
-    ProcessManager._workerBlobUrl = null;
-    ProcessManager._externalWorkerUrl = null;
-    ProcessManager._workerProbePromise = null;
+    getRuntimeHost().disposeGlobalResources?.();
   }
 
-  private _createWasiBootstrap(name: string): { worker: Worker; url: string } {
+  private _createWasiBootstrap(name: string): { worker: HostWorker; url: string } {
     const bootstrap = `self.onmessage = (event) => {
       if (!event.data || !event.data.__nodepod_wasi_init__) return;
       const init = event.data;
@@ -612,8 +591,12 @@ export class ProcessManager extends EventEmitter {
         self.postMessage({ __nodepod_worker_error__: String(error && error.stack || error) });
       }
     };`;
-    const url = URL.createObjectURL(new Blob([bootstrap], { type: "application/javascript" }));
-    return { worker: new Worker(url, { name }), url };
+    const worker = getRuntimeHost().createWorker({
+      type: "source",
+      source: bootstrap,
+      name,
+    });
+    return { worker, url: worker.__nodepodRevokeUrl ?? "" };
   }
 
   private _handleFsProxyWithRecovery(
@@ -658,7 +641,9 @@ export class ProcessManager extends EventEmitter {
       if (!child) return;
       clearTimeout(child.readyTimer);
       try { child.worker.terminate(); } catch { /* ignore */ }
-      try { URL.revokeObjectURL(child.url); } catch { /* ignore */ }
+      try {
+        if (child.url) getRuntimeHost().revokeObjectUrl?.(child.url);
+      } catch { /* ignore */ }
       root.children.delete(tid);
     };
     try {
@@ -666,8 +651,8 @@ export class ProcessManager extends EventEmitter {
       const readyTimer = setTimeout(fail, 30_000);
       child = { ...created, readyTimer };
       root.children.set(tid, child);
-      created.worker.onmessage = (event: MessageEvent) => {
-        const data = event.data;
+      created.worker.onmessage = (event) => {
+        const data = event.data as any;
         if (data && typeof data === "object" && data.__fs__) {
           this._handleFsProxyWithRecovery(data.__fs__, fsBridge);
           return;
@@ -699,7 +684,7 @@ export class ProcessManager extends EventEmitter {
         if (emnapi?.type === "cleanup-thread") {
           clearTimeout(readyTimer);
           try { created.worker.terminate(); } catch { /* ignore */ }
-          try { URL.revokeObjectURL(created.url); } catch { /* ignore */ }
+          revokeHostWorkerUrl(created.url);
           root.children.delete(tid);
         }
       };
@@ -727,33 +712,12 @@ export class ProcessManager extends EventEmitter {
     };
   }
 
-  private _createWorker(): Worker {
-    if (ProcessManager._externalWorkerUrl) {
-      try {
-        const worker = new Worker(ProcessManager._externalWorkerUrl);
-        (worker as Worker & { __nodepodDirect?: boolean }).__nodepodDirect = true;
-        this._performance?.increment("process.directWorkers");
-        return worker;
-      } catch {
-        ProcessManager._externalWorkerUrl = null;
-      }
-    }
-
-    return this._createEmbeddedWorker();
+  private _createWorker(): HostWorker {
+    return getRuntimeHost().createWorker({ type: "process" });
   }
 
-  private _createEmbeddedWorker(): Worker {
-    // blob URL is the CSP/CDN/missing-asset fallback
-    if (!ProcessManager._workerBlobUrl) {
-      const binary = atob(PROCESS_WORKER_BUNDLE_GZIP_BASE64);
-      const compressed = new Uint8Array(binary.length);
-      for (let i = 0; i < binary.length; i++) compressed[i] = binary.charCodeAt(i);
-      const source = ungzip(compressed, { to: "string" });
-      const blob = new Blob([source], { type: "application/javascript" });
-      ProcessManager._workerBlobUrl = URL.createObjectURL(blob);
-    }
-    this._performance?.increment("process.embeddedWorkers");
-    return new Worker(ProcessManager._workerBlobUrl);
+  private _createEmbeddedWorker(): HostWorker {
+    return getRuntimeHost().createWorker({ type: "process", embedded: true });
   }
 
   private _wireHandleEvents(handle: ProcessHandle): void {
@@ -812,7 +776,7 @@ export class ProcessManager extends EventEmitter {
           this._vfsBridge.handleWorkerWrite(path, new Uint8Array(content));
         }
         if (!isInternalVfsPath(path)) {
-          this._vfsBridge.broadcastChange(path, content, handle.pid);
+          this._vfsBridge.broadcastChange(path, content, isDirectory, handle.pid);
         }
       }
     });
@@ -821,7 +785,7 @@ export class ProcessManager extends EventEmitter {
       if (this._vfsBridge) {
         this._vfsBridge.handleWorkerDelete(path);
         if (!isInternalVfsPath(path)) {
-          this._vfsBridge.broadcastChange(path, null, handle.pid);
+          this._vfsBridge.broadcastChange(path, null, false, handle.pid);
         }
       }
     });
@@ -840,7 +804,16 @@ export class ProcessManager extends EventEmitter {
     });
 
     handle.on("spawn-request", (msg: WorkerToMain_SpawnRequest) => {
-      const fullCmd = msg.args.length ? `${msg.command} ${msg.args.join(" ")}` : msg.command;
+      // Quote args that need it so spaces/metacharacters survive shell parsing.
+      const quoteShell = (a: string) =>
+        a === ""
+          ? "''"
+          : /^[a-zA-Z0-9_./:@%+=,-]+$/.test(a)
+            ? a
+            : `'${a.replace(/'/g, `'\\''`)}'`;
+      const fullCmd = msg.args.length
+        ? `${quoteShell(msg.command)} ${msg.args.map(quoteShell).join(" ")}`
+        : quoteShell(msg.command);
       try {
         const childHandle = this.spawn({
           command: msg.command,
@@ -1090,7 +1063,7 @@ export class ProcessManager extends EventEmitter {
             const encoder = new TextEncoder();
             const content = encoder.encode(msg.modulePath).buffer as ArrayBuffer;
             this._vfsBridge.handleWorkerWrite(evalPath, new Uint8Array(content));
-            this._vfsBridge.broadcastChange(evalPath, content, handle.pid);
+            this._vfsBridge.broadcastChange(evalPath, content, false, handle.pid);
           }
         }
 
@@ -1257,8 +1230,8 @@ export class ProcessManager extends EventEmitter {
         };
         this._wasiWorkers.set(key, owned);
         handle.on("ipc-message", ipcListener);
-        worker.onmessage = (event: MessageEvent) => {
-          const data = event.data;
+        worker.onmessage = (event) => {
+          const data = event.data as any;
           if (data && typeof data === "object" && data.__fs__) {
             this._handleFsProxyWithRecovery(data.__fs__, fsBridge);
             return;
@@ -1287,7 +1260,7 @@ export class ProcessManager extends EventEmitter {
           }
           handle.postMessage({ type: "ipc-message", targetRequestId: msg.requestId, data } as any);
         };
-        worker.onerror = (event: ErrorEvent) => {
+        worker.onerror = (event) => {
           handle.postMessage({
             type: "ipc-message",
             targetRequestId: msg.requestId,
@@ -1327,14 +1300,23 @@ export class ProcessManager extends EventEmitter {
         return;
       }
 
+      const quoteShell = (a: string) =>
+        a === ""
+          ? "''"
+          : /^[a-zA-Z0-9_./:@%+=,-]+$/.test(a)
+            ? a
+            : `'${a.replace(/'/g, `'\\''`)}'`;
       const fullCmd = msg.shellCommand ??
-        (msg.args.length ? `${msg.command} ${msg.args.join(" ")}` : msg.command);
+        (msg.args.length
+          ? `${quoteShell(msg.command)} ${msg.args.map(quoteShell).join(" ")}`
+          : quoteShell(msg.command));
       const maxStdoutLen = (SLOT_SIZE - 3) * 4;
+      const { slot: syncSlotIndex } = decodeSyncSlot(msg.syncSlot);
 
       const signalError = (exitCode: number) => {
         try {
           const int32 = new Int32Array(this._syncBuffer!);
-          const slotBase = msg.syncSlot * SLOT_SIZE;
+          const slotBase = syncSlotIndex * SLOT_SIZE;
           Atomics.store(int32, slotBase + 1, exitCode);
           Atomics.store(int32, slotBase + 2, 0);
           Atomics.store(int32, slotBase, 2); // STATUS_ERROR
@@ -1403,7 +1385,7 @@ export class ProcessManager extends EventEmitter {
           try {
             const int32 = new Int32Array(this._syncBuffer!);
             const encoder = new TextEncoder();
-            const slotBase = msg.syncSlot * SLOT_SIZE;
+            const slotBase = syncSlotIndex * SLOT_SIZE;
             const stdoutBytes = encoder.encode(childHandle.stdout);
             const truncatedLen = Math.min(stdoutBytes.byteLength, maxStdoutLen);
 

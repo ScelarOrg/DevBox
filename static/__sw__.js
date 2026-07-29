@@ -1420,7 +1420,8 @@ async function proxyToVirtualServer(request, instanceId, serverPort, path, origi
   try {
     const data = await promise;
     let responseBody = null;
-    if (data.bodyBase64) {
+    // HEAD responses must not include a body even if upstream sent one
+    if (method !== "HEAD" && data.bodyBase64) {
       const binary = atob(data.bodyBase64);
       const bytes = new Uint8Array(binary.length);
       for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);

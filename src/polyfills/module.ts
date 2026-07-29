@@ -6,6 +6,7 @@ export const builtinModules: string[] = [
   "async_hooks",
   "buffer",
   "child_process",
+  "child_process/promises",
   "cluster",
   "console",
   "constants",

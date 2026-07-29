@@ -15,31 +15,36 @@ export function createYarnCommand(deps: PmDeps): ShellCommand {
 
       const sub = params[0];
       if (!sub) return deps.installPackages([], ctx, "yarn");
+
       if (sub === "help" || sub === "--help") {
         return {
           stdout:
             `${A_BOLD}Usage:${A_RESET} yarn <command>\n\n` +
-            `${A_BOLD}Commands:${A_RESET}\n` +
             `  ${A_CYAN}add${A_RESET} [pkg]         Install packages\n` +
-            `  ${A_CYAN}install${A_RESET}           Install from manifest\n` +
+            `  ${A_CYAN}install${A_RESET}           Install from package.json\n` +
             `  ${A_CYAN}remove${A_RESET} <pkg>      Remove a package\n` +
-            `  ${A_CYAN}list${A_RESET}              List installed packages\n` +
             `  ${A_CYAN}run${A_RESET} <script>      Run a script\n` +
+            `  ${A_CYAN}exec${A_RESET} <cmd>        Execute a binary\n` +
             `  ${A_CYAN}dlx${A_RESET} <pkg>         Download and execute a package\n` +
-            `  ${A_CYAN}init${A_RESET}              Create a package.json\n` +
-            `  ${A_CYAN}create${A_RESET} <pkg>      Create a project\n` +
-            `  ${A_CYAN}version${A_RESET}           Show version info\n`,
+            `  ${A_CYAN}init${A_RESET}              Create package.json\n` +
+            `  ${A_CYAN}create${A_RESET} <pkg>      Create a project\n`,
           stderr: "",
           exitCode: 0,
         };
       }
 
       switch (sub) {
-        case "add":
+        case "add": {
+          const rejected = deps.rejectGlobal(params.slice(1), "yarn");
+          if (rejected) return rejected;
           return deps.installPackages(params.slice(1), ctx, "yarn");
+        }
         case "install":
-        case "i":
+        case "i": {
+          const rejected = deps.rejectGlobal(params.slice(1), "yarn");
+          if (rejected) return rejected;
           return deps.installPackages(params.slice(1), ctx, "yarn");
+        }
         case "remove":
         case "rm":
         case "uninstall":
@@ -68,13 +73,21 @@ export function createYarnCommand(deps: PmDeps): ShellCommand {
         case "info":
           return deps.npmInfo(params.slice(1), ctx);
         case "audit":
-          return { stdout: "0 vulnerabilities found\n", stderr: "", exitCode: 0 };
+          return deps.npmAudit(ctx);
         case "outdated":
-          return { stdout: "", stderr: "", exitCode: 0 };
+          return deps.npmOutdated(ctx);
         case "why":
-          return { stdout: "", stderr: deps.formatWarn("why: not available in nodepod", "yarn"), exitCode: 0 };
+          return {
+            stdout: "",
+            stderr: deps.formatErr("why: not available in nodepod", "yarn"),
+            exitCode: 1,
+          };
         case "global":
-          return { stdout: "", stderr: deps.formatWarn("global: not available in nodepod", "yarn"), exitCode: 0 };
+          return {
+            stdout: "",
+            stderr: deps.formatErr("global: not available in nodepod", "yarn"),
+            exitCode: 1,
+          };
         default:
           // yarn classic treats unknown commands as `yarn run <cmd>`
           return deps.runScript(params, ctx);

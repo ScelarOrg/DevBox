@@ -304,7 +304,9 @@ ServerResponse.prototype.removeHeader = function removeHeader(key: string): void
 };
 
 ServerResponse.prototype.flushHeaders = function flushHeaders(): void {
-  this.headersSent = true;
+  if (!this.headersSent) {
+    this.writeHead(this.statusCode);
+  }
 };
 
 // Node internal API: flush implicit headers if none were sent explicitly.
@@ -354,6 +356,7 @@ ServerResponse.prototype.writeHead = function writeHead(
   } else if (msgOrHdrs) {
     for (const [k, v] of Object.entries(msgOrHdrs)) this.setHeader(k, v);
   }
+  this.headersSent = true;
   return this;
 };
 
@@ -396,7 +399,9 @@ ServerResponse.prototype.end = function end(
         flatHdrs[k] = Array.isArray(v) ? v.join(", ") : v;
       }
     });
-    const finalBody = Buffer.concat(this._chunks);
+    // HEAD responses must not carry a body (RFC 9110)
+    const isHead = this.req?.method === "HEAD";
+    const finalBody = isHead ? Buffer.alloc(0) : Buffer.concat(this._chunks);
     this._completionCallback({
       statusCode: this.statusCode,
       statusMessage: this.statusMessage,
@@ -551,9 +556,41 @@ Server.prototype.listen = function listen(
 
   const self = this;
   const origDone = done;
+
+  // Conflict check before bind — registry is the real routing table.
+  if (typeof port === "number" && port !== 0 && _registry.has(port)) {
+    const existing = _registry.get(port);
+    if (existing && existing !== self) {
+      const err = new Error(
+        `listen EADDRINUSE: address already in use :::${port}`,
+      ) as NodeJS.ErrnoException;
+      err.code = "EADDRINUSE";
+      err.errno = -98;
+      (err as any).syscall = "listen";
+      (err as any).address = host ?? "::";
+      (err as any).port = port;
+      queueMicrotask(() => self.emit("error", err));
+      return this;
+    }
+  }
+
   done = function onBound() {
     const addr = self._tcp.address();
-    if (addr) _addServer(addr.port, self);
+    if (addr) {
+      if (!_addServer(addr.port, self)) {
+        // Race: another server claimed the port between check and bind.
+        const err = new Error(
+          `listen EADDRINUSE: address already in use :::${addr.port}`,
+        ) as NodeJS.ErrnoException;
+        err.code = "EADDRINUSE";
+        err.errno = -98;
+        (err as any).syscall = "listen";
+        (err as any).port = addr.port;
+        self._tcp.close();
+        self.emit("error", err);
+        return;
+      }
+    }
     if (origDone) origDone();
   };
 
@@ -825,6 +862,7 @@ export const ClientRequest = function ClientRequest(
   this.headers = {};
   this._pending = [];
   this._cancelled = false;
+  this._timedOut = false;
   this._waitMs = null;
   this._waitTimer = null;
   this._sealed = false;
@@ -965,6 +1003,7 @@ ClientRequest.prototype._dispatch = async function _dispatch(): Promise<void> {
     if (isLocal) {
       const body = this._pending.length > 0 ? Buffer.concat(this._pending) : undefined;
       if (body) ensureContentLength(this.headers, body);
+      this._armWaitTimer();
       const vServer = _registry.get(port);
       if (vServer) {
         try {
@@ -974,15 +1013,12 @@ ClientRequest.prototype._dispatch = async function _dispatch(): Promise<void> {
             this.headers,
             body,
           );
-          if (this._cancelled) return;
-          const incoming = new IncomingMessage();
-          incoming.statusCode = result.statusCode;
-          incoming.statusMessage = result.statusMessage;
-          applyHeadersToIncomingMessage(incoming, result.headers);
-          incoming._injectBody(result.body);
-          this.emit("response", incoming);
+          if (this._cancelled || this._timedOut) return;
+          this._clearWaitTimer();
+          this._emitMappedResponse(result.statusCode, result.statusMessage, result.headers, result.body);
         } catch (err) {
-          this.emit("error", err);
+          this._clearWaitTimer();
+          if (!this._timedOut) this.emit("error", err);
         }
         return;
       }
@@ -995,18 +1031,16 @@ ClientRequest.prototype._dispatch = async function _dispatch(): Promise<void> {
             this.headers,
             body,
           );
-          if (this._cancelled) return;
-          const incoming = new IncomingMessage();
-          incoming.statusCode = result.statusCode;
-          incoming.statusMessage = result.statusMessage;
-          applyHeadersToIncomingMessage(incoming, result.headers);
-          incoming._injectBody(result.body);
-          this.emit("response", incoming);
+          if (this._cancelled || this._timedOut) return;
+          this._clearWaitTimer();
+          this._emitMappedResponse(result.statusCode, result.statusMessage, result.headers, result.body);
         } catch (err) {
-          this.emit("error", err);
+          this._clearWaitTimer();
+          if (!this._timedOut) this.emit("error", err);
         }
         return;
       }
+      this._clearWaitTimer();
       // No virtual server on this port — emit ECONNREFUSED
       const err = new Error(`connect ECONNREFUSED ${hostname}:${port}`) as NodeJS.ErrnoException;
       err.code = "ECONNREFUSED";
@@ -1041,26 +1075,69 @@ ClientRequest.prototype._dispatch = async function _dispatch(): Promise<void> {
 
     if (this._waitMs) {
       this._waitTimer = setTimeout(() => {
+        this._timedOut = true;
         ac.abort();
         this.emit("timeout");
       }, this._waitMs);
     }
 
     const resp = await fetch(targetUrl, init);
-    if (this._waitTimer) {
-      clearTimeout(this._waitTimer);
-      this._waitTimer = null;
-    }
-    if (this._cancelled) return;
+    this._clearWaitTimer();
+    if (this._cancelled || this._timedOut) return;
 
     const incoming = await this._mapResponse(resp);
+    // Emit headers first (complete=false), then inject body so listeners see Node ordering.
     this.emit("response", incoming);
+    const raw = (incoming as any)._pendingBody as Buffer | null | undefined;
+    if (raw !== undefined) {
+      delete (incoming as any)._pendingBody;
+      incoming._injectBody(this.method === "HEAD" ? null : raw);
+    }
   } catch (err) {
-    if (this._waitTimer) clearTimeout(this._waitTimer);
-    if (this._cancelled) return;
+    this._clearWaitTimer();
+    if (this._cancelled || this._timedOut) return;
     if (err instanceof Error && err.name === "AbortError") return;
     this.emit("error", err);
   }
+};
+
+ClientRequest.prototype._armWaitTimer = function _armWaitTimer(): void {
+  if (!this._waitMs || this._waitTimer) return;
+  const self = this;
+  this._waitTimer = setTimeout(() => {
+    self._timedOut = true;
+    self._waitTimer = null;
+    self.emit("timeout");
+  }, this._waitMs);
+};
+
+ClientRequest.prototype._clearWaitTimer = function _clearWaitTimer(): void {
+  if (this._waitTimer) {
+    clearTimeout(this._waitTimer);
+    this._waitTimer = null;
+  }
+};
+
+ClientRequest.prototype._emitMappedResponse = function _emitMappedResponse(
+  statusCode: number,
+  statusMessage: string,
+  headers: Record<string, string | string[] | undefined>,
+  body: Buffer | string | null | undefined,
+): void {
+  const incoming = new IncomingMessage();
+  incoming.statusCode = statusCode;
+  incoming.statusMessage = statusMessage;
+  applyHeadersToIncomingMessage(incoming, headers);
+  this.emit("response", incoming);
+  const payload =
+    this.method === "HEAD"
+      ? null
+      : body === undefined
+        ? null
+        : typeof body === "string"
+          ? Buffer.from(body)
+          : body;
+  incoming._injectBody(payload);
 };
 
 ClientRequest.prototype._mapResponse = async function _mapResponse(resp: Response): Promise<IncomingMessage> {
@@ -1069,7 +1146,8 @@ ClientRequest.prototype._mapResponse = async function _mapResponse(resp: Respons
   msg.statusMessage = resp.statusText || STATUS_CODES[resp.status] || "";
   applyHeadersToIncomingMessage(msg, fetchHeadersToNodeRecord(resp.headers));
   const raw = await resp.arrayBuffer();
-  msg._injectBody(Buffer.from(raw));
+  // Stash body so caller can emit('response') before injecting (complete ordering).
+  (msg as any)._pendingBody = Buffer.from(raw);
   return msg;
 };
 
@@ -1089,7 +1167,6 @@ ClientRequest.prototype._bridgeWebSocket = function _bridgeWebSocket(url: string
     return;
   }
 
-  const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
   const acceptDigest = createHash("sha1")
     .update(wsKey + WS_GUID)
     .digest("base64") as string;
@@ -1301,12 +1378,16 @@ export type HttpClientBridge = (
 
 let _httpClientBridge: HttpClientBridge | null = null;
 
-function _addServer(port: number, srv: Server, ownerPid?: number): void {
+/** Register server on port. Returns false if port is already taken by another server. */
+function _addServer(port: number, srv: Server, ownerPid?: number): boolean {
   // loop liveness is held by the inner net.TcpServer's TCPServerWrap handle.
   // this registry is just the port -> Server map for internal routing.
+  const existing = _registry.get(port);
+  if (existing && existing !== srv) return false;
   _registry.set(port, srv);
   if (ownerPid !== undefined) _serverOwnership.set(port, ownerPid);
   if (_onBind) _onBind(port, srv);
+  return true;
 }
 
 function _removeServer(port: number): void {
@@ -1436,6 +1517,9 @@ Agent.prototype.destroy = function destroy(): void {
 };
 
 export const globalAgent = new Agent();
+
+// RFC 6455 Sec-WebSocket-Accept GUID (shared with ws polyfill)
+export const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 // WebSocket frame codec
 

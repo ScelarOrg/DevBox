@@ -24,22 +24,33 @@ export const Http2Session = function Http2Session(this: any) {
   if (!this) return;
   EventEmitter.call(this);
   this._elHandle = getRegistry().register("HTTP2Session");
+  this._closed = false;
+  this._destroyed = false;
 } as unknown as { new(): Http2Session; prototype: any };
 
 Object.setPrototypeOf(Http2Session.prototype, EventEmitter.prototype);
 
 Http2Session.prototype.close = function close(done?: () => void): void {
+  this._closed = true;
   (this._elHandle as Handle | null)?.close();
   this._elHandle = null;
   if (done) setTimeout(done, 0);
 };
 Http2Session.prototype.destroy = function destroy(_err?: Error, _code?: number): void {
+  this._destroyed = true;
+  this._closed = true;
   (this._elHandle as Handle | null)?.close();
   this._elHandle = null;
 };
-Object.defineProperty(Http2Session.prototype, 'destroyed', { get() { return false; }, configurable: true });
+Object.defineProperty(Http2Session.prototype, 'destroyed', {
+  get() { return !!this._destroyed; },
+  configurable: true,
+});
 Object.defineProperty(Http2Session.prototype, 'encrypted', { get() { return false; }, configurable: true });
-Object.defineProperty(Http2Session.prototype, 'closed', { get() { return false; }, configurable: true });
+Object.defineProperty(Http2Session.prototype, 'closed', {
+  get() { return !!this._closed; },
+  configurable: true,
+});
 Http2Session.prototype.ping = function ping(
   _cb: (err: Error | null, dur: number, buf: Uint8Array) => void,
 ): boolean { return false; };
@@ -83,18 +94,33 @@ export interface Http2Stream extends EventEmitter {
 export const Http2Stream = function Http2Stream(this: any) {
   if (!this) return;
   EventEmitter.call(this);
+  this._closed = false;
+  this._destroyed = false;
 } as unknown as { new(): Http2Stream; prototype: any };
 
 Object.setPrototypeOf(Http2Stream.prototype, EventEmitter.prototype);
 
-Http2Stream.prototype.close = function close(_code?: number, _cb?: () => void): void {};
+Http2Stream.prototype.close = function close(_code?: number, _cb?: () => void): void {
+  this._closed = true;
+  if (_cb) setTimeout(_cb, 0);
+};
 Object.defineProperty(Http2Stream.prototype, 'id', { get() { return 0; }, configurable: true });
 Object.defineProperty(Http2Stream.prototype, 'pending', { get() { return false; }, configurable: true });
-Object.defineProperty(Http2Stream.prototype, 'destroyed', { get() { return false; }, configurable: true });
-Object.defineProperty(Http2Stream.prototype, 'closed', { get() { return false; }, configurable: true });
+Object.defineProperty(Http2Stream.prototype, 'destroyed', {
+  get() { return !!this._destroyed; },
+  configurable: true,
+});
+Object.defineProperty(Http2Stream.prototype, 'closed', {
+  get() { return !!this._closed; },
+  configurable: true,
+});
 Http2Stream.prototype.priority = function priority(_opts: unknown): void {};
 Http2Stream.prototype.setTimeout = function setTimeout(_ms: number, _cb?: () => void): void {};
-Http2Stream.prototype.end = function end(_data?: unknown, _enc?: string, _cb?: () => void): void {};
+Http2Stream.prototype.end = function end(_data?: unknown, _enc?: string, _cb?: () => void): void {
+  this._closed = true;
+  if (typeof _cb === "function") setTimeout(_cb, 0);
+  else if (typeof _enc === "function") setTimeout(_enc as () => void, 0);
+};
 
 /* ------------------------------------------------------------------ */
 /*  Request / Response                                                 */

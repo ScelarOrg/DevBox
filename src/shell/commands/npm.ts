@@ -1,6 +1,6 @@
 import type { ShellCommand } from "../shell-types";
 import type { PmDeps } from "./pm-types";
-import { VERSIONS, NPM_REGISTRY_URL_SLASH } from "../../constants/config";
+import { VERSIONS } from "../../constants/config";
 
 const A_RESET = "\x1b[0m";
 const A_BOLD = "\x1b[1m";
@@ -23,6 +23,7 @@ export function createNpmCommand(deps: PmDeps): ShellCommand {
             `  ${A_CYAN}start${A_RESET}             Alias for npm run start\n` +
             `  ${A_CYAN}test${A_RESET}              Alias for npm run test\n` +
             `  ${A_CYAN}install${A_RESET} [pkg]     Install packages\n` +
+            `  ${A_CYAN}ci${A_RESET}                Clean install from package-lock.json\n` +
             `  ${A_CYAN}uninstall${A_RESET} <pkg>   Remove a package\n` +
             `  ${A_CYAN}ls${A_RESET}                List installed packages\n` +
             `  ${A_CYAN}init${A_RESET}              Create a package.json\n` +
@@ -30,9 +31,8 @@ export function createNpmCommand(deps: PmDeps): ShellCommand {
             `  ${A_CYAN}version${A_RESET}           Show version info\n` +
             `  ${A_CYAN}info${A_RESET} <pkg>        Show package info\n` +
             `  ${A_CYAN}exec${A_RESET} <cmd>        Execute a package binary\n` +
-            `  ${A_CYAN}prefix${A_RESET}            Show prefix\n` +
-            `  ${A_CYAN}root${A_RESET}              Show node_modules path\n` +
-            `  ${A_CYAN}bin${A_RESET}               Show bin directory\n` +
+            `  ${A_CYAN}pkg${A_RESET}               Get/set package.json fields\n` +
+            `  ${A_CYAN}pack${A_RESET}              Create a tarball\n` +
             `  ${A_CYAN}config${A_RESET}            Manage configuration\n`,
           stderr: "",
           exitCode: 0,
@@ -51,15 +51,13 @@ export function createNpmCommand(deps: PmDeps): ShellCommand {
           return deps.runScript(["test"], ctx);
         case "install":
         case "i":
-        case "add":
+        case "add": {
+          const rejected = deps.rejectGlobal(params.slice(1), "npm");
+          if (rejected) return rejected;
           return deps.installPackages(params.slice(1), ctx);
+        }
         case "ci":
-          try {
-            deps.removeNodeModules(ctx.cwd);
-          } catch {
-            /* */
-          }
-          return deps.installPackages([], ctx);
+          return deps.npmCi(ctx, "npm");
         case "uninstall":
         case "remove":
         case "rm":
@@ -101,29 +99,14 @@ export function createNpmCommand(deps: PmDeps): ShellCommand {
         case "c":
           return deps.npmConfig(params.slice(1), ctx);
         case "outdated":
-          return {
-            stdout: "",
-            stderr: deps.formatWarn(
-              "outdated check not available in nodepod",
-              "npm",
-            ),
-            exitCode: 0,
-          };
+          return deps.npmOutdated(ctx);
         case "audit":
-          return {
-            stdout: "found 0 vulnerabilities\n",
-            stderr: "",
-            exitCode: 0,
-          };
+          return deps.npmAudit(ctx);
         case "fund":
-          return {
-            stdout: "0 packages are looking for funding\n",
-            stderr: "",
-            exitCode: 0,
-          };
+          return deps.npmFund(ctx);
         case "cache":
           if (params[1] === "clean" || params[1] === "clear") {
-            return { stdout: "Cache cleared.\n", stderr: "", exitCode: 0 };
+            return deps.npmCacheClean();
           }
           return {
             stdout: "",
@@ -134,13 +117,9 @@ export function createNpmCommand(deps: PmDeps): ShellCommand {
             exitCode: 1,
           };
         case "whoami":
-          return { stdout: "nodepod-user\n", stderr: "", exitCode: 0 };
+          return deps.npmWhoami(ctx);
         case "ping":
-          return {
-            stdout: `PING ${NPM_REGISTRY_URL_SLASH} - ok\n`,
-            stderr: "",
-            exitCode: 0,
-          };
+          return deps.npmPing(ctx);
         case "set-script": {
           const scriptName = params[1];
           const scriptCmd = params.slice(2).join(" ");
@@ -154,38 +133,13 @@ export function createNpmCommand(deps: PmDeps): ShellCommand {
               exitCode: 1,
             };
           }
-          try {
-            const pkgPath = ctx.cwd + "/package.json";
-            const raw = deps.readFile(pkgPath);
-            const pkg = JSON.parse(raw);
-            if (!pkg.scripts) pkg.scripts = {};
-            pkg.scripts[scriptName] = scriptCmd;
-            deps.writeFile(pkgPath, JSON.stringify(pkg, null, 2) + "\n");
-            return {
-              stdout: "",
-              stderr: deps.formatWarn(
-                "`set-script` is deprecated. Use `npm pkg set scripts.${scriptName}=\"${scriptCmd}\"` instead.",
-                "npm",
-              ),
-              exitCode: 0,
-            };
-          } catch (e: any) {
-            return {
-              stdout: "",
-              stderr: deps.formatErr(
-                e.message || "Failed to update package.json",
-                "npm",
-              ),
-              exitCode: 1,
-            };
-          }
+          return deps.npmPkg(
+            ["set", `scripts.${scriptName}=${scriptCmd}`],
+            ctx,
+          );
         }
         case "pkg":
-          return deps.npmPkg ? deps.npmPkg(params.slice(1), ctx) : {
-            stdout: "",
-            stderr: deps.formatErr("npm pkg not implemented", "npm"),
-            exitCode: 1,
-          };
+          return deps.npmPkg(params.slice(1), ctx);
         default:
           return {
             stdout: "",

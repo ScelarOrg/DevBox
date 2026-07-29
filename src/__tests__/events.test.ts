@@ -55,6 +55,26 @@ describe("EventEmitter", () => {
       ee.emit("x");
       expect(ee.listenerCount("x")).toBe(0);
     });
+
+    it("removeListener(original) removes once wrapper via .listener", () => {
+      const ee = new EventEmitter();
+      const fn = vi.fn();
+      ee.once("x", fn);
+      expect(ee.listenerCount("x")).toBe(1);
+      ee.removeListener("x", fn);
+      expect(ee.listenerCount("x")).toBe(0);
+      ee.emit("x");
+      expect(fn).not.toHaveBeenCalled();
+    });
+
+    it("prependOnceListener also supports removeListener(original)", () => {
+      const ee = new EventEmitter();
+      const fn = vi.fn();
+      ee.prependOnceListener("x", fn);
+      ee.removeListener("x", fn);
+      ee.emit("x");
+      expect(fn).not.toHaveBeenCalled();
+    });
   });
 
   describe("removeListener / off", () => {

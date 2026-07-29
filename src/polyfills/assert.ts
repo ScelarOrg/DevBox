@@ -337,7 +337,36 @@ assert.ifError = function ifError(value: unknown): void {
 /* ---- metadata ---- */
 
 assert.AssertionError = AssertionError;
-assert.strict = assert;
+
+/** Node's `assert.strict` namespace: loose names map to strict operators. */
+const strictAssert = function strictAssert(
+  value: unknown,
+  message?: string | Error,
+): asserts value {
+  assert.ok(value, message);
+} as any;
+
+strictAssert.ok = assert.ok;
+strictAssert.equal = assert.strictEqual;
+strictAssert.notEqual = assert.notStrictEqual;
+strictAssert.strictEqual = assert.strictEqual;
+strictAssert.notStrictEqual = assert.notStrictEqual;
+strictAssert.deepEqual = assert.deepStrictEqual;
+strictAssert.notDeepEqual = assert.notDeepStrictEqual;
+strictAssert.deepStrictEqual = assert.deepStrictEqual;
+strictAssert.notDeepStrictEqual = assert.notDeepStrictEqual;
+strictAssert.throws = assert.throws;
+strictAssert.doesNotThrow = assert.doesNotThrow;
+strictAssert.rejects = assert.rejects;
+strictAssert.doesNotReject = assert.doesNotReject;
+strictAssert.match = assert.match;
+strictAssert.doesNotMatch = assert.doesNotMatch;
+strictAssert.ifError = assert.ifError;
+strictAssert.fail = assert.fail;
+strictAssert.AssertionError = AssertionError;
+strictAssert.strict = strictAssert;
+
+assert.strict = strictAssert;
 
 /* ------------------------------------------------------------------ */
 /*  Internal: validate a thrown/rejected value                         */

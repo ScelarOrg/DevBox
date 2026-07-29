@@ -474,12 +474,13 @@ function fabricateStream(
       return [stream.columns, stream.rows];
     },
     getColorDepth(_env?: Record<string, string>): number {
-      return 8;
+      return stream.isTTY ? 8 : 1;
     },
     hasColors(
       countOrEnv?: number | Record<string, string>,
       _env?: Record<string, string>,
     ): boolean {
+      if (!stream.isTTY) return false;
       const count = typeof countOrEnv === "number" ? countOrEnv : 256;
       return 256 >= count;
     },

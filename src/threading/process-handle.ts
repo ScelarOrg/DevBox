@@ -2,6 +2,7 @@
 // Tracks lifecycle, routes I/O, emits events for each spawned worker.
 
 import { EventEmitter } from "../polyfills/events";
+import type { HostWorker } from "../host/types";
 import type {
   MainToWorkerMessage,
   WorkerToMainMessage,
@@ -20,7 +21,7 @@ export type ProcessState = "starting" | "running" | "exited";
 
 export class ProcessHandle extends EventEmitter {
   readonly pid: number;
-  worker: Worker;
+  worker: HostWorker;
   readonly command: string;
   readonly args: string[];
   readonly parentPid?: number;
@@ -29,7 +30,7 @@ export class ProcessHandle extends EventEmitter {
   private _exitCode: number | undefined;
   private _stdout = "";
   private _stderr = "";
-  private _fallbackWorker: (() => Worker) | null;
+  private _fallbackWorker: (() => HostWorker) | null;
   private _pendingInit: { msg: MainToWorker_Init; transfer: Transferable[] } | null = null;
   private _probeTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -62,7 +63,7 @@ export class ProcessHandle extends EventEmitter {
   get state(): ProcessState { return this._state; }
   get exitCode(): number | undefined { return this._exitCode; }
 
-  constructor(worker: Worker, config: SpawnConfig, fallbackWorker?: () => Worker) {
+  constructor(worker: HostWorker, config: SpawnConfig, fallbackWorker?: () => HostWorker) {
     super();
     this.pid = config.snapshot ? Math.floor(Math.random() * 90000) + 10000 : 0; // will be set properly
     this.worker = worker;
@@ -165,8 +166,8 @@ export class ProcessHandle extends EventEmitter {
     this.emit("exit", exitCode, this._stdout, this._stderr);
   }
 
-  private _setupWorkerListeners(worker: Worker): void {
-    worker.addEventListener("message", (ev: MessageEvent) => {
+  private _setupWorkerListeners(worker: HostWorker): void {
+    worker.addEventListener("message", (ev) => {
       if (worker !== this.worker) return;
       const msg = ev.data as WorkerToMainMessage;
       if (!msg || !msg.type) return;
@@ -316,13 +317,13 @@ export class ProcessHandle extends EventEmitter {
       }
     });
 
-    worker.addEventListener("error", (ev: ErrorEvent) => {
+    worker.addEventListener("error", (ev) => {
       if (worker !== this.worker) return;
       if (this._fallbackWorker && this._state === "starting") {
         this._activateFallback();
         return;
       }
-      this.emit("worker-error", ev.message, undefined);
+      this.emit("worker-error", ev.message ?? "Worker error", undefined);
       if (this._state !== "exited") {
         this._terminate(1);
       }

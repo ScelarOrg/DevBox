@@ -5,6 +5,7 @@ import { VERSIONS } from "../../constants/config";
 const A_RESET = "\x1b[0m";
 const A_BOLD = "\x1b[1m";
 const A_CYAN = "\x1b[36m";
+const A_DIM = "\x1b[2m";
 
 export function createPnpmCommand(deps: PmDeps): ShellCommand {
   return {
@@ -18,30 +19,33 @@ export function createPnpmCommand(deps: PmDeps): ShellCommand {
         return {
           stdout:
             `${A_BOLD}Usage:${A_RESET} pnpm <command>\n\n` +
-            `${A_BOLD}Manage your dependencies:${A_RESET}\n` +
             `  ${A_CYAN}add${A_RESET} [pkg]         Install packages\n` +
-            `  ${A_CYAN}install${A_RESET}           Install from manifest\n` +
+            `  ${A_CYAN}install${A_RESET}           Install from package.json\n` +
             `  ${A_CYAN}remove${A_RESET} <pkg>      Remove a package\n` +
-            `  ${A_CYAN}list${A_RESET}              List installed packages\n\n` +
-            `${A_BOLD}Run your scripts:${A_RESET}\n` +
             `  ${A_CYAN}run${A_RESET} <script>      Run a script\n` +
-            `  ${A_CYAN}exec${A_RESET} <cmd>        Execute a package binary\n` +
+            `  ${A_CYAN}exec${A_RESET} <cmd>        Execute a binary\n` +
             `  ${A_CYAN}dlx${A_RESET} <pkg>         Download and execute a package\n\n` +
-            `${A_BOLD}Create a project:${A_RESET}\n` +
-            `  ${A_CYAN}init${A_RESET}              Create a package.json\n` +
+            `  ${A_CYAN}list${A_RESET}              List packages\n` +
+            `  ${A_CYAN}init${A_RESET}              Create package.json\n` +
             `  ${A_CYAN}create${A_RESET} <pkg>      Create a project\n\n` +
-            `  ${A_CYAN}version${A_RESET}           Show version info\n`,
+            `${A_DIM}pnpm ${VERSIONS.PNPM}${A_RESET}\n`,
           stderr: "",
           exitCode: 0,
         };
       }
 
       switch (sub) {
-        case "add":
+        case "add": {
+          const rejected = deps.rejectGlobal(params.slice(1), "pnpm");
+          if (rejected) return rejected;
           return deps.installPackages(params.slice(1), ctx, "pnpm");
+        }
         case "install":
-        case "i":
+        case "i": {
+          const rejected = deps.rejectGlobal(params.slice(1), "pnpm");
+          if (rejected) return rejected;
           return deps.installPackages(params.slice(1), ctx, "pnpm");
+        }
         case "remove":
         case "rm":
         case "uninstall":
@@ -69,13 +73,21 @@ export function createPnpmCommand(deps: PmDeps): ShellCommand {
         case "--version":
           return { stdout: VERSIONS.PNPM + "\n", stderr: "", exitCode: 0 };
         case "audit":
-          return { stdout: "No known vulnerabilities found\n", stderr: "", exitCode: 0 };
+          return deps.npmAudit(ctx);
         case "outdated":
-          return { stdout: "", stderr: "", exitCode: 0 };
+          return deps.npmOutdated(ctx);
         case "why":
-          return { stdout: "", stderr: deps.formatWarn("why: not available in nodepod", "pnpm"), exitCode: 0 };
+          return {
+            stdout: "",
+            stderr: deps.formatErr("why: not available in nodepod", "pnpm"),
+            exitCode: 1,
+          };
         default:
-          return { stdout: "", stderr: deps.formatErr(`Unknown command "${sub}"`, "pnpm"), exitCode: 1 };
+          return {
+            stdout: "",
+            stderr: deps.formatErr(`Unknown command "${sub}"`, "pnpm"),
+            exitCode: 1,
+          };
       }
     },
   };

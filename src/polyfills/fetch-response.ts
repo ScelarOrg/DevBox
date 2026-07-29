@@ -195,6 +195,44 @@ export function patchFetchNodeAdapterExports(
   ) {
     exports.setResponse = setFetchResponse;
   }
+  // better-call/node closes over setResponse at module init. When the loader
+  // snapshots imports (not live ESM bindings), patching setResponse alone is
+  // not enough — rewrite toNodeHandler to always use setFetchResponse.
+  if (
+    typeof exports.toNodeHandler === "function" &&
+    typeof exports.getRequest === "function"
+  ) {
+    const getRequest = exports.getRequest as (opts: {
+      request: unknown;
+      base: string;
+      bodySizeLimit?: number;
+    }) => Request;
+    exports.toNodeHandler = (handler: unknown) => {
+      const fetchHandler =
+        typeof handler === "function"
+          ? (handler as (req: Request) => Promise<Response>)
+          : (
+              handler as { handler: (req: Request) => Promise<Response> }
+            ).handler;
+      return async (req: any, res: ServerResponse) => {
+        const headers = req.headers ?? {};
+        const proto =
+          (typeof headers["x-forwarded-proto"] === "string"
+            ? headers["x-forwarded-proto"]
+            : null) || (req.socket?.encrypted ? "https" : "http");
+        const host =
+          (typeof headers[":authority"] === "string"
+            ? headers[":authority"]
+            : null) ||
+          (typeof headers.host === "string" ? headers.host : "localhost");
+        const request = getRequest({
+          base: `${proto}://${host}`,
+          request: req,
+        });
+        return setFetchResponse(res, await fetchHandler(request));
+      };
+    };
+  }
 }
 
 /** Make Fetch Headers iteration/get behave like Node for Set-Cookie (browser worker parity). */
