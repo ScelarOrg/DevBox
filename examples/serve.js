@@ -60,6 +60,7 @@ createServer((req, res) => {
   console.log(`  typebox 1.x (#56):    http://localhost:${port}/examples/issue-56-typebox-1x/`);
   console.log(`  TS inline generic?:   http://localhost:${port}/examples/ts-inline-generic-optional/`);
   console.log(`  Vite HMR test:        http://localhost:${port}/examples/vite-hmr-test/`);
+  console.log(`  Expo web smoke:       http://localhost:${port}/examples/expo-web-smoke/`);
   console.log(`  Dev playground:       http://localhost:${port}/examples/dev-playground/`);
   console.log(`  SQLite test:          http://localhost:${port}/examples/sqlite-test/`);
   console.log(`  Better Auth + Vite:   http://localhost:${port}/examples/better-auth-vite/  (React Router demo in app/)`);

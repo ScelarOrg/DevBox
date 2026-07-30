@@ -1,5 +1,14 @@
 // nodepod - browser-native Node.js runtime environment
 
+// Default RuntimeHost for the browser entry. The browser-host module also
+// publishes `globalThis.__NODEPOD_CREATE_BROWSER_HOST__` so boot still works
+// if cross-chunk minify drops `registerDefaultHostFactory(...)`.
+import { createBrowserHost } from "./host/browser-host";
+import { registerDefaultHostFactory } from "./host/runtime-host";
+registerDefaultHostFactory(createBrowserHost);
+(globalThis as Record<string, unknown>).__NODEPOD_CREATE_BROWSER_HOST__ =
+  createBrowserHost;
+
 export { MemoryVolume } from "./memory-volume";
 export type {
   VolumeNode,
@@ -193,6 +202,7 @@ export type {
   PerformanceTiming,
 } from "./sdk/types";
 export {
+  ensureRuntimeHost,
   getRuntimeHost,
   setRuntimeHost,
   resetRuntimeHost,

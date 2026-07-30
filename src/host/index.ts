@@ -10,6 +10,7 @@ export type {
   WorkerSpec,
 } from "./types";
 export {
+  ensureRuntimeHost,
   getRuntimeHost,
   registerDefaultHostFactory,
   resetRuntimeHost,

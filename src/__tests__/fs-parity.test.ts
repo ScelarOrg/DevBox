@@ -257,6 +257,30 @@ describe("fs.watchFile", () => {
   });
 });
 
+describe("fs.readdir callback deferral", () => {
+  // Metro's node crawler increments activeCalls around readdir+lstat and
+  // completes early if readdir invokes its callback synchronously.
+  it("invokes callback asynchronously", async () => {
+    const { vol, fs } = makeFs();
+    vol.writeFileSync("/a.js", "1");
+    let sawSync = true;
+    const done = new Promise<void>((resolve, reject) => {
+      fs.readdir("/", { withFileTypes: true }, (err, entries) => {
+        try {
+          expect(err).toBeNull();
+          expect(sawSync).toBe(false);
+          expect(entries!.map((e: any) => e.name)).toContain("a.js");
+          resolve();
+        } catch (e) {
+          reject(e);
+        }
+      });
+    });
+    sawSync = false;
+    await done;
+  });
+});
+
 describe("fs.promises.constants and rm retries", () => {
   it("exposes promises.constants", () => {
     const { fs } = makeFs();

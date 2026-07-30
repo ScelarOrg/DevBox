@@ -157,6 +157,9 @@ export function createBrowserHost(): RuntimeHost {
   };
 }
 
-// Side-effect: ensure getRuntimeHost() works when consumers import the SDK
-// without going through `@scelar/nodepod/headless`.
+// Publish the browser factory on globalThis. Esbuild minify can DCE calls to
+// `registerDefaultHostFactory` across chunks, but keeps this assignment —
+// `getRuntimeHost()` falls back to the global hook when the factory var is unset.
+(globalThis as Record<string, unknown>).__NODEPOD_CREATE_BROWSER_HOST__ =
+  createBrowserHost;
 registerDefaultHostFactory(createBrowserHost);

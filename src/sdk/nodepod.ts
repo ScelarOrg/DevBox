@@ -34,8 +34,9 @@ import {
 import { NodepodFSClient } from "./nodepod-fs-client";
 import { SyncChannelController } from "../threading/sync-channel";
 import { MemoryHandler } from "../memory-handler";
-import "../host/browser-host"; // registers default RuntimeHost factory
-import { getRuntimeHost } from "../host/runtime-host";
+// Browser default host is registered by `@scelar/nodepod` (src/index.ts).
+// Headless installs its host via `@scelar/nodepod/headless` before boot.
+import { ensureRuntimeHost } from "../host/runtime-host";
 import type { HttpIngress } from "../host/types";
 import type { CompletedResponse } from "../polyfills/http";
 import { getEsbuild } from "../helpers/esbuild-engine";
@@ -246,7 +247,9 @@ export class Nodepod {
   static async boot(opts: NodepodOptions = {}): Promise<Nodepod> {
     const performanceTracker = new PerformanceTracker();
     const stopBoot = performanceTracker.start("boot.total");
-    const host = getRuntimeHost();
+    // Wait for browser-host factory side effects when vite-plugin-top-level-await
+    // defers chunk init; headless already has a host from setRuntimeHost().
+    const host = await ensureRuntimeHost();
     const headless = opts.headless === true || host.defaultHeadless === true;
 
     if (!host.canCreateWorkers()) {

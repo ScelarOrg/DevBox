@@ -106,6 +106,11 @@ export default defineConfig({
     },
     rollupOptions: {
       external: allExternal,
+      // Keep top-level RuntimeHost registration in entry facades. Without
+      // this, Rollup rewrites index.mjs to pure re-exports and drops
+      // `registerDefaultHostFactory(createBrowserHost)`, so browser apps
+      // that only import `{ Nodepod }` get "No RuntimeHost registered".
+      preserveEntrySignatures: "strict",
     },
     sourcemap: true,
     minify: "esbuild",

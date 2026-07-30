@@ -486,6 +486,11 @@ export interface FsBridge {
     target: string,
     cb: (err: Error | null, entries?: string[]) => void,
   ): void;
+  readdir(
+    target: string,
+    opts: { withFileTypes?: boolean; encoding?: string } | string,
+    cb: (err: Error | null, entries?: string[] | Buffer[] | Dirent[]) => void,
+  ): void;
   mkdir(
     target: string,
     opts: { recursive?: boolean },
@@ -2358,15 +2363,18 @@ export function buildFileSystemBridge(
           ? { encoding: optsOrCb }
           : optsOrCb;
       const p = abs(target);
+      // Must defer the callback. Metro's node crawler (and similar) pairs
+      // sync-looking readdir with async lstat and uses an activeCalls counter;
+      // a synchronous readdir callback can resolve the crawl with an empty
+      // file map before any lstat callbacks run.
       try {
         const names = volume.readdirSync(p);
-        if (opts?.withFileTypes) {
-          actualCb?.(null, toDirents(p, names));
-        } else {
-          actualCb?.(null, encodeReaddirNames(names, opts?.encoding));
-        }
+        const files = opts?.withFileTypes
+          ? toDirents(p, names)
+          : encodeReaddirNames(names, opts?.encoding);
+        if (actualCb) setTimeout(() => actualCb(null, files), 0);
       } catch (e) {
-        actualCb?.(e as Error);
+        if (actualCb) setTimeout(() => actualCb(e as Error), 0);
       }
     },
 

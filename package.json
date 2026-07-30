@@ -1,6 +1,6 @@
 {
   "name": "@scelar/nodepod",
-  "version": "1.9.17",
+  "version": "1.9.18",
   "description": "Browser-native Node.js runtime environment",
   "type": "module",
   "license": "MIT WITH Commons-Clause",
@@ -89,7 +89,16 @@
     "src",
     "dist"
   ],
-  "sideEffects": false,
+  "sideEffects": [
+    "./src/index.ts",
+    "./src/headless.ts",
+    "./src/host/browser-host.ts",
+    "./src/host/runtime-host.ts",
+    "./dist/index.mjs",
+    "./dist/index.cjs",
+    "./dist/headless.mjs",
+    "./dist/headless.cjs"
+  ],
   "scripts": {
     "build:lib": "vite build --config vite.lib.config.js && node -e \"require('fs').copyFileSync('static/__sw__.js','dist/__sw__.js')\"",
     "build:types": "tsc --project tsconfig.build.json",

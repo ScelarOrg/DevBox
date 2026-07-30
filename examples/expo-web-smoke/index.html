@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>nodepod — expo web smoke</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: monospace; background: #1a1a2e; color: #e0e0e0; padding: 20px; line-height: 1.5; }
+    h1 { font-size: 18px; margin-bottom: 4px; color: #fff; }
+    p { font-size: 13px; color: #888; margin-bottom: 12px; max-width: 960px; }
+    code { background: #0d0d1a; padding: 2px 6px; border-radius: 3px; color: #a8e6a3; font-size: 12px; }
+    a { color: #8ac4e6; }
+    .controls { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; align-items: center; }
+    button {
+      background: #2a2a4a; color: #e0e0e0; border: 1px solid #444;
+      padding: 6px 12px; border-radius: 4px; font-family: monospace; cursor: pointer;
+    }
+    button:hover:not(:disabled) { background: #3a3a5a; }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+    button.primary { background: #3d5a2a; border-color: #5a8a3a; }
+    #status {
+      font-size: 12px; padding: 6px 10px; border-radius: 3px; margin-bottom: 12px;
+      background: #181830; color: #aaa; border: 1px solid #222;
+    }
+    .layout { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    @media (max-width: 900px) { .layout { grid-template-columns: 1fr; } }
+    .pane {
+      background: #0d0d1a; border: 1px solid #333; border-radius: 6px;
+      padding: 12px; display: flex; flex-direction: column; min-height: 520px;
+    }
+    .pane h2 { font-size: 13px; margin-bottom: 8px; color: #8ac4e6; }
+    #output {
+      flex: 1; white-space: pre-wrap; font-size: 11px; line-height: 1.55;
+      overflow-y: auto; max-height: 640px;
+    }
+    #frame { flex: 1; border: 1px solid #333; border-radius: 4px; background: #fff; min-height: 420px; width: 100%; }
+    .stdout { color: #a8e6a3; }
+    .stderr { color: #e68a8a; }
+    .info { color: #8ac4e6; }
+    .pass { color: #a8e6a3; font-weight: bold; }
+    .fail { color: #e68a8a; font-weight: bold; }
+    .dim { color: #666; }
+    label.chk { font-size: 12px; color: #aaa; display: flex; gap: 6px; align-items: center; }
+  </style>
+</head>
+<body>
+  <h1>nodepod — expo web smoke</h1>
+  <p>
+    Boots Nodepod, installs a minimal Expo SDK 54 web app, runs
+    <code>npm run web</code>, and iframes the <code>onServerReady</code> URL.
+    Use <strong>probe GET</strong> after ready to inspect what Metro returns for
+    <code>/</code>, <code>/index.html</code>, and the AppEntry bundle
+    (debug <code>Cannot GET /</code> / resolve errors).
+  </p>
+  <p>
+    Serve with <code>node examples/serve.js</code>, then open
+    <a href="/examples/expo-web-smoke/">/examples/expo-web-smoke/</a>.
+    Requires a built <code>dist/</code> (<code>pnpm run build:publish</code>).
+  </p>
+
+  <div class="controls">
+    <button id="run" class="primary">boot + run expo web</button>
+    <button id="probe" disabled>probe GET paths</button>
+    <button id="reload-frame" disabled>reload iframe</button>
+    <button id="stop">stop / teardown</button>
+    <button id="clear">clear log</button>
+    <label class="chk">
+      <input type="checkbox" id="ci-mode" checked>
+      CI=1 (no watch / no browser)
+    </label>
+  </div>
+  <div id="status">idle</div>
+
+  <div class="layout">
+    <div class="pane">
+      <h2>log</h2>
+      <div id="output"><span class="dim">idle — hit boot + run</span></div>
+    </div>
+    <div class="pane">
+      <h2>preview <span id="preview-url" class="dim"></span></h2>
+      <iframe id="frame" sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals"></iframe>
+    </div>
+  </div>
+
+  <script type="module">
+    import { Nodepod } from "/dist/index.mjs";
+
+    const EXPO_PORT = 8081;
+
+    const GUEST_FILES = {
+      "/package.json": JSON.stringify(
+        {
+          name: "expo-web-smoke",
+          version: "1.0.0",
+          private: true,
+          main: "node_modules/expo/AppEntry.js",
+          scripts: {
+            web: "expo start --web --port 8081",
+          },
+          dependencies: {
+            expo: "~54.0.0",
+            react: "19.1.0",
+            "react-dom": "19.1.0",
+            "react-native": "0.81.4",
+            "react-native-web": "^0.21.0",
+            "@expo/metro-runtime": "~5.0.4",
+          },
+        },
+        null,
+        2,
+      ),
+      "/app.json": JSON.stringify(
+        {
+          expo: {
+            name: "expo-web-smoke",
+            slug: "expo-web-smoke",
+            version: "1.0.0",
+            platforms: ["web"],
+            web: {
+              bundler: "metro",
+            },
+          },
+        },
+        null,
+        2,
+      ),
+      "/babel.config.js": `module.exports = function (api) {
+  api.cache(true);
+  return {
+    presets: ["babel-preset-expo"],
+  };
+};
+`,
+      "/App.js": `import { StyleSheet, Text, View } from "react-native";
+
+export default function App() {
+  return (
+    <View style={styles.container}>
+      <Text style={styles.title}>Expo web in Nodepod</Text>
+      <Text style={styles.sub}>If you can read this, Metro served the bundle.</Text>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "#0b1220",
+    padding: 24,
+  },
+  title: {
+    color: "#f8fafc",
+    fontSize: 28,
+    fontWeight: "700",
+    marginBottom: 12,
+    textAlign: "center",
+  },
+  sub: {
+    color: "#94a3b8",
+    fontSize: 16,
+    textAlign: "center",
+  },
+});
+`,
+    };
+
+    const output = document.getElementById("output");
+    const statusEl = document.getElementById("status");
+    const frame = document.getElementById("frame");
+    const previewUrlEl = document.getElementById("preview-url");
+    const runBtn = document.getElementById("run");
+    const probeBtn = document.getElementById("probe");
+    const reloadBtn = document.getElementById("reload-frame");
+    const stopBtn = document.getElementById("stop");
+    const clearBtn = document.getElementById("clear");
+    const ciMode = document.getElementById("ci-mode");
+
+    let pod = null;
+    let proc = null;
+    let previewUrl = null;
+    let cancelled = false;
+    let running = false;
+
+    function setStatus(text) {
+      statusEl.textContent = text;
+    }
+
+    function log(text, cls = "info") {
+      if (output.querySelector(".dim") && output.childNodes.length === 1) {
+        output.textContent = "";
+      }
+      const line = document.createElement("div");
+      line.className = cls;
+      line.textContent = text;
+      output.appendChild(line);
+      output.scrollTop = output.scrollHeight;
+    }
+
+    function guestEnv() {
+      const env = {
+        BROWSER: "none",
+        EXPO_NO_TELEMETRY: "1",
+      };
+      if (ciMode.checked) env.CI = "1";
+      return env;
+    }
+
+    function setPreview(url) {
+      previewUrl = url;
+      previewUrlEl.textContent = url ? `· ${url}` : "";
+      frame.src = url || "about:blank";
+      probeBtn.disabled = !url;
+      reloadBtn.disabled = !url;
+    }
+
+    async function teardown() {
+      cancelled = true;
+      try { proc?.kill(); } catch { /* ignore */ }
+      proc = null;
+      try { pod?.teardown(); } catch { /* ignore */ }
+      pod = null;
+      setPreview(null);
+      running = false;
+      runBtn.disabled = false;
+    }
+
+    async function probePaths() {
+      if (!previewUrl) {
+        log("no preview URL yet", "fail");
+        return;
+      }
+      const base = previewUrl.replace(/\/$/, "");
+      const paths = ["/", "/index.html", "/status", "/manifest", "/node_modules/expo/AppEntry.bundle?platform=web&dev=true&hot=false"];
+      log("── probe GET ──", "info");
+      for (const path of paths) {
+        const url = path.startsWith("http") ? path : base + path;
+        try {
+          const res = await fetch(url, { method: "GET", cache: "no-store" });
+          const ct = res.headers.get("content-type") || "";
+          const body = await res.text();
+          const snippet = body.slice(0, 160).replace(/\s+/g, " ");
+          const cls = res.ok ? "pass" : "fail";
+          log(`${res.status} ${path}  ct=${ct || "(none)"}  ${snippet}`, cls);
+        } catch (err) {
+          log(`FETCH FAIL ${path}: ${err instanceof Error ? err.message : String(err)}`, "fail");
+        }
+      }
+      log("── end probe ──", "info");
+    }
+
+    runBtn.addEventListener("click", async () => {
+      if (running) return;
+      cancelled = false;
+      running = true;
+      runBtn.disabled = true;
+      output.textContent = "";
+      setPreview(null);
+      setStatus("booting");
+
+      try {
+        log("Nodepod.boot…");
+        let resolveReady = null;
+        const readyPromise = new Promise((resolve) => {
+          resolveReady = resolve;
+        });
+
+        pod = await Nodepod.boot({
+          watermark: false,
+          workdir: "/",
+          files: GUEST_FILES,
+          env: guestEnv(),
+          onServerReady: (port, url) => {
+            log(`onServerReady port=${port} url=${url}`, "info");
+            resolveReady?.(url);
+          },
+        });
+        if (cancelled) {
+          await teardown();
+          return;
+        }
+        log("booted", "pass");
+
+        setStatus("installing");
+        log("packages.installFromManifest(/package.json)…");
+        await pod.packages.installFromManifest("/package.json", {
+          withDevDeps: true,
+          onProgress: (message) => {
+            setStatus(`installing: ${String(message).slice(0, 80)}`);
+          },
+        });
+        if (cancelled) return;
+        log("install finished", "pass");
+
+        setStatus("starting expo web");
+        log("spawn: npm run web");
+        proc = await pod.spawn("npm", ["run", "web"], {
+          cwd: "/",
+          env: guestEnv(),
+        });
+        proc.on("output", (chunk) => {
+          const text = String(chunk).trimEnd();
+          if (text) log(text, "stdout");
+        });
+        proc.on("error", (chunk) => {
+          const text = String(chunk).trimEnd();
+          if (text) log(text, "stderr");
+        });
+
+        const result = await Promise.race([
+          readyPromise.then((url) => ({ kind: "ready", url })),
+          proc.completion.then((res) => ({ kind: "exit", res })),
+          new Promise((resolve) =>
+            setTimeout(() => resolve({ kind: "timeout" }), 180_000),
+          ),
+        ]);
+
+        if (cancelled) return;
+
+        if (result.kind === "ready") {
+          setPreview(result.url);
+          setStatus(`ready · ${result.url}`);
+          log(`Expo web ready at ${result.url}`, "pass");
+          log("tip: hit probe GET paths if the iframe shows Cannot GET /", "dim");
+        } else if (result.kind === "exit") {
+          setStatus(`exited · code ${result.res.exitCode}`);
+          log(`process exited code=${result.res.exitCode}`, "fail");
+          running = false;
+          runBtn.disabled = false;
+        } else {
+          const guessed = pod.port(EXPO_PORT) ?? pod.port(8081) ?? pod.port(19006);
+          if (guessed) {
+            setPreview(guessed);
+            setStatus(`timeout but port live · ${guessed}`);
+            log(`timed out waiting onServerReady; using ${guessed}`, "fail");
+          } else {
+            setStatus("timeout — no server");
+            log("timed out waiting for Expo HTTP server (3 min)", "fail");
+            running = false;
+            runBtn.disabled = false;
+          }
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        setStatus(`error · ${message}`);
+        log(message, "fail");
+        if (error instanceof Error && error.stack) log(error.stack, "stderr");
+        running = false;
+        runBtn.disabled = false;
+      }
+    });
+
+    probeBtn.addEventListener("click", () => void probePaths());
+    reloadBtn.addEventListener("click", () => {
+      if (previewUrl) frame.src = previewUrl;
+    });
+    stopBtn.addEventListener("click", async () => {
+      await teardown();
+      setStatus("stopped");
+      log("stopped / torn down", "info");
+    });
+    clearBtn.addEventListener("click", () => {
+      output.innerHTML = '<span class="dim">cleared</span>';
+    });
+
+    window.addEventListener("beforeunload", () => {
+      try { proc?.kill(); } catch { /* ignore */ }
+      try { pod?.teardown(); } catch { /* ignore */ }
+    });
+  </script>
+</body>
+</html>
