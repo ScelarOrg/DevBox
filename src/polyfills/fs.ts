@@ -330,11 +330,15 @@ type RmOptions = { recursive?: boolean; force?: boolean; maxRetries?: number; re
 
 interface FsPromisesShape {
   readFile(target: PathArg): Promise<Buffer>;
-  readFile(target: PathArg, enc: "utf8" | "utf-8"): Promise<string>;
+  readFile(target: PathArg, enc: BufferEncoding): Promise<string>;
   readFile(
     target: PathArg,
-    opts: { encoding: "utf8" | "utf-8" },
+    opts: { encoding: BufferEncoding },
   ): Promise<string>;
+  readFile(
+    target: PathArg,
+    encOrOpts?: string | { encoding?: string | null },
+  ): Promise<Buffer | string>;
   writeFile(
     target: PathArg,
     data: string | Uint8Array,
@@ -375,9 +379,13 @@ interface FsPromisesShape {
 export interface FsBridge {
   __openFileHandleSync(target: PathArg): VolumeFileHandle;
   readFileSync(target: PathArg): Buffer;
-  readFileSync(target: PathArg, enc: "utf8" | "utf-8"): string;
-  readFileSync(target: PathArg, opts: { encoding: "utf8" | "utf-8" }): string;
+  readFileSync(target: PathArg, enc: BufferEncoding): string;
+  readFileSync(target: PathArg, opts: { encoding: BufferEncoding }): string;
   readFileSync(target: PathArg, opts: { encoding?: null }): Buffer;
+  readFileSync(
+    target: PathArg,
+    encOrOpts?: string | { encoding?: string | null },
+  ): Buffer | string;
   writeFileSync(
     target: PathArg,
     data: string | Uint8Array,
