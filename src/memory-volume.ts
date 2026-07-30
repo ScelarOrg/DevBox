@@ -11,8 +11,14 @@ export interface VolumeNode {
   children?: Map<string, VolumeNode>;
   target?: string;
   modified: number;
-  /** Directory permission bits (files use inode.mode). Default 0o755. */
+  /** Directory/symlink permission bits (files use inode.mode). Default 0o755 / 0o777. */
   mode?: number;
+  /** Symlink atime (mtime uses `modified`). */
+  atime?: number;
+  uid?: number;
+  gid?: number;
+  /** Windows-style symlink type hint: 'file' | 'dir' | 'junction'. */
+  symlinkType?: string;
   // lean spawn mode: file known to exist (from a lazy readdir listing) but
   // content not yet fetched from the main thread
   lazy?: boolean;
@@ -29,6 +35,8 @@ interface VolumeFileInode {
   mtime: number;
   ctime: number;
   nlink: number;
+  uid?: number;
+  gid?: number;
 }
 
 export interface VolumeFileHandle {
@@ -49,6 +57,8 @@ export interface BinaryVolumeEntry {
   mtimeMs?: number;
   ctimeMs?: number;
   nlink?: number;
+  uid?: number;
+  gid?: number;
 }
 
 // lean spawn mode: synchronous fallback consulted on read misses for paths
@@ -259,6 +269,8 @@ export class MemoryVolume {
         mtime: modified,
         ctime: modified,
         nlink: 1,
+        uid: node.uid ?? MOCK_IDS.UID,
+        gid: node.gid ?? MOCK_IDS.GID,
       };
       node.content = undefined;
     }
@@ -500,11 +512,30 @@ export class MemoryVolume {
         mtimeMs: inode.mtime,
         ctimeMs: inode.ctime,
         nlink: inode.nlink,
+        uid: inode.uid ?? node.uid,
+        gid: inode.gid ?? node.gid,
       });
     } else if (node.kind === 'symlink') {
-      result.push({ path: currentPath, kind: 'symlink', target: node.target });
+      result.push({
+        path: currentPath,
+        kind: 'symlink',
+        target: node.target,
+        mode: node.mode,
+        atimeMs: node.atime,
+        mtimeMs: node.modified,
+        uid: node.uid,
+        gid: node.gid,
+        symlinkType: node.symlinkType,
+      });
     } else if (node.kind === 'directory') {
-      result.push({ path: currentPath, kind: 'directory' });
+      result.push({
+        path: currentPath,
+        kind: 'directory',
+        mode: node.mode,
+        uid: node.uid,
+        gid: node.gid,
+        mtimeMs: node.modified,
+      });
       if (node.children) {
         for (const [name, child] of node.children) {
           // Skip excluded directory names at any depth (e.g. node_modules, .cache)
@@ -586,6 +617,8 @@ export class MemoryVolume {
           if (entry.mtimeMs !== undefined) inode.mtime = entry.mtimeMs;
           if (entry.ctimeMs !== undefined) inode.ctime = entry.ctimeMs;
           if (entry.nlink !== undefined) inode.nlink = entry.nlink;
+          if (entry.uid !== undefined) inode.uid = entry.uid;
+          if (entry.gid !== undefined) inode.gid = entry.gid;
           if (entry.inode !== undefined) {
             inodes.set(entry.inode, inode);
             this._nextIno = Math.max(this._nextIno, entry.inode + 1);
@@ -610,11 +643,25 @@ export class MemoryVolume {
       if (entry.path === '/') continue;
 
       if (entry.kind === 'directory') {
-        vol.mkdirSync(entry.path, { recursive: true });
+        vol.mkdirSync(entry.path, { recursive: true, mode: entry.mode });
+        const dirNode = vol.locateRaw(vol.normalize(entry.path));
+        if (dirNode?.kind === 'directory') {
+          if (entry.uid !== undefined) dirNode.uid = entry.uid;
+          if (entry.gid !== undefined) dirNode.gid = entry.gid;
+          if (entry.mtimeMs !== undefined) dirNode.modified = entry.mtimeMs;
+        }
       } else if (entry.kind === 'symlink') {
         const parentDir = entry.path.substring(0, entry.path.lastIndexOf('/')) || '/';
         if (parentDir !== '/' && !vol.existsSync(parentDir)) vol.mkdirSync(parentDir, { recursive: true });
-        vol.symlinkSync(entry.target ?? '', entry.path);
+        vol.symlinkSync(entry.target ?? '', entry.path, entry.symlinkType);
+        const linkNode = vol.locateRaw(vol.normalize(entry.path));
+        if (linkNode?.kind === 'symlink') {
+          if (entry.mode !== undefined) linkNode.mode = entry.mode;
+          if (entry.atimeMs !== undefined) linkNode.atime = entry.atimeMs;
+          if (entry.mtimeMs !== undefined) linkNode.modified = entry.mtimeMs;
+          if (entry.uid !== undefined) linkNode.uid = entry.uid;
+          if (entry.gid !== undefined) linkNode.gid = entry.gid;
+        }
       } else if (entry.kind === 'file') {
         let content: Uint8Array;
         if (entry.data) {
@@ -640,6 +687,8 @@ export class MemoryVolume {
             if (entry.mtimeMs !== undefined) inode.mtime = entry.mtimeMs;
             if (entry.ctimeMs !== undefined) inode.ctime = entry.ctimeMs;
             if (entry.nlink !== undefined) inode.nlink = entry.nlink;
+            if (entry.uid !== undefined) inode.uid = entry.uid;
+            if (entry.gid !== undefined) inode.gid = entry.gid;
             if (entry.inode !== undefined) {
               inodes.set(entry.inode, inode);
               vol._nextIno = Math.max(vol._nextIno, entry.inode + 1);
@@ -1105,6 +1154,8 @@ export class MemoryVolume {
     const inode = node.kind === 'file' ? this._fileInode(node) : null;
     const fileSize = node.kind === 'file' ? (inode?.content?.length ?? node.lazySize ?? 0) : 0;
     const ts = inode?.mtime ?? node.modified;
+    const uid = inode?.uid ?? node.uid ?? MOCK_IDS.UID;
+    const gid = inode?.gid ?? node.gid ?? MOCK_IDS.GID;
 
     const result: FileStat = {
       isFile: () => node.kind === 'file',
@@ -1117,22 +1168,22 @@ export class MemoryVolume {
       size: fileSize,
       mode: node.kind === 'directory' ? (node.mode ?? 0o755) : (inode?.mode ?? 0o644),
       mtime: new Date(ts),
-      atime: new Date(inode?.atime ?? ts),
+      atime: new Date(inode?.atime ?? node.atime ?? ts),
       ctime: new Date(inode?.ctime ?? ts),
       birthtime: new Date(ts),
       mtimeMs: ts,
-      atimeMs: inode?.atime ?? ts,
+      atimeMs: inode?.atime ?? node.atime ?? ts,
       ctimeMs: inode?.ctime ?? ts,
       birthtimeMs: ts,
       nlink: inode?.nlink ?? 1,
-      uid: MOCK_IDS.UID,
-      gid: MOCK_IDS.GID,
+      uid,
+      gid,
       dev: 0,
       ino: inode?.ino ?? this._inoFor(norm),
       rdev: 0,
       blksize: MOCK_FS.BLOCK_SIZE,
       blocks: Math.ceil(fileSize / MOCK_FS.BLOCK_CALC_SIZE),
-      atimeNs: BigInt(inode?.atime ?? ts) * 1000000n,
+      atimeNs: BigInt(inode?.atime ?? node.atime ?? ts) * 1000000n,
       mtimeNs: BigInt(ts) * 1000000n,
       ctimeNs: BigInt(inode?.ctime ?? ts) * 1000000n,
       birthtimeNs: BigInt(ts) * 1000000n,
@@ -1151,7 +1202,9 @@ export class MemoryVolume {
     if (!node) throw makeSystemError('ENOENT', 'lstat', p);
 
     if (node.kind === 'symlink') {
-      const ts = node.modified;
+      const mtimeMs = node.modified;
+      const atimeMs = node.atime ?? mtimeMs;
+      const mode = 0o120000 | ((node.mode ?? 0o777) & 0o777);
       return {
         isFile: () => false,
         isDirectory: () => false,
@@ -1161,27 +1214,27 @@ export class MemoryVolume {
         isFIFO: () => false,
         isSocket: () => false,
         size: (node.target || '').length,
-        mode: 0o120777,
-        mtime: new Date(ts),
-        atime: new Date(ts),
-        ctime: new Date(ts),
-        birthtime: new Date(ts),
-        mtimeMs: ts,
-        atimeMs: ts,
-        ctimeMs: ts,
-        birthtimeMs: ts,
+        mode,
+        mtime: new Date(mtimeMs),
+        atime: new Date(atimeMs),
+        ctime: new Date(mtimeMs),
+        birthtime: new Date(mtimeMs),
+        mtimeMs,
+        atimeMs,
+        ctimeMs: mtimeMs,
+        birthtimeMs: mtimeMs,
         nlink: 1,
-        uid: 1000,
-        gid: 1000,
+        uid: node.uid ?? MOCK_IDS.UID,
+        gid: node.gid ?? MOCK_IDS.GID,
         dev: 0,
         ino: this._inoFor(norm),
         rdev: 0,
         blksize: MOCK_FS.BLOCK_SIZE,
         blocks: 0,
-        atimeNs: BigInt(ts) * 1000000n,
-        mtimeNs: BigInt(ts) * 1000000n,
-        ctimeNs: BigInt(ts) * 1000000n,
-        birthtimeNs: BigInt(ts) * 1000000n,
+        atimeNs: BigInt(atimeMs) * 1000000n,
+        mtimeNs: BigInt(mtimeMs) * 1000000n,
+        ctimeNs: BigInt(mtimeMs) * 1000000n,
+        birthtimeNs: BigInt(mtimeMs) * 1000000n,
       };
     }
     return this.statSync(norm);
@@ -1262,23 +1315,26 @@ export class MemoryVolume {
     this.writeInternal(norm, data, false);
   }
 
-  mkdirSync(p: string, options?: { recursive?: boolean }): void {
+  mkdirSync(p: string, options?: { recursive?: boolean; mode?: number }): string | undefined {
     const norm = this.normalize(p);
+    const mode = options?.mode !== undefined ? options.mode & 0o7777 : 0o777;
 
     if (options?.recursive) {
       const { created } = this.ensureDirTracked(norm);
       for (const path of created) {
+        const node = this.locateRaw(path);
+        if (node?.kind === 'directory') node.mode = mode;
         this._invalidateLazyListedFor(path);
         if (this._handler) this._handler.invalidateStat(path);
         this.triggerWatchers(path, 'rename');
         this.notifyGlobalListeners(path, 'addDir');
       }
-      return;
+      return created.length > 0 ? created[0] : undefined;
     }
 
     const parentPath = this.parentOf(norm);
     const name = this.nameOf(norm);
-    if (!name) return;
+    if (!name) return undefined;
 
     const parent = this.locate(parentPath);
     if (!parent) throw makeSystemError('ENOENT', 'mkdir', parentPath);
@@ -1289,12 +1345,14 @@ export class MemoryVolume {
       kind: 'directory',
       children: new Map(),
       modified: Date.now(),
+      mode,
     });
 
     this._invalidateLazyListedFor(norm);
     if (this._handler) this._handler.invalidateStat(norm);
     this.triggerWatchers(norm, 'rename');
     this.notifyGlobalListeners(norm, 'addDir');
+    return undefined;
   }
 
   readdirSync(p: string): string[] {
@@ -1541,7 +1599,7 @@ export class MemoryVolume {
     return resolve(norm, new Set());
   }
 
-  symlinkSync(target: string, linkPath: string, _type?: string): void {
+  symlinkSync(target: string, linkPath: string, type?: string): void {
     const normLink = this.normalize(linkPath);
     const parentPath = this.parentOf(normLink);
     const name = this.nameOf(normLink);
@@ -1550,10 +1608,16 @@ export class MemoryVolume {
     const parent = this.ensureDir(parentPath);
 
     if (parent.children!.has(name)) throw makeSystemError('EEXIST', 'symlink', linkPath);
+    const now = Date.now();
     parent.children!.set(name, {
       kind: 'symlink',
       target,
-      modified: Date.now(),
+      modified: now,
+      atime: now,
+      mode: 0o777,
+      uid: MOCK_IDS.UID,
+      gid: MOCK_IDS.GID,
+      symlinkType: type,
     });
 
     if (this._handler) this._handler.invalidateStat(normLink);
@@ -1613,32 +1677,107 @@ export class MemoryVolume {
       node.mode = mode;
       node.modified = Date.now();
     }
+    if (this._handler) this._handler.invalidateStat(norm);
   }
 
-  chownSync(_p: string, _uid: number, _gid: number): void {
-    const norm = this.normalize(_p);
-    if (!this.locate(norm)) throw makeSystemError('ENOENT', 'chown', _p);
+  lchmodSync(p: string, mode: number): void {
+    const norm = this.normalize(p);
+    const node = this.locateRaw(norm);
+    if (!node) throw makeSystemError('ENOENT', 'lchmod', p);
+    const bits = mode & 0o7777;
+    if (node.kind === 'file') {
+      const inode = this._fileInode(node);
+      inode.mode = bits;
+      inode.ctime = Date.now();
+    } else {
+      node.mode = bits;
+      node.modified = Date.now();
+    }
+    if (this._handler) this._handler.invalidateStat(norm);
+  }
+
+  chownSync(p: string, uid: number, gid: number): void {
+    const norm = this.normalize(p);
+    const node = this.locate(norm);
+    if (!node) throw makeSystemError('ENOENT', 'chown', p);
+    if (node.kind === 'file') {
+      const inode = this._fileInode(node);
+      inode.uid = uid;
+      inode.gid = gid;
+      inode.ctime = Date.now();
+    } else {
+      node.uid = uid;
+      node.gid = gid;
+      node.modified = Date.now();
+    }
+    if (this._handler) this._handler.invalidateStat(norm);
+  }
+
+  lchownSync(p: string, uid: number, gid: number): void {
+    const norm = this.normalize(p);
+    const node = this.locateRaw(norm);
+    if (!node) throw makeSystemError('ENOENT', 'lchown', p);
+    if (node.kind === 'file') {
+      const inode = this._fileInode(node);
+      inode.uid = uid;
+      inode.gid = gid;
+      inode.ctime = Date.now();
+    } else {
+      node.uid = uid;
+      node.gid = gid;
+      node.modified = Date.now();
+    }
+    if (this._handler) this._handler.invalidateStat(norm);
+  }
+
+  private _parseTimes(
+    p: string,
+    syscall: string,
+    atime: number | Date,
+    mtime: number | Date,
+  ): { atimeMs: number; mtimeMs: number } {
+    const atimeMs = atime instanceof Date ? atime.getTime() : Number(atime) * 1000;
+    const mtimeMs = mtime instanceof Date ? mtime.getTime() : Number(mtime) * 1000;
+    if (!Number.isFinite(atimeMs) || !Number.isFinite(mtimeMs)) {
+      const error = new Error(`EINVAL: invalid time, ${syscall} '${p}'`) as SystemError;
+      error.code = 'EINVAL';
+      error.errno = -22;
+      error.syscall = syscall;
+      error.path = p;
+      throw error;
+    }
+    return { atimeMs, mtimeMs };
   }
 
   utimesSync(p: string, atime: number | Date, mtime: number | Date): void {
     const norm = this.normalize(p);
     const node = this.locate(norm);
     if (!node) throw makeSystemError('ENOENT', 'utimes', p);
-    const atimeMs = atime instanceof Date ? atime.getTime() : Number(atime) * 1000;
-    const mtimeMs = mtime instanceof Date ? mtime.getTime() : Number(mtime) * 1000;
-    if (!Number.isFinite(atimeMs) || !Number.isFinite(mtimeMs)) {
-      const error = new Error(`EINVAL: invalid time, utimes '${p}'`) as SystemError;
-      error.code = 'EINVAL';
-      error.errno = -22;
-      error.syscall = 'utimes';
-      error.path = p;
-      throw error;
-    }
+    const { atimeMs, mtimeMs } = this._parseTimes(p, 'utimes', atime, mtime);
     if (node.kind === 'file') {
       const inode = this._fileInode(node);
       inode.atime = atimeMs;
       inode.mtime = mtimeMs;
       inode.ctime = Date.now();
+    } else {
+      node.atime = atimeMs;
+    }
+    node.modified = mtimeMs;
+    if (this._handler) this._handler.invalidateStat(norm);
+  }
+
+  lutimesSync(p: string, atime: number | Date, mtime: number | Date): void {
+    const norm = this.normalize(p);
+    const node = this.locateRaw(norm);
+    if (!node) throw makeSystemError('ENOENT', 'lutimes', p);
+    const { atimeMs, mtimeMs } = this._parseTimes(p, 'lutimes', atime, mtime);
+    if (node.kind === 'file') {
+      const inode = this._fileInode(node);
+      inode.atime = atimeMs;
+      inode.mtime = mtimeMs;
+      inode.ctime = Date.now();
+    } else {
+      node.atime = atimeMs;
     }
     node.modified = mtimeMs;
     if (this._handler) this._handler.invalidateStat(norm);

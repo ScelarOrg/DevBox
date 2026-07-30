@@ -20,6 +20,11 @@ export default defineConfig({
   ],
   test: {
     include: ["src/**/*.test.ts"],
+    // CI runners OOM / hang when fork fan-out is high; wasi/native workers also
+    // need a bounded pool so teardown does not time out into a false failure.
+    pool: "forks",
+    maxWorkers: 2,
+    teardownTimeout: 20_000,
     benchmark: {
       include: ["src/**/*.bench.ts"],
     },

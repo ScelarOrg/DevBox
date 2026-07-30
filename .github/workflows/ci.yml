@@ -31,6 +31,6 @@ jobs:
         run: pnpm run build:publish
 
       - name: Test
-        # The WASI/native test worker can be terminated under the runner's
-        # default fork fan-out. Two forks keep memory and teardown stable.
-        run: pnpm run test -- --maxWorkers=2
+        # Worker limits live in vitest.config.ts (maxWorkers: 2). Do not pass
+        # flags after `--` — Vitest treats those as name filters, not options.
+        run: pnpm test

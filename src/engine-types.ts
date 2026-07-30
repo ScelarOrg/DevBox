@@ -60,4 +60,7 @@ export interface VolumeEntry {
   mtimeMs?: number;
   ctimeMs?: number;
   nlink?: number;
+  uid?: number;
+  gid?: number;
+  symlinkType?: string;
 }

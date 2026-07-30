@@ -9,7 +9,6 @@ import type {
   VolumeFileHandle,
 } from "../memory-volume";
 import { makeSystemError } from "../memory-volume";
-import { bytesToBase64, bytesToHex } from "../helpers/byte-encoding";
 import { precompileWasm } from "../helpers/wasm-cache";
 import { prefetchWasmFromCdn } from "../helpers/wasm-cdn";
 import { Readable, Writable } from "./stream";
@@ -198,14 +197,27 @@ export class StatFs {
 export class StatWatcher {
   private _listeners: Map<string, ((...args: unknown[]) => void)[]> = new Map();
   private _interval: ReturnType<typeof setInterval> | null = null;
+  private _poll: (() => void) | null = null;
 
-  start(_filename: string, _persistent?: boolean, _interval?: number): void {
+  start(
+    _filename: string,
+    _persistent?: boolean,
+    interval = 5007,
+    poll?: () => void,
+  ): void {
+    this.stop();
+    this._poll = poll ?? null;
+    if (!this._poll) return;
+    this._interval = setInterval(() => {
+      try { this._poll?.(); } catch { /* ignore */ }
+    }, interval);
   }
   stop(): void {
     if (this._interval) {
       clearInterval(this._interval);
       this._interval = null;
     }
+    this._poll = null;
     this._emit("stop");
   }
   ref(): this { return this; }
@@ -297,6 +309,25 @@ interface FsConstantsShape {
   UV_FS_SYMLINK_JUNCTION: number;
 }
 
+type StatOptions = { bigint?: boolean; throwIfNoEntry?: boolean };
+type WriteFileOptions = { encoding?: string | null; mode?: number; flag?: string };
+type CpOptions = {
+  recursive?: boolean;
+  force?: boolean;
+  errorOnExist?: boolean;
+  filter?: (src: string, dest: string) => boolean;
+  dereference?: boolean;
+  preserveTimestamps?: boolean;
+  verbatimSymlinks?: boolean;
+  mode?: number;
+};
+type GlobOptions = {
+  cwd?: string;
+  exclude?: string[] | ((p: string) => boolean);
+  withFileTypes?: boolean;
+};
+type RmOptions = { recursive?: boolean; force?: boolean; maxRetries?: number; retryDelay?: number };
+
 interface FsPromisesShape {
   readFile(target: PathArg): Promise<Buffer>;
   readFile(target: PathArg, enc: "utf8" | "utf-8"): Promise<string>;
@@ -304,18 +335,22 @@ interface FsPromisesShape {
     target: PathArg,
     opts: { encoding: "utf8" | "utf-8" },
   ): Promise<string>;
-  writeFile(target: PathArg, data: string | Uint8Array): Promise<void>;
+  writeFile(
+    target: PathArg,
+    data: string | Uint8Array,
+    opts?: WriteFileOptions,
+  ): Promise<void>;
   appendFile(target: PathArg, data: string | Uint8Array): Promise<void>;
-  stat(target: PathArg): Promise<FileStat>;
-  lstat(target: PathArg): Promise<FileStat>;
+  stat(target: PathArg, opts?: StatOptions): Promise<FileStat | undefined>;
+  lstat(target: PathArg, opts?: StatOptions): Promise<FileStat | undefined>;
   readdir(target: PathArg): Promise<string[]>;
-  mkdir(target: PathArg, opts?: { recursive?: boolean }): Promise<void>;
+  mkdir(
+    target: PathArg,
+    opts?: { recursive?: boolean; mode?: number },
+  ): Promise<string | undefined>;
   unlink(target: PathArg): Promise<void>;
   rmdir(target: PathArg): Promise<void>;
-  rm(
-    target: PathArg,
-    opts?: { recursive?: boolean; force?: boolean },
-  ): Promise<void>;
+  rm(target: PathArg, opts?: RmOptions): Promise<void>;
   rename(src: PathArg, dest: PathArg): Promise<void>;
   access(target: PathArg, mode?: number): Promise<void>;
   realpath(target: PathArg): Promise<string>;
@@ -329,7 +364,11 @@ interface FsPromisesShape {
   truncate(target: PathArg, len?: number): Promise<void>;
   utimes(target: PathArg, atime: unknown, mtime: unknown): Promise<void>;
   lutimes(target: PathArg, atime: unknown, mtime: unknown): Promise<void>;
-  glob(pattern: string | string[], opts?: { cwd?: string; exclude?: string[] | ((p: string) => boolean) }): AsyncIterable<string>;
+  glob(
+    pattern: string | string[],
+    opts?: GlobOptions,
+  ): AsyncIterable<string | Dirent>;
+  constants: FsConstantsShape;
 }
 
 
@@ -339,19 +378,26 @@ export interface FsBridge {
   readFileSync(target: PathArg, enc: "utf8" | "utf-8"): string;
   readFileSync(target: PathArg, opts: { encoding: "utf8" | "utf-8" }): string;
   readFileSync(target: PathArg, opts: { encoding?: null }): Buffer;
-  writeFileSync(target: PathArg, data: string | Uint8Array): void;
+  writeFileSync(
+    target: PathArg,
+    data: string | Uint8Array,
+    opts?: WriteFileOptions | string,
+  ): void;
   appendFileSync(target: PathArg, data: string | Uint8Array): void;
   existsSync(target: PathArg): boolean;
-  mkdirSync(target: PathArg, opts?: { recursive?: boolean }): void;
+  mkdirSync(
+    target: PathArg,
+    opts?: { recursive?: boolean; mode?: number },
+  ): string | undefined;
   readdirSync(target: PathArg): string[];
   readdirSync(target: PathArg, opts: { withFileTypes: true }): Dirent[];
   readdirSync(
     target: PathArg,
     opts?: { withFileTypes?: boolean; encoding?: string } | string,
-  ): string[] | Dirent[];
-  statSync(target: PathArg): FileStat;
-  lstatSync(target: PathArg): FileStat;
-  fstatSync(fd: number): FileStat;
+  ): string[] | Buffer[] | Dirent[];
+  statSync(target: PathArg, opts?: StatOptions): FileStat | undefined;
+  lstatSync(target: PathArg, opts?: StatOptions): FileStat | undefined;
+  fstatSync(fd: number, opts?: StatOptions): FileStat | undefined;
   unlinkSync(target: PathArg): void;
   rmdirSync(target: PathArg): void;
   renameSync(src: PathArg, dest: PathArg): void;
@@ -366,6 +412,10 @@ export interface FsBridge {
   chmodSync(target: PathArg, mode: number): void;
   chownSync(target: PathArg, uid: number, gid: number): void;
   truncateSync(target: PathArg, len?: number): void;
+  lchownSync(target: PathArg, uid: number, gid: number): void;
+  lutimesSync(target: PathArg, atime: unknown, mtime: unknown): void;
+  fchownSync(fd: number, uid: number, gid: number): void;
+  fchmodSync(fd: number, mode: number): void;
   openSync(target: string, flags: string | number, mode?: number): number;
   closeSync(fd: number): void;
   readSync(
@@ -386,8 +436,14 @@ export interface FsBridge {
   fsyncSync(fd: number): void;
   fdatasyncSync(fd: number): void;
   mkdtempSync(prefix: string): string;
-  rmSync(target: string, opts?: { recursive?: boolean; force?: boolean }): void;
+  rmSync(target: string, opts?: RmOptions): void;
   opendirSync(target: unknown): Dir;
+  watchFile(
+    filename: unknown,
+    optsOrListener?: unknown,
+    listener?: unknown,
+  ): StatWatcher;
+  unwatchFile(filename: unknown, listener?: unknown): void;
   watch(
     filename: string,
     opts?: { persistent?: boolean; recursive?: boolean },
@@ -461,17 +517,28 @@ export interface FsBridge {
   ): void;
   createReadStream(
     target: string,
-    opts?: { encoding?: string; start?: number; end?: number },
+    opts?: {
+      encoding?: string;
+      start?: number;
+      end?: number;
+      highWaterMark?: number;
+      flags?: string;
+      mode?: number;
+      autoClose?: boolean;
+      fd?: number;
+    },
   ): import("./stream").Readable;
   createWriteStream(
     target: string,
     opts?: { encoding?: string; flags?: string },
   ): import("./stream").Writable;
-  cpSync(src: unknown, dest: unknown, opts?: { recursive?: boolean; force?: boolean; errorOnExist?: boolean }): void;
+  ReadStream: new (path: unknown, opts?: Record<string, unknown>) => import("./stream").Readable;
+  WriteStream: new (path: unknown, opts?: Record<string, unknown>) => import("./stream").Writable;
+  cpSync(src: unknown, dest: unknown, opts?: CpOptions): void;
   cp(src: unknown, dest: unknown, optsOrCb?: unknown, cb?: (err: Error | null) => void): void;
   readvSync(fd: number, buffers: ArrayBufferView[], pos?: number | null): number;
   readv(fd: number, buffers: ArrayBufferView[], posOrCb?: unknown, cb?: unknown): void;
-  globSync(pattern: string | string[], opts?: { cwd?: string; exclude?: string[] | ((p: string) => boolean) }): string[];
+  globSync(pattern: string | string[], opts?: GlobOptions): string[] | Dirent[];
   glob(pattern: string | string[], optsOrCb?: unknown, cb?: unknown): void;
   statfsSync(target: unknown, opts?: unknown): StatFs;
   statfs(target: unknown, optsOrCb?: unknown, cb?: unknown): void;
@@ -550,6 +617,9 @@ interface OpenFile {
   cursor: number;
   mode: string;
   data: Uint8Array;
+  isDirectory?: boolean;
+  /** Permission bits to apply on first persist of a newly created file. */
+  createMode?: number;
 }
 
 export function buildFileSystemBridge(
@@ -585,13 +655,17 @@ export function buildFileSystemBridge(
 
   function persistWritableFd(fd: number): void {
     const entry = openFiles.get(fd);
-    if (!entry) return;
+    if (!entry || entry.isDirectory) return;
     if (
       entry.mode.includes("w") ||
       entry.mode.includes("a") ||
       entry.mode.includes("+")
     ) {
       volume.writeFileSync(entry.filePath, entry.data);
+      if (entry.createMode !== undefined) {
+        volume.chmodSync(entry.filePath, entry.createMode & 0o777);
+        entry.createMode = undefined;
+      }
     }
   }
 
@@ -660,6 +734,230 @@ export function buildFileSystemBridge(
       return new Dirent(name, isDir, isFile, dirPath, isSymlink);
     });
   }
+
+  function isEnoent(err: unknown): boolean {
+    return !!(err && typeof err === "object" && (err as { code?: string }).code === "ENOENT");
+  }
+
+  function toBigIntStats(st: FileStat): FileStat {
+    const wrap = (n: number) => BigInt(n) as unknown as number;
+    return {
+      ...st,
+      size: wrap(st.size),
+      mode: wrap(st.mode),
+      nlink: wrap(st.nlink),
+      uid: wrap(st.uid),
+      gid: wrap(st.gid),
+      dev: wrap(st.dev),
+      ino: wrap(st.ino),
+      rdev: wrap(st.rdev),
+      blksize: wrap(st.blksize),
+      blocks: wrap(st.blocks),
+      atimeMs: wrap(st.atimeMs) as unknown as number,
+      mtimeMs: wrap(st.mtimeMs) as unknown as number,
+      ctimeMs: wrap(st.ctimeMs) as unknown as number,
+      birthtimeMs: wrap(st.birthtimeMs) as unknown as number,
+      atimeNs: BigInt(Math.trunc(st.atimeMs)) * 1000000n,
+      mtimeNs: BigInt(Math.trunc(st.mtimeMs)) * 1000000n,
+      ctimeNs: BigInt(Math.trunc(st.ctimeMs)) * 1000000n,
+      birthtimeNs: BigInt(Math.trunc(st.birthtimeMs)) * 1000000n,
+    };
+  }
+
+  function applyStatOptions(st: FileStat | undefined, opts?: StatOptions): FileStat | undefined {
+    if (st === undefined) return undefined;
+    return opts?.bigint ? toBigIntStats(st) : st;
+  }
+
+  function runStat(
+    fn: () => FileStat,
+    opts?: StatOptions,
+  ): FileStat | undefined {
+    try {
+      return applyStatOptions(fn(), opts);
+    } catch (err) {
+      if (opts?.throwIfNoEntry === false && isEnoent(err)) return undefined;
+      throw err;
+    }
+  }
+
+  function decodeBytes(raw: Uint8Array, enc?: string | null): Buffer | string {
+    if (!enc || enc === "buffer") return wrapAsBuffer(raw);
+    return Buffer.from(raw).toString(enc as BufferEncoding);
+  }
+
+  function normalizeWriteData(
+    data: string | Uint8Array | ArrayBuffer | ArrayBufferView | unknown,
+    encoding?: string | null,
+  ): Uint8Array {
+    if (typeof data === "string") {
+      return Buffer.from(data, (encoding || "utf8") as BufferEncoding) as unknown as Uint8Array;
+    }
+    if (data instanceof Uint8Array) return data;
+    if (data instanceof ArrayBuffer) return new Uint8Array(data);
+    if (data && ArrayBuffer.isView(data as ArrayBufferView)) {
+      const view = data as ArrayBufferView;
+      return new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+    }
+    if (Array.isArray(data) || (data && typeof (data as { length?: number }).length === "number")) {
+      return Uint8Array.from(data as ArrayLike<number>);
+    }
+    return new Uint8Array(0);
+  }
+
+  function encodeReaddirNames(names: string[], encoding?: string): string[] | Buffer[] {
+    if (encoding === "buffer") {
+      return names.map((n) => Buffer.from(n) as unknown as Buffer);
+    }
+    if (!encoding || encoding === "utf8" || encoding === "utf-8") return names;
+    return names.map((n) => Buffer.from(n).toString(encoding as BufferEncoding));
+  }
+
+  function expandBraces(pat: string): string[] {
+    const m = pat.match(/^([^{]*)\{([^}]+)\}(.*)$/);
+    if (!m) return [pat];
+    const prefix = m[1], alts = m[2].split(","), suffix = m[3];
+    const result: string[] = [];
+    for (const alt of alts) result.push(...expandBraces(prefix + alt + suffix));
+    return result;
+  }
+
+  function globToRegex(pat: string): RegExp {
+    let re = "";
+    let i = 0;
+    while (i < pat.length) {
+      const ch = pat[i];
+      if (ch === "*" && pat[i + 1] === "*") {
+        if (pat[i + 2] === "/") { re += "(?:.+/)?"; i += 3; }
+        else { re += ".*"; i += 2; }
+      } else if (ch === "*") { re += "[^/]*"; i++; }
+      else if (ch === "?") { re += "[^/]"; i++; }
+      else if (ch === "[") {
+        let j = i + 1;
+        if (j < pat.length && (pat[j] === "!" || pat[j] === "^")) j++;
+        if (j < pat.length && pat[j] === "]") j++;
+        while (j < pat.length && pat[j] !== "]") j++;
+        if (j >= pat.length) { re += "\\["; i++; }
+        else {
+          let cls = pat.slice(i + 1, j);
+          if (cls.startsWith("!") || cls.startsWith("^")) cls = "^" + cls.slice(1);
+          re += "[" + cls.replace(/\\/g, "\\\\") + "]";
+          i = j + 1;
+        }
+      } else if (".()^$|+{}".includes(ch)) { re += "\\" + ch; i++; }
+      else { re += ch; i++; }
+    }
+    return new RegExp("^" + re + "$");
+  }
+
+  function matchGlob(
+    pattern: string | string[],
+    opts?: GlobOptions,
+  ): string[] | Dirent[] {
+    const patterns = Array.isArray(pattern) ? pattern : [pattern];
+    const cwd = opts?.cwd ? abs(opts.cwd) : (getCwd ? getCwd() : "/");
+    const exclude = opts?.exclude;
+    const regexes: RegExp[] = [];
+    for (const p of patterns) {
+      for (const expanded of expandBraces(p)) regexes.push(globToRegex(expanded));
+    }
+    let excludeFn: ((p: string) => boolean) | null = null;
+    if (typeof exclude === "function") excludeFn = exclude;
+    else if (Array.isArray(exclude) && exclude.length > 0) {
+      const exRegexes: RegExp[] = [];
+      for (const ep of exclude) {
+        for (const expanded of expandBraces(ep)) exRegexes.push(globToRegex(expanded));
+      }
+      excludeFn = (p: string) => exRegexes.some((r) => r.test(p));
+    }
+    const results: string[] = [];
+    function walk(dir: string, base: string): void {
+      let entries: string[];
+      try { entries = volume.readdirSync(dir); } catch { return; }
+      for (const name of entries) {
+        const full = dir.endsWith("/") ? dir + name : dir + "/" + name;
+        const rel = base ? base + "/" + name : name;
+        let isDir = false;
+        try { isDir = volume.lstatSync(full).isDirectory(); } catch {}
+        if (isDir) {
+          if (regexes.some((r) => r.test(rel))) results.push(rel);
+          walk(full, rel);
+        } else {
+          results.push(rel);
+        }
+      }
+    }
+    walk(cwd, "");
+    const matched = results.filter((f) => {
+      if (excludeFn && excludeFn(f)) return false;
+      return regexes.some((r) => r.test(f));
+    });
+    if (opts?.withFileTypes) {
+      return matched.map((rel) => {
+        const full = cwd.endsWith("/") ? cwd + rel : cwd + "/" + rel;
+        const parent = full.substring(0, full.lastIndexOf("/")) || "/";
+        const name = rel.includes("/") ? rel.slice(rel.lastIndexOf("/") + 1) : rel;
+        return toDirents(parent, [name])[0];
+      });
+    }
+    return matched;
+  }
+
+  function busyWait(ms: number): void {
+    if (ms <= 0) return;
+    const end = Date.now() + ms;
+    while (Date.now() < end) { /* sync retry delay */ }
+  }
+
+  function rmWithRetry(fn: () => void, opts?: RmOptions): void {
+    const maxRetries = opts?.maxRetries ?? 0;
+    const retryDelay = opts?.retryDelay ?? 100;
+    let lastErr: unknown;
+    for (let i = 0; i <= maxRetries; i++) {
+      try {
+        fn();
+        return;
+      } catch (err) {
+        lastErr = err;
+        const code = (err as { code?: string })?.code;
+        if (i >= maxRetries || (code !== "EBUSY" && code !== "EPERM" && code !== "EACCES")) throw err;
+        busyWait(retryDelay);
+      }
+    }
+    throw lastErr;
+  }
+
+  // watchFile polling state (per bridge / volume)
+  type WatchFileEntry = {
+    watcher: StatWatcher;
+    listeners: Set<(curr: FileStat, prev: FileStat) => void>;
+    prev?: FileStat;
+    interval: number;
+  };
+  const watchFileMap = new Map<string, WatchFileEntry>();
+
+  function pollWatchFile(path: string, entry: WatchFileEntry): void {
+    let curr: FileStat | undefined;
+    try {
+      curr = volume.statSync(path);
+    } catch {
+      curr = undefined;
+    }
+    const prev = entry.prev;
+    if (curr && prev) {
+      if (
+        curr.mtimeMs !== prev.mtimeMs ||
+        curr.size !== prev.size ||
+        curr.ino !== prev.ino
+      ) {
+        for (const listener of entry.listeners) {
+          try { listener(curr, prev); } catch { /* ignore */ }
+        }
+        entry.watcher.emit("change", curr, prev);
+      }
+    }
+    entry.prev = curr;
+  }
   class FileHandle {
     fd: number;
     constructor(fd: number) {
@@ -678,12 +976,26 @@ export function buildFileSystemBridge(
       return Promise.resolve();
     }
 
-    chmod(_mode: number): Promise<void> {
-      return Promise.resolve();
+    chmod(mode: number): Promise<void> {
+      const entry = openFiles.get(this.fd);
+      if (!entry) return Promise.reject(makeBadfError("chmod"));
+      try {
+        volume.chmodSync(entry.filePath, mode);
+        return Promise.resolve();
+      } catch (e) {
+        return Promise.reject(e);
+      }
     }
 
-    chown(_uid: number, _gid: number): Promise<void> {
-      return Promise.resolve();
+    chown(uid: number, gid: number): Promise<void> {
+      const entry = openFiles.get(this.fd);
+      if (!entry) return Promise.reject(makeBadfError("chown"));
+      try {
+        volume.chownSync(entry.filePath, uid, gid);
+        return Promise.resolve();
+      } catch (e) {
+        return Promise.reject(e);
+      }
     }
 
     close(): Promise<void> {
@@ -698,23 +1010,38 @@ export function buildFileSystemBridge(
       }
     }
 
-    createReadStream(opts?: { encoding?: string; start?: number; end?: number }): Readable {
+    createReadStream(opts?: { encoding?: string; start?: number; end?: number; highWaterMark?: number }): Readable {
       const entry = openFiles.get(this.fd);
       if (!entry) throw makeBadfError("createReadStream");
-      const stream: any = new Readable();
+      if (entry.isDirectory) throw makeSystemError("EISDIR", "read", entry.filePath);
+      const start = opts?.start ?? 0;
+      const end = opts?.end ?? Infinity;
+      let pos = start;
+      const hwm = opts?.highWaterMark ?? 64 * 1024;
+      const stream: any = new Readable({
+        highWaterMark: hwm,
+        read(size: number) {
+          try {
+            if (pos > end) {
+              stream.push(null);
+              return;
+            }
+            const toRead = Math.min(size || hwm, Math.max(0, (end === Infinity ? entry.data.length - 1 : end) - pos + 1));
+            if (toRead <= 0 || pos >= entry.data.length) {
+              stream.push(null);
+              return;
+            }
+            const chunk = entry.data.subarray(pos, pos + toRead);
+            pos += chunk.length;
+            stream.push(Buffer.from(chunk));
+            if (pos > end || pos >= entry.data.length) stream.push(null);
+          } catch (err) {
+            stream.destroy(err as Error);
+          }
+        },
+      });
       stream.path = entry.filePath;
       stream.fd = this.fd;
-      queueMicrotask(() => {
-        try {
-          const data = entry.data;
-          const start = opts?.start ?? 0;
-          const end = opts?.end !== undefined ? opts.end + 1 : data.length;
-          stream.push(Buffer.from(data.slice(start, end)));
-          stream.push(null);
-        } catch (err) {
-          stream.destroy(err as Error);
-        }
-      });
       return stream;
     }
 
@@ -838,11 +1165,11 @@ export function buildFileSystemBridge(
       return Promise.resolve({ bytesRead: totalRead, buffers });
     }
 
-    stat(): Promise<FileStat> {
+    stat(opts?: StatOptions): Promise<FileStat | undefined> {
       const entry = openFiles.get(this.fd);
       if (!entry) return Promise.reject(makeBadfError("fstat"));
       try {
-        return Promise.resolve(volume.statSync(entry.filePath));
+        return Promise.resolve(runStat(() => volume.statSync(entry.filePath), opts));
       } catch (e) {
         return Promise.reject(e);
       }
@@ -972,46 +1299,45 @@ export function buildFileSystemBridge(
           const p = abs(target);
           let enc: string | undefined;
           if (typeof encOrOpts === "string") enc = encOrOpts;
-          else if (encOrOpts?.encoding) enc = encOrOpts.encoding;
-
-          if (enc === "utf8" || enc === "utf-8") {
-            ok(volume.readFileSync(p, "utf8"));
-          } else {
-            ok(wrapAsBuffer(volume.readFileSync(p)));
-          }
+          else if (encOrOpts?.encoding) enc = encOrOpts.encoding ?? undefined;
+          const raw = volume.readFileSync(p);
+          if (p.endsWith(".wasm")) precompileWasm(raw);
+          ok(decodeBytes(raw, enc));
         } catch (e) {
           fail(e);
         }
       });
     },
-    writeFile(target: unknown, data: string | Uint8Array): Promise<void> {
+    writeFile(
+      target: unknown,
+      data: string | Uint8Array,
+      opts?: WriteFileOptions,
+    ): Promise<void> {
       return new Promise((ok, fail) => {
         try {
-          const wp = abs(target);
-          volume.writeFileSync(wp, data);
-          if (wp.endsWith(".wasm") && typeof data !== "string") {
-            precompileWasm(data);
-          }
+          bridge.writeFileSync(target as PathArg, data, opts);
           ok();
         } catch (e) {
           fail(e);
         }
       });
     },
-    stat(target: unknown): Promise<FileStat> {
+    stat(target: unknown, opts?: StatOptions): Promise<FileStat | undefined> {
       return new Promise((ok, fail) => {
         try {
-          ok(volume.statSync(abs(target)));
+          ok(runStat(() => volume.statSync(abs(target)), opts));
         } catch (e) {
           fail(e);
         }
       });
     },
-    mkdir(target: unknown, opts?: { recursive?: boolean }): Promise<void> {
+    mkdir(
+      target: unknown,
+      opts?: { recursive?: boolean; mode?: number },
+    ): Promise<string | undefined> {
       return new Promise((ok, fail) => {
         try {
-          volume.mkdirSync(abs(target), opts);
-          ok();
+          ok(volume.mkdirSync(abs(target), opts));
         } catch (e) {
           fail(e);
         }
@@ -1147,21 +1473,38 @@ export function buildFileSystemBridge(
     },
     rm(
       target: unknown,
-      opts?: { recursive?: boolean; force?: boolean },
+      opts?: RmOptions,
     ): Promise<void> {
-      return new Promise((ok, fail) => {
+      return new Promise(async (ok, fail) => {
         try {
-          bridge.rmSync(abs(target), opts);
-          ok();
+          const maxRetries = opts?.maxRetries ?? 0;
+          const retryDelay = opts?.retryDelay ?? 100;
+          let lastErr: unknown;
+          for (let i = 0; i <= maxRetries; i++) {
+            try {
+              bridge.rmSync(abs(target), opts);
+              ok();
+              return;
+            } catch (err) {
+              lastErr = err;
+              const code = (err as { code?: string })?.code;
+              if (i >= maxRetries || (code !== "EBUSY" && code !== "EPERM" && code !== "EACCES")) {
+                fail(err);
+                return;
+              }
+              await new Promise((r) => setTimeout(r, retryDelay));
+            }
+          }
+          fail(lastErr);
         } catch (e) {
           fail(e);
         }
       });
     },
-    lstat(target: unknown): Promise<FileStat> {
+    lstat(target: unknown, opts?: StatOptions): Promise<FileStat | undefined> {
       return new Promise((ok, fail) => {
         try {
-          ok(volume.lstatSync(abs(target)));
+          ok(runStat(() => volume.lstatSync(abs(target)), opts));
         } catch (e) {
           fail(e);
         }
@@ -1175,13 +1518,21 @@ export function buildFileSystemBridge(
         return Promise.reject(error);
       }
     },
-    lchown(_target: unknown, _uid: number, _gid: number): Promise<void> {
-      // VFS doesn't track symlink ownership
-      return Promise.resolve();
+    lchown(target: unknown, uid: number, gid: number): Promise<void> {
+      try {
+        volume.lchownSync(abs(target), uid, gid);
+        return Promise.resolve();
+      } catch (error) {
+        return Promise.reject(error);
+      }
     },
-    lutimes(_target: unknown, _atime: unknown, _mtime: unknown): Promise<void> {
-      // VFS doesn't track timestamps
-      return Promise.resolve();
+    lutimes(target: unknown, atime: unknown, mtime: unknown): Promise<void> {
+      try {
+        volume.lutimesSync(abs(target), atime as number | Date, mtime as number | Date);
+        return Promise.resolve();
+      } catch (error) {
+        return Promise.reject(error);
+      }
     },
     opendir(target: unknown, _opts?: unknown): Promise<Dir> {
       try {
@@ -1196,7 +1547,7 @@ export function buildFileSystemBridge(
     readdir(
       target: unknown,
       opts?: { withFileTypes?: boolean; encoding?: string } | string,
-    ): Promise<string[] | Dirent[]> {
+    ): Promise<string[] | Buffer[] | Dirent[]> {
       try {
         const p = abs(target);
         const names = volume.readdirSync(p);
@@ -1204,128 +1555,25 @@ export function buildFileSystemBridge(
         if (o?.withFileTypes) {
           return Promise.resolve(toDirents(p, names));
         }
-        return Promise.resolve(names);
+        return Promise.resolve(encodeReaddirNames(names, o?.encoding));
       } catch (e) {
         return Promise.reject(e);
       }
     },
     glob(
       pattern: string | string[],
-      opts?: { cwd?: string; exclude?: string[] | ((p: string) => boolean) },
-    ): AsyncIterable<string> {
-      const patterns = Array.isArray(pattern) ? pattern : [pattern];
-      const cwd = opts?.cwd ? abs(opts.cwd) : (getCwd ? getCwd() : "/");
-      const exclude = opts?.exclude;
-
-      // Expand brace patterns like {tsx,ts,jsx,js} → individual alternatives
-      function expandBraces(pat: string): string[] {
-        const m = pat.match(/^([^{]*)\{([^}]+)\}(.*)$/);
-        if (!m) return [pat];
-        const prefix = m[1], alts = m[2].split(","), suffix = m[3];
-        const result: string[] = [];
-        for (const alt of alts) {
-          result.push(...expandBraces(prefix + alt + suffix));
-        }
-        return result;
-      }
-
-      // Convert a glob pattern to a RegExp
-      function globToRegex(pat: string): RegExp {
-        let re = "";
-        let i = 0;
-        while (i < pat.length) {
-          const ch = pat[i];
-          if (ch === "*" && pat[i + 1] === "*") {
-            // ** matches any number of path segments
-            if (pat[i + 2] === "/") {
-              re += "(?:.+/)?";
-              i += 3;
-            } else {
-              re += ".*";
-              i += 2;
-            }
-          } else if (ch === "*") {
-            re += "[^/]*";
-            i++;
-          } else if (ch === "?") {
-            re += "[^/]";
-            i++;
-          } else if (ch === "." || ch === "(" || ch === ")" || ch === "+" || ch === "^" || ch === "$" || ch === "|" || ch === "\\") {
-            re += "\\" + ch;
-            i++;
-          } else {
-            re += ch;
-            i++;
-          }
-        }
-        return new RegExp("^" + re + "$");
-      }
-
-      // Recursively collect all file paths under a directory (relative to base)
-      function walk(dir: string, base: string): string[] {
-        const results: string[] = [];
-        let entries: string[];
-        try {
-          entries = volume.readdirSync(dir);
-        } catch {
-          return results;
-        }
-        for (const name of entries) {
-          const full = dir.endsWith("/") ? dir + name : dir + "/" + name;
-          const rel = base ? base + "/" + name : name;
-          let isDir = false;
-          try {
-            isDir = volume.statSync(full).isDirectory();
-          } catch {
-            // skip broken entries
-          }
-          if (isDir) {
-            results.push(...walk(full, rel));
-          } else {
-            results.push(rel);
-          }
-        }
-        return results;
-      }
-
-      // Build all expanded patterns → regexes
-      const regexes: RegExp[] = [];
-      for (const p of patterns) {
-        for (const expanded of expandBraces(p)) {
-          regexes.push(globToRegex(expanded));
-        }
-      }
-
-      // Build exclude matchers
-      let excludeFn: ((p: string) => boolean) | null = null;
-      if (typeof exclude === "function") {
-        excludeFn = exclude;
-      } else if (Array.isArray(exclude) && exclude.length > 0) {
-        const exRegexes: RegExp[] = [];
-        for (const ep of exclude) {
-          for (const expanded of expandBraces(ep)) {
-            exRegexes.push(globToRegex(expanded));
-          }
-        }
-        excludeFn = (p: string) => exRegexes.some((r) => r.test(p));
-      }
-
-      const allFiles = walk(cwd, "");
-      const matched = allFiles.filter((f) => {
-        if (excludeFn && excludeFn(f)) return false;
-        return regexes.some((r) => r.test(f));
-      });
-
-      // Return an async iterable
+      opts?: GlobOptions,
+    ): AsyncIterable<string | Dirent> {
+      const matched = matchGlob(pattern, opts) as Array<string | Dirent>;
       return {
         [Symbol.asyncIterator]() {
           let i = 0;
           return {
             next() {
               if (i < matched.length) {
-                return Promise.resolve({ value: matched[i++], done: false });
+                return Promise.resolve({ value: matched[i++], done: false as const });
               }
-              return Promise.resolve({ value: undefined as any, done: true });
+              return Promise.resolve({ value: undefined as never, done: true as const });
             },
           };
         },
@@ -1413,6 +1661,7 @@ export function buildFileSystemBridge(
       }
     },
     FileHandle: FileHandle as any,
+    constants: fsConst,
   } as FsPromisesShape;
   const realpathSyncFn = function realpathSync(target: unknown): string {
     return volume.realpathSync(abs(target));
@@ -1432,15 +1681,12 @@ export function buildFileSystemBridge(
       const p = abs(target);
       let enc: string | undefined;
       if (typeof encOrOpts === "string") enc = encOrOpts;
-      else if (encOrOpts?.encoding) enc = encOrOpts.encoding;
+      else if (encOrOpts?.encoding) enc = encOrOpts.encoding ?? undefined;
 
-      if (enc === "utf8" || enc === "utf-8") {
-        return volume.readFileSync(p, "utf8");
-      }
       try {
         const raw = volume.readFileSync(p);
         if (p.endsWith(".wasm")) precompileWasm(raw);
-        return wrapAsBuffer(raw);
+        return decodeBytes(raw, enc);
       } catch (err: any) {
         // .wasm under node_modules missing from the VFS (e.g. >15MB binary
         // that skipped extraction): kick an async CDN prefetch so a retry
@@ -1459,24 +1705,14 @@ export function buildFileSystemBridge(
       }
     },
 
-    writeFileSync(target: unknown, data: string | Uint8Array | ArrayBuffer | ArrayBufferView | unknown): void {
-      // normalize binary once, napi-rs WASM packages pass ArrayBuffer/TypedArray/Buffer/plain arrays (postMessage via Array.from)
-      // otherwise precompileWasm throws and the volume stores non-Uint8Array content
-      let normalized: string | Uint8Array;
-      if (typeof data === "string") {
-        normalized = data;
-      } else if (data instanceof Uint8Array) {
-        normalized = data;
-      } else if (data instanceof ArrayBuffer) {
-        normalized = new Uint8Array(data);
-      } else if (data && ArrayBuffer.isView(data as any)) {
-        const view = data as ArrayBufferView;
-        normalized = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
-      } else if (Array.isArray(data) || (data && typeof (data as any).length === "number")) {
-        normalized = Uint8Array.from(data as ArrayLike<number>);
-      } else {
-        normalized = new Uint8Array(0);
-      }
+    writeFileSync(
+      target: unknown,
+      data: string | Uint8Array | ArrayBuffer | ArrayBufferView | unknown,
+      opts?: WriteFileOptions | string,
+    ): void {
+      const options: WriteFileOptions =
+        typeof opts === "string" ? { encoding: opts } : opts ?? {};
+      const bytes = normalizeWriteData(data, options.encoding);
 
       if (typeof target === "number") {
         const entry = openFiles.get(target);
@@ -1488,15 +1724,27 @@ export function buildFileSystemBridge(
           err.errno = -9;
           throw err;
         }
-        const bytes = typeof normalized === "string" ? encoder.encode(normalized) : normalized;
         entry.data = new Uint8Array(bytes);
         entry.cursor = bytes.length;
         return;
       }
+
       const wp = abs(target);
-      volume.writeFileSync(wp, normalized);
-      if (wp.endsWith(".wasm") && typeof normalized !== "string") {
-        precompileWasm(normalized);
+      const flag = options.flag ?? "w";
+      const mode = options.mode ?? 0o666;
+      const fd = bridge.openSync(wp, flag, mode);
+      try {
+        if (flag.includes("a")) {
+          bridge.writeSync(fd, bytes as unknown as Buffer, 0, bytes.length, null);
+        } else {
+          bridge.ftruncateSync(fd, 0);
+          bridge.writeSync(fd, bytes as unknown as Buffer, 0, bytes.length, 0);
+        }
+      } finally {
+        bridge.closeSync(fd);
+      }
+      if (wp.endsWith(".wasm")) {
+        precompileWasm(bytes);
       }
     },
 
@@ -1504,32 +1752,32 @@ export function buildFileSystemBridge(
       return volume.existsSync(abs(target));
     },
 
-    mkdirSync(target: unknown, opts?: { recursive?: boolean }): void {
-      volume.mkdirSync(abs(target), opts);
+    mkdirSync(target: unknown, opts?: { recursive?: boolean; mode?: number }): string | undefined {
+      return volume.mkdirSync(abs(target), opts);
     },
 
     readdirSync(
       target: unknown,
       opts?: { withFileTypes?: boolean; encoding?: string } | string,
-    ): string[] | Dirent[] {
+    ): string[] | Buffer[] | Dirent[] {
       const p = abs(target);
       const names = volume.readdirSync(p);
       const o = typeof opts === "string" ? { encoding: opts } : opts;
       if (o?.withFileTypes) {
         return toDirents(p, names);
       }
-      return names;
+      return encodeReaddirNames(names, o?.encoding);
     },
 
-    statSync(target: unknown): FileStat {
-      return volume.statSync(abs(target));
+    statSync(target: unknown, opts?: StatOptions): FileStat | undefined {
+      return runStat(() => volume.statSync(abs(target)), opts);
     },
 
-    lstatSync(target: unknown): FileStat {
-      return volume.lstatSync(abs(target));
+    lstatSync(target: unknown, opts?: StatOptions): FileStat | undefined {
+      return runStat(() => volume.lstatSync(abs(target)), opts);
     },
 
-    fstatSync(fd: number): FileStat {
+    fstatSync(fd: number, opts?: StatOptions): FileStat | undefined {
       const entry = openFiles.get(fd);
       if (!entry) {
         const err = new Error("EBADF: bad file descriptor, fstat") as Error & {
@@ -1540,7 +1788,7 @@ export function buildFileSystemBridge(
         err.errno = -9;
         throw err;
       }
-      return volume.statSync(entry.filePath);
+      return runStat(() => volume.statSync(entry.filePath), opts);
     },
 
     unlinkSync(target: unknown): void {
@@ -1585,16 +1833,16 @@ export function buildFileSystemBridge(
       volume.chownSync(abs(target), uid, gid);
     },
 
-    lchownSync(_target: unknown, _uid: number, _gid: number): void {
-      // VFS doesn't track symlink ownership — no-op
+    lchownSync(target: unknown, uid: number, gid: number): void {
+      volume.lchownSync(abs(target), uid, gid);
     },
 
     utimesSync(target: unknown, atime: unknown, mtime: unknown): void {
       volume.utimesSync(abs(target), atime as number | Date, mtime as number | Date);
     },
 
-    lutimesSync(_target: unknown, _atime: unknown, _mtime: unknown): void {
-      // VFS doesn't track timestamps — no-op
+    lutimesSync(target: unknown, atime: unknown, mtime: unknown): void {
+      volume.lutimesSync(abs(target), atime as number | Date, mtime as number | Date);
     },
 
     futimesSync(fd: number, atime: unknown, mtime: unknown): void {
@@ -1603,12 +1851,16 @@ export function buildFileSystemBridge(
       volume.utimesSync(entry.filePath, atime as number | Date, mtime as number | Date);
     },
 
-    fchownSync(_fd: number, _uid: number, _gid: number): void {
-      // VFS doesn't track fd ownership — no-op
+    fchownSync(fd: number, uid: number, gid: number): void {
+      const entry = openFiles.get(fd);
+      if (!entry) throw makeBadfError("fchown");
+      volume.chownSync(entry.filePath, uid, gid);
     },
 
-    fchmodSync(_fd: number, _mode: number): void {
-      // VFS doesn't track fd permissions — no-op
+    fchmodSync(fd: number, mode: number): void {
+      const entry = openFiles.get(fd);
+      if (!entry) throw makeBadfError("fchmod");
+      volume.chmodSync(entry.filePath, mode);
     },
 
     appendFileSync(target: unknown, data: string | Uint8Array): void {
@@ -1618,20 +1870,38 @@ export function buildFileSystemBridge(
     truncateSync(target: unknown, len?: number): void {
       volume.truncateSync(abs(target), len);
     },
-    openSync(target: unknown, flags: string | number, _mode?: number): number {
+    openSync(target: unknown, flags: string | number, mode?: number): number {
       const p = abs(target);
       const numeric = typeof flags === "number" ? flags : null;
       const flagStr = numeric !== null ? numericFlagsToString(numeric) : String(flags);
-      const exists = volume.existsSync(p);
       const O_CREAT = 64;
       const O_EXCL = 128;
+      const O_DIRECTORY = 65536;
+      const O_NOFOLLOW = 131072;
+      const createMode = mode ?? 0o666;
       const wantsExcl =
         (numeric !== null && (numeric & O_EXCL) !== 0) || flagStr.includes("x");
       const wantsCreat =
         (numeric !== null && (numeric & O_CREAT) !== 0) ||
         /[wax]/i.test(flagStr);
+      const wantsDirectory = numeric !== null && (numeric & O_DIRECTORY) !== 0;
+      const wantsNoFollow = numeric !== null && (numeric & O_NOFOLLOW) !== 0;
       const isWrite = flagStr.includes("w") || flagStr.includes("a");
       const isReadOnly = flagStr.includes("r") && !flagStr.includes("+");
+
+      if (wantsNoFollow) {
+        try {
+          const raw = volume.lstatSync(p);
+          if (raw.isSymbolicLink()) {
+            throw makeSystemError("ELOOP", "open", p);
+          }
+        } catch (err) {
+          if ((err as { code?: string }).code === "ELOOP") throw err;
+          // missing path handled below
+        }
+      }
+
+      const exists = volume.existsSync(p);
 
       if (wantsExcl && exists) {
         const err = new Error(
@@ -1653,7 +1923,43 @@ export function buildFileSystemBridge(
         throw err;
       }
 
+      if (exists && wantsDirectory) {
+        const st = volume.statSync(p);
+        if (!st.isDirectory()) throw makeSystemError("ENOTDIR", "open", p);
+        const fd = fdCounter++;
+        openFiles.set(fd, {
+          filePath: p,
+          cursor: 0,
+          mode: flagStr,
+          data: new Uint8Array(0),
+          isDirectory: true,
+        });
+        return fd;
+      }
+
+      if (exists) {
+        try {
+          if (volume.statSync(p).isDirectory()) {
+            if (wantsDirectory || isReadOnly) {
+              const fd = fdCounter++;
+              openFiles.set(fd, {
+                filePath: p,
+                cursor: 0,
+                mode: flagStr,
+                data: new Uint8Array(0),
+                isDirectory: true,
+              });
+              return fd;
+            }
+            throw makeSystemError("EISDIR", "open", p);
+          }
+        } catch (err) {
+          if ((err as { code?: string }).code === "EISDIR") throw err;
+        }
+      }
+
       let content: Uint8Array;
+      let created = false;
       if (exists && !flagStr.includes("w")) {
         content = volume.readFileSync(p);
       } else {
@@ -1663,6 +1969,7 @@ export function buildFileSystemBridge(
           if (!volume.existsSync(parent)) {
             volume.mkdirSync(parent, { recursive: true });
           }
+          if (!exists) created = true;
         }
       }
 
@@ -1672,7 +1979,15 @@ export function buildFileSystemBridge(
         cursor: flagStr.includes("a") ? content.length : 0,
         mode: flagStr,
         data: new Uint8Array(content),
+        createMode: created ? createMode : undefined,
       });
+      if (exists && flagStr.includes("w") && !flagStr.includes("a")) {
+        // truncate on open for 'w' — deferred until first persist so fsync
+        // semantics stay Node-like, but remember mode if caller set one.
+        if (mode !== undefined) {
+          openFiles.get(fd)!.createMode = createMode;
+        }
+      }
       return fd;
     },
 
@@ -1821,23 +2136,25 @@ export function buildFileSystemBridge(
 
     rmSync(
       target: unknown,
-      opts?: { recursive?: boolean; force?: boolean },
+      opts?: RmOptions,
     ): void {
-      const p = abs(target);
-      if (!volume.existsSync(p)) {
-        if (opts?.force) return;
-        throw makeSystemError("ENOENT", "rm", p);
-      }
-      const st = volume.statSync(p);
-      if (st.isDirectory()) {
-        if (opts?.recursive) {
-          volume.removeTreeSync(p);
-        } else {
-          throw makeSystemError("EISDIR", "rm", p);
+      rmWithRetry(() => {
+        const p = abs(target);
+        if (!volume.existsSync(p)) {
+          if (opts?.force) return;
+          throw makeSystemError("ENOENT", "rm", p);
         }
-      } else {
-        volume.unlinkSync(p);
-      }
+        const st = volume.statSync(p);
+        if (st.isDirectory()) {
+          if (opts?.recursive) {
+            volume.removeTreeSync(p);
+          } else {
+            throw makeSystemError("EISDIR", "rm", p);
+          }
+        } else {
+          volume.unlinkSync(p);
+        }
+      }, opts);
     },
     watch(
       filename: unknown,
@@ -1873,16 +2190,60 @@ export function buildFileSystemBridge(
     },
 
     watchFile(
-      _filename: unknown,
-      _optsOrListener?: unknown,
-      _listener?: unknown,
-    ): { unref(): void; ref(): void } {
-      // Stub — polling-based file watch not implemented in VFS
-      return { unref() {}, ref() {} };
+      filename: unknown,
+      optsOrListener?:
+        | { interval?: number; persistent?: boolean }
+        | ((curr: FileStat, prev: FileStat) => void),
+      listener?: (curr: FileStat, prev: FileStat) => void,
+    ): StatWatcher {
+      const p = abs(filename);
+      const opts =
+        typeof optsOrListener === "function" ? undefined : optsOrListener;
+      const cb =
+        typeof optsOrListener === "function" ? optsOrListener : listener;
+      const interval = opts?.interval ?? 5007;
+      let entry = watchFileMap.get(p);
+      if (!entry) {
+        const watcher = new StatWatcher();
+        entry = {
+          watcher,
+          listeners: new Set(),
+          interval,
+          prev: (() => {
+            try { return volume.statSync(p); } catch { return undefined; }
+          })(),
+        };
+        watchFileMap.set(p, entry);
+        watcher.start(p, opts?.persistent !== false, interval, () => {
+          const e = watchFileMap.get(p);
+          if (e) pollWatchFile(p, e);
+        });
+      }
+      if (cb) {
+        entry.listeners.add(cb);
+        entry.watcher.on("change", cb as (...args: unknown[]) => void);
+      }
+      return entry.watcher;
     },
 
-    unwatchFile(_filename: unknown, _listener?: unknown): void {
-      // Stub — polling-based file unwatch not implemented in VFS
+    unwatchFile(
+      filename: unknown,
+      listener?: (curr: FileStat, prev: FileStat) => void,
+    ): void {
+      const p = abs(filename);
+      const entry = watchFileMap.get(p);
+      if (!entry) return;
+      if (listener) {
+        entry.listeners.delete(listener);
+        entry.watcher.removeListener("change", listener as (...args: unknown[]) => void);
+      } else {
+        entry.listeners.clear();
+        entry.watcher.removeAllListeners("change");
+      }
+      if (entry.listeners.size === 0) {
+        entry.watcher.stop();
+        watchFileMap.delete(p);
+      }
     },
     readFile(
       target: unknown,
@@ -1906,13 +2267,9 @@ export function buildFileSystemBridge(
         }
       }
       try {
-        if (enc && enc !== "buffer" && (enc === "utf8" || enc === "utf-8")) {
-          const data = volume.readFileSync(p, "utf8");
-          if (actualCb) setTimeout(() => actualCb(null, data), 0);
-        } else {
-          const raw = volume.readFileSync(p);
-          if (actualCb) setTimeout(() => actualCb(null, wrapAsBuffer(raw)), 0);
-        }
+        const raw = volume.readFileSync(p);
+        const data = decodeBytes(raw, enc);
+        if (actualCb) setTimeout(() => actualCb(null, data), 0);
       } catch (e) {
         if (actualCb) setTimeout(() => actualCb(e as Error), 0);
       }
@@ -1927,13 +2284,13 @@ export function buildFileSystemBridge(
       const cb = typeof optsOrCb === "function"
         ? optsOrCb as (err: Error | null) => void
         : maybeCb;
+      const opts = typeof optsOrCb === "object" && optsOrCb !== null
+        ? optsOrCb as WriteFileOptions
+        : typeof optsOrCb === "string"
+          ? { encoding: optsOrCb }
+          : undefined;
       try {
-        const wp = abs(target);
-        const writeData = typeof data === "string" ? data : data as Uint8Array;
-        volume.writeFileSync(wp, writeData);
-        if (wp.endsWith(".wasm") && typeof data !== "string") {
-          precompileWasm(data as Uint8Array);
-        }
+        bridge.writeFileSync(target as PathArg, data as any, opts);
         if (cb) setTimeout(() => cb(null), 0);
       } catch (e) {
         if (cb) setTimeout(() => cb(e as Error), 0);
@@ -1945,12 +2302,18 @@ export function buildFileSystemBridge(
       optsOrCb?: unknown,
       maybeCb?: (err: Error | null, stats?: FileStat) => void,
     ): void {
-      // Support both stat(path, cb) and stat(path, opts, cb)
       const cb = typeof optsOrCb === "function"
         ? optsOrCb as (err: Error | null, stats?: FileStat) => void
         : maybeCb as (err: Error | null, stats?: FileStat) => void;
-      const p = abs(target);
-      volume.stat(p, cb);
+      const opts = typeof optsOrCb === "object" && optsOrCb !== null
+        ? optsOrCb as StatOptions
+        : undefined;
+      try {
+        const st = runStat(() => volume.statSync(abs(target)), opts);
+        if (cb) setTimeout(() => cb(null, st), 0);
+      } catch (e) {
+        if (cb) setTimeout(() => cb(e as Error), 0);
+      }
     },
 
     lstat(
@@ -1958,30 +2321,41 @@ export function buildFileSystemBridge(
       optsOrCb?: unknown,
       maybeCb?: (err: Error | null, stats?: FileStat) => void,
     ): void {
-      // Support both lstat(path, cb) and lstat(path, opts, cb)
       const cb = typeof optsOrCb === "function"
         ? optsOrCb as (err: Error | null, stats?: FileStat) => void
         : maybeCb as (err: Error | null, stats?: FileStat) => void;
-      const p = abs(target);
-      volume.lstat(p, cb);
+      const opts = typeof optsOrCb === "object" && optsOrCb !== null
+        ? optsOrCb as StatOptions
+        : undefined;
+      try {
+        const st = runStat(() => volume.lstatSync(abs(target)), opts);
+        if (cb) setTimeout(() => cb(null, st), 0);
+      } catch (e) {
+        if (cb) setTimeout(() => cb(e as Error), 0);
+      }
     },
 
     readdir(
       target: unknown,
       optsOrCb?:
-        | { withFileTypes?: boolean }
-        | ((err: Error | null, files?: string[] | Dirent[]) => void),
-      cb?: (err: Error | null, files?: string[] | Dirent[]) => void,
+        | { withFileTypes?: boolean; encoding?: string }
+        | string
+        | ((err: Error | null, files?: string[] | Buffer[] | Dirent[]) => void),
+      cb?: (err: Error | null, files?: string[] | Buffer[] | Dirent[]) => void,
     ): void {
       const actualCb = typeof optsOrCb === "function" ? optsOrCb : cb;
-      const opts = typeof optsOrCb === "function" ? undefined : optsOrCb;
+      const opts = typeof optsOrCb === "function"
+        ? undefined
+        : typeof optsOrCb === "string"
+          ? { encoding: optsOrCb }
+          : optsOrCb;
       const p = abs(target);
       try {
         const names = volume.readdirSync(p);
         if (opts?.withFileTypes) {
           actualCb?.(null, toDirents(p, names));
         } else {
-          actualCb?.(null, names);
+          actualCb?.(null, encodeReaddirNames(names, opts?.encoding));
         }
       } catch (e) {
         actualCb?.(e as Error);
@@ -1990,14 +2364,16 @@ export function buildFileSystemBridge(
 
     mkdir(
       target: unknown,
-      optsOrCb?: { recursive?: boolean } | ((err: Error | null) => void),
-      cb?: (err: Error | null) => void,
+      optsOrCb?:
+        | { recursive?: boolean; mode?: number }
+        | ((err: Error | null, path?: string) => void),
+      cb?: (err: Error | null, path?: string) => void,
     ): void {
       const actualCb = typeof optsOrCb === "function" ? optsOrCb : cb;
       const opts = typeof optsOrCb === "object" ? optsOrCb : undefined;
       try {
-        volume.mkdirSync(abs(target), opts);
-        if (actualCb) setTimeout(() => actualCb(null), 0);
+        const created = volume.mkdirSync(abs(target), opts);
+        if (actualCb) setTimeout(() => actualCb(null, created), 0);
       } catch (e) {
         if (actualCb) setTimeout(() => actualCb(e as Error), 0);
       }
@@ -2076,8 +2452,9 @@ export function buildFileSystemBridge(
       cb?: (err: Error | null) => void,
     ): void {
       const actualCb = typeof typeOrCb === "function" ? typeOrCb : cb;
+      const type = typeof typeOrCb === "string" ? typeOrCb : undefined;
       try {
-        volume.symlinkSync(symlinkTargetArg(target), abs(path));
+        volume.symlinkSync(symlinkTargetArg(target), abs(path), type);
         if (actualCb) setTimeout(() => actualCb(null), 0);
       } catch (e) {
         if (actualCb) setTimeout(() => actualCb(e as Error), 0);
@@ -2142,12 +2519,16 @@ export function buildFileSystemBridge(
 
     lchown(
       target: unknown,
-      _uid: number,
-      _gid: number,
+      uid: number,
+      gid: number,
       cb: (err: Error | null) => void,
     ): void {
-      // VFS doesn't track symlink ownership — succeed silently
-      if (cb) setTimeout(() => cb(null), 0);
+      try {
+        volume.lchownSync(abs(target), uid, gid);
+        if (cb) setTimeout(() => cb(null), 0);
+      } catch (error) {
+        if (cb) setTimeout(() => cb(error as Error), 0);
+      }
     },
 
     utimes(
@@ -2165,12 +2546,17 @@ export function buildFileSystemBridge(
     },
 
     lutimes(
-      _target: unknown,
-      _atime: number | string | Date,
-      _mtime: number | string | Date,
+      target: unknown,
+      atime: number | string | Date,
+      mtime: number | string | Date,
       cb: (err: Error | null) => void,
     ): void {
-      if (cb) setTimeout(() => cb(null), 0);
+      try {
+        volume.lutimesSync(abs(target), atime as number | Date, mtime as number | Date);
+        if (cb) setTimeout(() => cb(null), 0);
+      } catch (error) {
+        if (cb) setTimeout(() => cb(error as Error), 0);
+      }
     },
     open(
       target: unknown,
@@ -2358,16 +2744,15 @@ export function buildFileSystemBridge(
       const cb = typeof optsOrCb === "function"
         ? optsOrCb as (err: Error | null, stats?: FileStat) => void
         : maybeCb;
-      const entry = openFiles.get(fd);
-      if (!entry) {
-        const err = new Error(`EBADF: bad file descriptor, fstat`) as Error & {
-          code: string;
-        };
-        err.code = "EBADF";
-        if (cb) setTimeout(() => cb(err), 0);
-        return;
+      const opts = typeof optsOrCb === "object" && optsOrCb !== null
+        ? optsOrCb as StatOptions
+        : undefined;
+      try {
+        const st = bridge.fstatSync(fd, opts);
+        if (cb) setTimeout(() => cb(null, st), 0);
+      } catch (e) {
+        if (cb) setTimeout(() => cb(e as Error), 0);
       }
-      volume.stat(entry.filePath, cb);
     },
 
     futimes(
@@ -2391,21 +2776,29 @@ export function buildFileSystemBridge(
 
     fchown(
       fd: number,
-      _uid: number,
-      _gid: number,
+      uid: number,
+      gid: number,
       cb: (err: Error | null) => void,
     ): void {
-      // VFS doesn't track ownership — succeed silently
-      if (cb) setTimeout(() => cb(null), 0);
+      try {
+        bridge.fchownSync(fd, uid, gid);
+        if (cb) setTimeout(() => cb(null), 0);
+      } catch (e) {
+        if (cb) setTimeout(() => cb(e as Error), 0);
+      }
     },
 
     fchmod(
       fd: number,
-      _mode: number,
+      mode: number,
       cb: (err: Error | null) => void,
     ): void {
-      // VFS doesn't track permissions — succeed silently
-      if (cb) setTimeout(() => cb(null), 0);
+      try {
+        bridge.fchmodSync(fd, mode);
+        if (cb) setTimeout(() => cb(null), 0);
+      } catch (e) {
+        if (cb) setTimeout(() => cb(e as Error), 0);
+      }
     },
     // function constructor, not class -- graceful-fs calls fs$ReadStream.apply(this, args)
     ReadStream: (() => {
@@ -2466,6 +2859,13 @@ export function buildFileSystemBridge(
         self.flags = (opts?.flags as string) ?? "r";
         self.mode = (opts?.mode as number) ?? 0o666;
         self.autoClose = opts?.autoClose !== false;
+        (self as any)._start = typeof opts?.start === "number" ? opts.start : 0;
+        (self as any)._end = typeof opts?.end === "number" ? opts.end : Infinity;
+        (self as any)._pos = (self as any)._start;
+        if (typeof opts?.highWaterMark === "number") {
+          self._highWaterMark = opts.highWaterMark;
+          self.readableHighWaterMark = opts.highWaterMark;
+        }
         queueMicrotask(() => self.open());
       }
       FsReadStream.prototype = Object.create(Readable.prototype);
@@ -2473,21 +2873,40 @@ export function buildFileSystemBridge(
 
       FsReadStream.prototype.open = function () {
         try {
-          this.fd = bridge.openSync(this.path, this.flags, this.mode);
+          if (this.fd === null) {
+            this.fd = bridge.openSync(this.path, this.flags, this.mode);
+          }
           this.emit("open", this.fd);
           this.emit("ready");
-          this._read();
         } catch (err) {
           this.destroy(err);
         }
       };
 
-      FsReadStream.prototype._read = function () {
+      FsReadStream.prototype._read = function (size?: number) {
         if (this.fd === null) return;
         try {
-          const data = volume.readFileSync(this.path);
-          this.push(Buffer.from(data));
-          this.push(null);
+          const end = (this as any)._end as number;
+          let pos = (this as any)._pos as number;
+          if (pos > end) {
+            this.push(null);
+            return;
+          }
+          const hwm = size || this._highWaterMark || 64 * 1024;
+          const maxLen = end === Infinity ? hwm : Math.min(hwm, end - pos + 1);
+          if (maxLen <= 0) {
+            this.push(null);
+            return;
+          }
+          const buf = Buffer.alloc(maxLen);
+          const n = bridge.readSync(this.fd, buf, 0, maxLen, pos);
+          if (n <= 0) {
+            this.push(null);
+            return;
+          }
+          (this as any)._pos = pos + n;
+          this.push(buf.subarray(0, n));
+          if ((this as any)._pos > end) this.push(null);
         } catch (err) {
           this.destroy(err);
         }
@@ -2655,34 +3074,9 @@ export function buildFileSystemBridge(
 
     createReadStream(
       target: unknown,
-      opts?: { encoding?: string; start?: number; end?: number },
+      opts?: { encoding?: string; start?: number; end?: number; highWaterMark?: number; flags?: string; mode?: number; autoClose?: boolean; fd?: number },
     ): Readable {
-      const p = abs(target);
-      const stream: any = new Readable();
-      stream.path = p;
-      stream.fd = null;
-      stream.close = function (cb?: (err?: Error | null) => void) {
-        stream.destroy();
-        if (cb) cb(null);
-      };
-      stream.open = function () {
-        stream.fd = 42;
-        stream.emit("open", stream.fd);
-      };
-      setTimeout(() => {
-        try {
-          stream.open();
-          const data = volume.readFileSync(p);
-          const start = opts?.start ?? 0;
-          const end = opts?.end !== undefined ? opts.end + 1 : data.length;
-          const chunk = data.slice(start, end);
-          stream.push(Buffer.from(chunk));
-          stream.push(null);
-        } catch (err) {
-          stream.destroy(err as Error);
-        }
-      }, 0);
-      return stream;
+      return new (bridge.ReadStream as any)(target, opts);
     },
 
     createWriteStream(
@@ -2809,17 +3203,21 @@ export function buildFileSystemBridge(
       const result = volume.existsSync(abs(target));
       setTimeout(() => cb(result), 0);
     },
-    lchmodSync(_target: unknown, _mode: number): void {
-      // VFS doesn't track symlink permissions — no-op
+    lchmodSync(target: unknown, mode: number): void {
+      volume.lchmodSync(abs(target), mode);
     },
 
     lchmod(
-      _target: unknown,
-      _mode: number,
+      target: unknown,
+      mode: number,
       cb: (err: Error | null) => void,
     ): void {
-      // VFS doesn't track symlink permissions — succeed silently
-      if (cb) setTimeout(() => cb(null), 0);
+      try {
+        volume.lchmodSync(abs(target), mode);
+        if (cb) setTimeout(() => cb(null), 0);
+      } catch (e) {
+        if (cb) setTimeout(() => cb(e as Error), 0);
+      }
     },
     fdatasync(fd: number, cb: (err: Error | null) => void): void {
       try {
@@ -2922,11 +3320,42 @@ export function buildFileSystemBridge(
     cpSync(
       src: unknown,
       dest: unknown,
-      opts?: { recursive?: boolean; force?: boolean; errorOnExist?: boolean },
+      opts?: CpOptions,
     ): void {
       const srcPath = abs(src);
       const destPath = abs(dest);
-      const st = volume.statSync(srcPath);
+      if (opts?.filter && !opts.filter(srcPath, destPath)) return;
+
+      const dereference = opts?.dereference === true;
+      const lst = dereference ? volume.statSync(srcPath) : volume.lstatSync(srcPath);
+
+      if (lst.isSymbolicLink() && !dereference) {
+        let target = volume.readlinkSync(srcPath);
+        if (!opts?.verbatimSymlinks && !target.startsWith("/")) {
+          // keep relative target as-is (Node default for verbatimSymlinks false still
+          // stores the string; we preserve the readlink result)
+        }
+        const parent = destPath.substring(0, destPath.lastIndexOf("/")) || "/";
+        if (!volume.existsSync(parent)) volume.mkdirSync(parent, { recursive: true });
+        if (volume.existsSync(destPath)) {
+          if (opts?.errorOnExist) {
+            const err = new Error(
+              `EEXIST: file already exists, cp '${srcPath}' -> '${destPath}'`,
+            ) as Error & { code: string };
+            err.code = "EEXIST";
+            throw err;
+          }
+          if (opts?.force === false) return;
+          try { volume.unlinkSync(destPath); } catch { /* ignore */ }
+        }
+        volume.symlinkSync(target, destPath);
+        if (opts?.preserveTimestamps) {
+          volume.lutimesSync(destPath, lst.atime, lst.mtime);
+        }
+        return;
+      }
+
+      const st = dereference ? lst : volume.statSync(srcPath);
       if (st.isDirectory()) {
         if (!opts?.recursive) {
           const err = new Error(
@@ -2944,6 +3373,9 @@ export function buildFileSystemBridge(
           const childDest = destPath.endsWith("/") ? destPath + child : destPath + "/" + child;
           bridge.cpSync(childSrc, childDest, opts);
         }
+        if (opts?.preserveTimestamps) {
+          volume.utimesSync(destPath, st.atime, st.mtime);
+        }
       } else {
         if (opts?.errorOnExist && volume.existsSync(destPath)) {
           const err = new Error(
@@ -2952,22 +3384,22 @@ export function buildFileSystemBridge(
           err.code = "EEXIST";
           throw err;
         }
-        if (!opts?.force && volume.existsSync(destPath)) return;
-        const data = volume.readFileSync(srcPath);
+        if (opts?.force === false && volume.existsSync(destPath)) return;
         const parent = destPath.substring(0, destPath.lastIndexOf("/")) || "/";
         if (!volume.existsSync(parent)) {
           volume.mkdirSync(parent, { recursive: true });
         }
-        volume.writeFileSync(destPath, data);
+        volume.copyFileSync(srcPath, destPath, opts?.mode ?? 0);
+        if (opts?.preserveTimestamps) {
+          volume.utimesSync(destPath, st.atime, st.mtime);
+        }
       }
     },
 
     cp(
       src: unknown,
       dest: unknown,
-      optsOrCb?:
-        | { recursive?: boolean; force?: boolean; errorOnExist?: boolean }
-        | ((err: Error | null) => void),
+      optsOrCb?: CpOptions | ((err: Error | null) => void),
       cb?: (err: Error | null) => void,
     ): void {
       const callback = typeof optsOrCb === "function" ? optsOrCb : cb;
@@ -2996,77 +3428,17 @@ export function buildFileSystemBridge(
     },
     globSync(
       pattern: string | string[],
-      opts?: { cwd?: string; exclude?: string[] | ((p: string) => boolean) },
-    ): string[] {
-      // Reuse the glob logic from promises
-      const patterns = Array.isArray(pattern) ? pattern : [pattern];
-      const cwd = opts?.cwd ? abs(opts.cwd) : (getCwd ? getCwd() : "/");
-      const exclude = opts?.exclude;
-
-      function expandBraces(pat: string): string[] {
-        const m = pat.match(/^([^{]*)\{([^}]+)\}(.*)$/);
-        if (!m) return [pat];
-        const prefix = m[1], alts = m[2].split(","), suffix = m[3];
-        const result: string[] = [];
-        for (const alt of alts) result.push(...expandBraces(prefix + alt + suffix));
-        return result;
-      }
-      function globToRegex(pat: string): RegExp {
-        let re = "";
-        let i = 0;
-        while (i < pat.length) {
-          const ch = pat[i];
-          if (ch === "*" && pat[i + 1] === "*") {
-            if (pat[i + 2] === "/") { re += "(?:.+/)?"; i += 3; }
-            else { re += ".*"; i += 2; }
-          } else if (ch === "*") { re += "[^/]*"; i++; }
-          else if (ch === "?") { re += "[^/]"; i++; }
-          else if (".()^$|\\+".includes(ch)) { re += "\\" + ch; i++; }
-          else { re += ch; i++; }
-        }
-        return new RegExp("^" + re + "$");
-      }
-      function walk(dir: string, base: string): string[] {
-        const results: string[] = [];
-        let entries: string[];
-        try { entries = volume.readdirSync(dir); } catch { return results; }
-        for (const name of entries) {
-          const full = dir.endsWith("/") ? dir + name : dir + "/" + name;
-          const rel = base ? base + "/" + name : name;
-          let isDir = false;
-          try { isDir = volume.statSync(full).isDirectory(); } catch {}
-          if (isDir) results.push(...walk(full, rel));
-          else results.push(rel);
-        }
-        return results;
-      }
-
-      const regexes: RegExp[] = [];
-      for (const p of patterns) {
-        for (const expanded of expandBraces(p)) regexes.push(globToRegex(expanded));
-      }
-      let excludeFn: ((p: string) => boolean) | null = null;
-      if (typeof exclude === "function") excludeFn = exclude;
-      else if (Array.isArray(exclude) && exclude.length > 0) {
-        const exRegexes: RegExp[] = [];
-        for (const ep of exclude) {
-          for (const expanded of expandBraces(ep)) exRegexes.push(globToRegex(expanded));
-        }
-        excludeFn = (p: string) => exRegexes.some((r) => r.test(p));
-      }
-      const allFiles = walk(cwd, "");
-      return allFiles.filter((f) => {
-        if (excludeFn && excludeFn(f)) return false;
-        return regexes.some((r) => r.test(f));
-      });
+      opts?: GlobOptions,
+    ): string[] | Dirent[] {
+      return matchGlob(pattern, opts);
     },
 
     glob(
       pattern: string | string[],
       optsOrCb?:
-        | { cwd?: string; exclude?: string[] | ((p: string) => boolean) }
-        | ((err: Error | null, matches?: string[]) => void),
-      cb?: (err: Error | null, matches?: string[]) => void,
+        | GlobOptions
+        | ((err: Error | null, matches?: string[] | Dirent[]) => void),
+      cb?: (err: Error | null, matches?: string[] | Dirent[]) => void,
     ): void {
       const callback = typeof optsOrCb === "function" ? optsOrCb : cb;
       const opts = typeof optsOrCb === "object" ? optsOrCb : undefined;
