@@ -54,6 +54,11 @@ export function cpus(): CpuEntry[] {
   return Array.from({ length: MOCK_CPU.COUNT }, () => ({ ...template }));
 }
 
+/** Node 18.14+ / 19+ — Metro and others use this for worker fan-out. */
+export function availableParallelism(): number {
+  return Math.max(1, MOCK_CPU.COUNT);
+}
+
 export function totalmem(): number {
   return MOCK_MEMORY.TOTAL;
 }
@@ -223,6 +228,7 @@ export default {
   tmpdir,
   homedir,
   cpus,
+  availableParallelism,
   totalmem,
   freemem,
   uptime,

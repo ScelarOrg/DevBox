@@ -11,6 +11,7 @@ import {
   BrotliDecompressStream,
   preloadBrotli,
 } from "../polyfills/zlib";
+import osDefault, { availableParallelism, cpus } from "../polyfills/os";
 
 describe("assert.strict", () => {
   it("assert.strict.equal uses ===", () => {
@@ -182,5 +183,13 @@ describe("brotli stream framing", () => {
     compress.end();
     await done;
     expect(Buffer.concat(chunks).toString()).toBe("hello world");
+  });
+});
+
+describe("os.availableParallelism", () => {
+  it("matches cpus().length on named and default exports", () => {
+    expect(availableParallelism()).toBe(cpus().length);
+    expect(osDefault.availableParallelism()).toBe(cpus().length);
+    expect(availableParallelism()).toBeGreaterThanOrEqual(1);
   });
 });

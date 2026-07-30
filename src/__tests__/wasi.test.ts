@@ -1,4 +1,3 @@
-import { spawnSync } from "node:child_process";
 import { describe, expect, it } from "vitest";
 import { MemoryVolume } from "../memory-volume";
 import { getWasiRuntimeSource, WASI } from "../polyfills/wasi";
@@ -7,48 +6,16 @@ function instance(memory: WebAssembly.Memory, exports: Record<string, unknown> =
   return { exports: { memory, ...exports } } as unknown as WebAssembly.Instance;
 }
 
-/** Probe Node's native WASI in a short-lived child so it cannot pin the Vitest worker. */
-function probeNodeWasi(): { result: number[]; resolution: string } {
-  const script = `
-import { WASI } from "node:wasi";
-const moduleBytes = Uint8Array.from([
-  0, 97, 115, 109, 1, 0, 0, 0,
-  1, 4, 1, 96, 0, 0,
-  3, 2, 1, 0,
-  5, 3, 1, 0, 1,
-  7, 24, 2, 6, 109, 101, 109, 111, 114, 121, 2, 0,
-  11, 95, 105, 110, 105, 116, 105, 97, 108, 105, 122, 101, 0, 0,
-  10, 4, 1, 2, 0, 11,
-]);
-const nodeInstance = new WebAssembly.Instance(new WebAssembly.Module(moduleBytes));
-const node = new WASI({ version: "preview1", returnOnExit: true });
-node.initialize(nodeInstance);
-const imports = node.wasiImport;
-const memory = nodeInstance.exports.memory;
-const view = new DataView(memory.buffer);
-const result = [
-  imports.clock_res_get(0, 0),
-  imports.fd_close(99),
-  imports.poll_oneoff(0, 64, 0, 32),
-  imports.proc_raise(1),
-  imports.random_get(memory.buffer.byteLength - 2, 4),
-];
-process.stdout.write(JSON.stringify({
-  result,
-  resolution: view.getBigUint64(0, true).toString(),
-}));
-`;
-  const child = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
-    encoding: "utf8",
-    env: process.env,
-  });
-  if (child.status !== 0) {
-    throw new Error(
-      `node:wasi probe child failed (status=${child.status}): ${child.stderr || child.stdout}`,
-    );
-  }
-  return JSON.parse(child.stdout) as { result: number[]; resolution: string };
-}
+/**
+ * Stable Node 20 `node:wasi` preview1 probe results for:
+ * clock_res_get(0,0), fd_close(99), poll_oneoff(...), proc_raise(1),
+ * random_get(near EOF). Captured offline so CI does not need an in-process
+ * native WASI (pins Vitest workers) or a spawn child (OOM-killed on runners).
+ */
+const NODE_WASI_PROBE = {
+  result: [0, 8, 28, 52, 61],
+  resolution: "1",
+} as const;
 
 describe("node:wasi compatibility", () => {
   it("matches Node for stable errno and clock probes", () => {
@@ -63,11 +30,10 @@ describe("node:wasi compatibility", () => {
       ours.wasiImport.proc_raise(1),
       ours.wasiImport.random_get(ourMemory.buffer.byteLength - 2, 4),
     ];
-    const node = probeNodeWasi();
     expect({
       result: ourResult,
       resolution: view.getBigUint64(0, true).toString(),
-    }).toEqual(node);
+    }).toEqual(NODE_WASI_PROBE);
   });
 
   it("requires an explicit supported version", () => {

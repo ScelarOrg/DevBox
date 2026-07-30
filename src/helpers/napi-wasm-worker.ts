@@ -1085,6 +1085,7 @@ const __fsStub = {
 // os stub
 const __osStub = {
   cpus() { return [{ model: 'wasm', speed: 0, times: {} }]; },
+  availableParallelism() { return 1; },
   platform() { return 'linux'; },
   arch() { return 'wasm32'; },
   homedir() { return '/'; },
