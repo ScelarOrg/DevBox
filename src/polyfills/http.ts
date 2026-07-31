@@ -535,7 +535,8 @@ Object.setPrototypeOf(Server.prototype, EventEmitter.prototype);
 
 Server.prototype.listen = function listen(
   portOrOpts?: number | { port?: number; host?: string },
-  hostOrCb?: string | (() => void),
+  hostOrCb?: string | number | (() => void) | null,
+  backlogOrCb?: number | (() => void),
   cb?: () => void,
 ): any {
   let port: number | undefined;
@@ -544,14 +545,44 @@ Server.prototype.listen = function listen(
 
   if (typeof portOrOpts === "number") {
     port = portOrOpts;
-    if (typeof hostOrCb === "string") {
+    // Node parity: listen(port, host, backlog, cb) with optional holes.
+    // Expo/Metro call listen(port, undefined, callback) — the previous
+    // implementation treated undefined host as "no callback" and dropped cb,
+    // so runServer's Promise never resolved and Expo HTML middleware never
+    // attached (GET / → Cannot GET /).
+    if (typeof hostOrCb === "function") {
+      done = hostOrCb;
+    } else if (typeof hostOrCb === "string") {
       host = hostOrCb;
-      done = cb;
-    } else done = hostOrCb;
+      if (typeof backlogOrCb === "function") {
+        done = backlogOrCb;
+      } else if (typeof backlogOrCb === "number") {
+        done = typeof cb === "function" ? cb : undefined;
+      } else {
+        done = typeof cb === "function" ? cb : undefined;
+      }
+    } else if (typeof hostOrCb === "number") {
+      // listen(port, backlog, cb)
+      done = typeof backlogOrCb === "function" ? backlogOrCb : undefined;
+    } else {
+      // host omitted/undefined/null — callback may be 3rd or 4th arg
+      if (typeof backlogOrCb === "function") {
+        done = backlogOrCb;
+      } else if (typeof cb === "function") {
+        done = cb;
+      }
+    }
   } else if (portOrOpts) {
     port = portOrOpts.port;
     host = portOrOpts.host;
-    done = typeof hostOrCb === "function" ? hostOrCb : cb;
+    done =
+      typeof hostOrCb === "function"
+        ? hostOrCb
+        : typeof backlogOrCb === "function"
+          ? backlogOrCb
+          : typeof cb === "function"
+            ? cb
+            : undefined;
   }
 
   const self = this;

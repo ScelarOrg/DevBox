@@ -153,6 +153,10 @@ interface WebSocketConstructor {
   readonly OPEN: number;
   readonly CLOSING: number;
   readonly CLOSED: number;
+  /** Node `ws` package attaches Server on the default export. */
+  Server: any;
+  WebSocket: any;
+  createWebSocketStream: (...args: never[]) => never;
 }
 
 export const WebSocket = function WebSocket(this: any, address: string, protocols?: string | string[]) {
@@ -714,5 +718,13 @@ export const Server = WebSocketServer;
 export const createWebSocketStream = (): never => {
   throw new Error('createWebSocketStream is not available in the browser');
 };
+
+// Match the real `ws` package: default export is WebSocket, with Server (and
+// helpers) hung off it. Expo/Metro do `require("ws").default.Server` /
+// `new (require("ws"))().Server` via interop — without this, Metro's listen
+// callback throws after onReady and never attaches Expo HTML middleware.
+(WebSocket as WebSocketConstructor).Server = WebSocketServer;
+(WebSocket as WebSocketConstructor).WebSocket = WebSocket as WebSocketConstructor;
+(WebSocket as WebSocketConstructor).createWebSocketStream = createWebSocketStream;
 
 export default WebSocket;
