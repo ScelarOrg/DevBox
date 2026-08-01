@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>nodepod example</title>
+        <style>
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }
+            body {
+                font-family: monospace;
+                background: #1a1a2e;
+                color: #e0e0e0;
+                padding: 24px;
+            }
+            h1 {
+                font-size: 18px;
+                margin-bottom: 8px;
+                color: #fff;
+            }
+            p {
+                font-size: 13px;
+                color: #888;
+                margin-bottom: 20px;
+            }
+            #output {
+                background: #0d0d1a;
+                border: 1px solid #333;
+                border-radius: 6px;
+                padding: 16px;
+                min-height: 300px;
+                white-space: pre-wrap;
+                font-size: 14px;
+                line-height: 1.6;
+                overflow-y: auto;
+            }
+            .stdout {
+                color: #a8e6a3;
+            }
+            .stderr {
+                color: #e68a8a;
+            }
+            .info {
+                color: #8ac4e6;
+            }
+            .dim {
+                color: #555;
+            }
+        </style>
+    </head>
+    <body>
+        <h1>nodepod</h1>
+        <p>Open devtools to see logs. Output below.</p>
+        <div id="output"></div>
+
+        <script type="module">
+            import { Nodepod } from "/dist/index.mjs"; // use 'https://esm.sh/@scelar/nodepod' in production
+
+            const out = document.getElementById("output");
+            function log(text, cls = "stdout") {
+                const span = document.createElement("span");
+                span.className = cls;
+                span.textContent = text + "\n";
+                out.appendChild(span);
+                out.scrollTop = out.scrollHeight;
+            }
+
+            log("Booting nodepod...", "info");
+
+            const nodepod = await Nodepod.boot({
+                files: {
+                    "/hello.js": `
+const os = require('os');
+console.log('Hello from nodepod!');
+console.log('Platform:', os.platform());
+console.log('Arch:', os.arch());
+console.log('Node version:', process.version);
+console.log('CWD:', process.cwd());
+console.log('2 + 2 =', 2 + 2);
+        `.trim(),
+
+                    "/server.js": `
+const http = require('http');
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ message: 'Hello from nodepod!', path: req.url }));
+});
+server.listen(3000, () => console.log('Server running on port 3000'));
+        `.trim(),
+                },
+            });
+
+            log("Booted!\n", "info");
+
+            // Run a simple script
+            log("--- Running hello.js ---", "dim");
+            const proc = await nodepod.spawn("node", ["hello.js"]);
+            proc.on("output", (text) => log(text.trimEnd()));
+            proc.on("error", (text) => log(text.trimEnd(), "stderr"));
+            await proc.completion;
+
+            log("\n--- Running shell commands ---", "dim");
+
+            // Run some shell commands
+            const commands = [
+                'echo "writing a file..."',
+                'echo "nodepod is cool" > /tmp/test.txt',
+                "cat /tmp/test.txt",
+                "ls /",
+            ];
+
+            for (const cmd of commands) {
+                log(`$ ${cmd}`, "dim");
+                const p = await nodepod.spawn(cmd);
+                p.on("output", (text) => log(text.trimEnd()));
+                p.on("error", (text) => log(text.trimEnd(), "stderr"));
+                await p.completion;
+            }
+
+            log("\nDone!", "info");
+        </script>
+    </body>
+</html>

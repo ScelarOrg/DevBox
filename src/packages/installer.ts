@@ -1,0 +1,666 @@
+// Dependency Installer
+// Handles the full install lifecycle: resolve, download, extract, transform, bin stubs, lock file.
+
+import { MemoryVolume } from "../memory-volume";
+import { RegistryClient, RegistryConfig } from "./registry-client";
+import {
+  resolveDependencyTree,
+  resolveFromManifest,
+  ResolvedDependency,
+  ResolutionConfig,
+} from "./version-resolver";
+import { downloadAndExtract } from "./archive-extractor";
+import { convertPackage, prepareTransformer } from "../module-transformer";
+import type { PackageManifest } from "../types/manifest";
+import * as path from "../polyfills/path";
+import type { IDBSnapshotCache } from "../persistence/idb-cache";
+import { quickDigest } from "../helpers/digest";
+import {
+  createFilteredBinarySnapshot,
+  restoreBinarySnapshot,
+} from "../persistence/binary-snapshot";
+import { getTarballCache } from "../persistence/tarball-cache";
+import type { PerformanceTracker } from "../performance-tracker";
+import { resolveWithCache } from "./resolution-cache";
+import { writeNpmPackageLock } from "./pm-cli";
+
+const RESOLVER_CACHE_VERSION = 1;
+const SNAPSHOT_CACHE_VERSION = 2;
+
+function stableRecord(record: Record<string, string> | undefined): string {
+  return JSON.stringify(Object.entries(record ?? {}).sort(([a], [b]) => a.localeCompare(b)));
+}
+
+export function manifestSnapshotKey(raw: string, flags: InstallFlags = {}): string {
+  return quickDigest(JSON.stringify({
+    version: SNAPSHOT_CACHE_VERSION,
+    manifest: raw,
+    registry: flags.registry ?? "default",
+    dev: !!flags.withDevDeps,
+    optional: !!flags.withOptionalDeps,
+    transform: isEagerTransform(flags.transformModules) ? "eager" : "lazy",
+  }));
+}
+
+// ---------------------------------------------------------------------------
+// Public types
+// ---------------------------------------------------------------------------
+
+export interface InstallFlags {
+  registry?: string;
+  persist?: boolean;
+  persistDev?: boolean;
+  withDevDeps?: boolean;
+  withOptionalDeps?: boolean;
+  onProgress?: (message: string) => void;
+  /**
+   * Module transform timing. Default is lazy: install only downloads and
+   * extracts; the runtime module loader converts ESM/CJS on first require()
+   * (and caches it). Pass "eager" (or the legacy `true`) to run esbuild over
+   * every installed file at install time like before.
+   */
+  transformModules?: boolean | "eager";
+  /** Prefer lockfile tarball URL + SRI for the root package being installed. */
+  lockEntry?: { resolved?: string; integrity?: string };
+}
+
+// "eager" | true → install-time transforms; false | undefined → lazy (default)
+export function isEagerTransform(value: boolean | "eager" | undefined): boolean {
+  return value === "eager" || value === true;
+}
+
+export function isManifestSnapshotComplete(
+  snapshot: Parameters<typeof restoreBinarySnapshot>[1],
+  workingDir: string,
+  manifest: PackageManifest,
+  flags: InstallFlags = {},
+): boolean {
+  const requiredPackages = {
+    ...manifest.dependencies,
+    ...(flags.withDevDeps ? manifest.devDependencies : undefined),
+  };
+  const cachedPaths = new Set(snapshot.manifest.map((entry) => entry.path));
+  return Object.keys(requiredPackages).every((name) =>
+    cachedPaths.has(path.join(workingDir, "node_modules", name, "package.json")),
+  );
+}
+
+export interface InstallOutcome {
+  resolved: Map<string, ResolvedDependency>;
+  newPackages: string[];
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+// Normalize bin field — handles both shorthand string and object forms
+function normalizeBinField(
+  packageName: string,
+  bin?: string | Record<string, string>,
+): Record<string, string> {
+  if (!bin) return {};
+  if (typeof bin === "string") {
+    const command = packageName.includes("/")
+      ? packageName.split("/").pop()!
+      : packageName;
+    return { [command]: bin };
+  }
+  return bin;
+}
+
+// Walk up from a package directory to the enclosing `node_modules` folder.
+// Handles scoped packages (whose direct parent is the scope dir, not
+// node_modules) and nested placements like `.../foo/node_modules/bar`.
+function enclosingNodeModules(pkgDir: string): string {
+  let dir = path.dirname(pkgDir);
+  while (dir !== "/" && dir !== "" && path.basename(dir) !== "node_modules") {
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return dir;
+}
+
+// Split "express@4.18.2" or "@types/node@20" into name + version
+function splitSpecifier(spec: string): { name: string; version?: string } {
+  if (spec.startsWith("@")) {
+    const slashIdx = spec.indexOf("/");
+    if (slashIdx === -1)
+      throw new Error(`Malformed package specifier: ${spec}`);
+
+    const tail = spec.slice(slashIdx + 1);
+    const atIdx = tail.indexOf("@");
+    if (atIdx === -1) return { name: spec };
+    return {
+      name: spec.slice(0, slashIdx + 1 + atIdx),
+      version: tail.slice(atIdx + 1),
+    };
+  }
+
+  const atIdx = spec.indexOf("@");
+  if (atIdx === -1) return { name: spec };
+  return {
+    name: spec.slice(0, atIdx),
+    version: spec.slice(atIdx + 1),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Main class
+// ---------------------------------------------------------------------------
+
+let transformerReady = false;
+
+export class DependencyInstaller {
+  private vol: MemoryVolume;
+  private registryClient: RegistryClient;
+  private workingDir: string;
+  private _snapshotCache: IDBSnapshotCache | null;
+  private _performance: PerformanceTracker | null;
+
+  constructor(
+    vol: MemoryVolume,
+    opts: {
+      cwd?: string;
+      snapshotCache?: IDBSnapshotCache | null;
+      performanceTracker?: PerformanceTracker | null;
+    } & RegistryConfig = {},
+  ) {
+    this.vol = vol;
+    this.registryClient = new RegistryClient(opts);
+    this.workingDir = opts.cwd || "/";
+    this._snapshotCache = opts.snapshotCache ?? null;
+    this._performance = opts.performanceTracker ?? null;
+  }
+
+  // -----------------------------------------------------------------------
+  // Public API
+  // -----------------------------------------------------------------------
+
+  async install(
+    packageName: string,
+    version?: string,
+    flags: InstallFlags = {},
+  ): Promise<InstallOutcome> {
+    const stopInstall = this._performance?.start("install.total");
+    const { onProgress } = flags;
+
+    const spec = splitSpecifier(packageName);
+    const targetName = spec.name;
+    const targetRange = version || spec.version || "latest";
+
+    onProgress?.(`Resolving ${targetName}@${targetRange}...`);
+
+    const resolutionOpts: ResolutionConfig = {
+      registry: flags.registry
+        ? new RegistryClient({ endpoint: flags.registry })
+        : this.registryClient,
+      devDependencies: flags.withDevDeps,
+      optionalDependencies: flags.withOptionalDeps,
+      onProgress,
+    };
+
+    const stopResolution = this._performance?.start("install.resolve");
+    const resolutionKey = quickDigest(JSON.stringify({
+      version: RESOLVER_CACHE_VERSION,
+      package: targetName,
+      range: targetRange,
+      registry: flags.registry ?? "default",
+      dev: !!flags.withDevDeps,
+      optional: !!flags.withOptionalDeps,
+    }));
+    const resolved = await resolveWithCache(resolutionKey, () =>
+      resolveDependencyTree(targetName, targetRange, resolutionOpts));
+    const tree = resolved.tree;
+    if (resolved.hit) this._performance?.increment("install.resolutionCacheHits");
+    stopResolution?.();
+
+    // Prefer package-lock resolved URL + SRI for the root package (npm ci)
+    if (flags.lockEntry) {
+      const root = tree.get(targetName);
+      if (root) {
+        if (flags.lockEntry.resolved) root.tarballUrl = flags.lockEntry.resolved;
+        if (flags.lockEntry.integrity) root.integrity = flags.lockEntry.integrity;
+      }
+    }
+
+    // snapshot cache keyed by the resolved package set — skips download,
+    // extract, and transform on warm runs (resolution still hit the registry).
+    // TODO(follow-up): upgrade quickDigest to SHA-256 via sync-digest.ts
+    const treeKey = this._snapshotCache
+      ? "tree:" + quickDigest(
+          [...tree].map(([n, d]) => `${n}@${d.version}`).sort().join(",") +
+            "|" + this.workingDir,
+        )
+      : null;
+
+    if (this._snapshotCache && treeKey) {
+      try {
+        const cached = await this._snapshotCache.get(treeKey);
+        if (cached) {
+          onProgress?.("Restoring cached packages...");
+          const stopRestore = this._performance?.start("install.restore");
+          const restored = restoreBinarySnapshot(this.vol, cached);
+          stopRestore?.();
+          // bin stubs + lock file are deterministic — recreate from the tree
+          const nmRoot = path.join(this.workingDir, "node_modules");
+          for (const [depName] of tree) {
+            this.createBinStubs(nmRoot, depName, path.join(nmRoot, depName));
+          }
+          this.writeLockFile(tree);
+          if (flags.persist || flags.persistDev) {
+            const entry = tree.get(targetName);
+            if (entry) {
+              await this.patchManifest(targetName, `^${entry.version}`, !!flags.persistDev);
+            }
+          }
+          onProgress?.(`Restored ${restored} cached entries`);
+          this._performance?.increment("install.cacheHits");
+          stopInstall?.();
+          return { resolved: tree, newPackages: [] };
+        }
+      } catch {
+        // cache error — proceed with normal install
+      }
+    }
+
+    const stopMaterialize = this._performance?.start("install.materialize");
+    const newPkgs = await this.materializePackages(tree, flags);
+    stopMaterialize?.();
+
+    // cache just this tree's package dirs so unrelated node_modules content
+    // from the session doesn't leak into the entry
+    if (this._snapshotCache && treeKey && newPkgs.length > 0) {
+      try {
+        const nmRoot = path.join(this.workingDir, "node_modules");
+        const prefixes = [...tree.keys()].map((n) => path.join(nmRoot, n));
+        const snapshot = createFilteredBinarySnapshot(this.vol, (p) =>
+          prefixes.some((prefix) => p === prefix || p.startsWith(prefix + "/")),
+        );
+        await this._snapshotCache.set(treeKey, snapshot);
+      } catch { /* cache write failure is non-fatal */ }
+    }
+
+    if (flags.persist || flags.persistDev) {
+      const entry = tree.get(targetName);
+      if (entry) {
+        await this.patchManifest(
+          targetName,
+          `^${entry.version}`,
+          !!flags.persistDev,
+        );
+      }
+    }
+
+    onProgress?.(`Installed ${tree.size} package(s)`);
+
+    stopInstall?.();
+    return { resolved: tree, newPackages: newPkgs };
+  }
+
+  async installFromManifest(
+    manifestPath?: string,
+    flags: InstallFlags = {},
+  ): Promise<InstallOutcome> {
+    const stopInstall = this._performance?.start("install.total");
+    const { onProgress } = flags;
+
+    const jsonPath = manifestPath || path.join(this.workingDir, "package.json");
+
+    if (!this.vol.existsSync(jsonPath)) {
+      throw new Error(`Manifest not found at ${jsonPath}`);
+    }
+
+    const raw = this.vol.readFileSync(jsonPath, "utf8");
+    const manifest: PackageManifest = JSON.parse(raw);
+
+    // Check IDB snapshot cache — skip full install if we have a cached node_modules
+    const cacheKey = this._snapshotCache ? manifestSnapshotKey(raw, flags) : null;
+    if (this._snapshotCache && cacheKey) {
+      try {
+        const cached = await this._snapshotCache.get(cacheKey);
+        if (cached && isManifestSnapshotComplete(cached, this.workingDir, manifest, flags)) {
+          onProgress?.("Restoring cached node_modules...");
+          const stopRestore = this._performance?.start("install.restore");
+          const restored = restoreBinarySnapshot(this.vol, cached);
+          stopRestore?.();
+          onProgress?.(`Restored ${restored} cached entries`);
+          this._performance?.increment("install.cacheHits");
+          stopInstall?.();
+          return { resolved: new Map(), newPackages: [] };
+        }
+      } catch {
+        // Cache miss or error — proceed with normal install
+      }
+    }
+
+    onProgress?.("Resolving dependency tree...");
+
+    const resolutionOpts: ResolutionConfig = {
+      registry: flags.registry
+        ? new RegistryClient({ endpoint: flags.registry })
+        : this.registryClient,
+      devDependencies: flags.withDevDeps,
+      optionalDependencies: flags.withOptionalDeps,
+      onProgress,
+    };
+
+    const stopResolution = this._performance?.start("install.resolve");
+    const resolutionKey = quickDigest(JSON.stringify({
+      version: RESOLVER_CACHE_VERSION,
+      registry: flags.registry ?? "default",
+      dependencies: stableRecord(manifest.dependencies),
+      devDependencies: flags.withDevDeps ? stableRecord(manifest.devDependencies) : "",
+      optionalDependencies: flags.withOptionalDeps ? stableRecord(manifest.optionalDependencies) : "",
+    }));
+    const resolved = await resolveWithCache(resolutionKey, () =>
+      resolveFromManifest(manifest, resolutionOpts));
+    const tree = resolved.tree;
+    if (resolved.hit) this._performance?.increment("install.resolutionCacheHits");
+    stopResolution?.();
+
+    const stopMaterialize = this._performance?.start("install.materialize");
+    const newPkgs = await this.materializePackages(tree, flags);
+    stopMaterialize?.();
+
+    // Cache the installed node_modules snapshot for future reuse (raw bytes,
+    // no base64 — restores go through the bulk binary path)
+    if (this._snapshotCache && cacheKey && newPkgs.length > 0) {
+      try {
+        const snapshot = createFilteredBinarySnapshot(this.vol, (p) =>
+          p.includes("/node_modules/"),
+        );
+        await this._snapshotCache.set(cacheKey, snapshot);
+      } catch { /* cache write failure is non-fatal */ }
+    }
+
+    onProgress?.(`Installed ${tree.size} package(s)`);
+
+    stopInstall?.();
+    return { resolved: tree, newPackages: newPkgs };
+  }
+
+  listInstalled(): Record<string, string> {
+    const nmDir = path.join(this.workingDir, "node_modules");
+    if (!this.vol.existsSync(nmDir)) return {};
+
+    const result: Record<string, string> = {};
+    const topLevel = this.vol.readdirSync(nmDir) as string[];
+
+    for (const entry of topLevel) {
+      if (entry.startsWith(".")) continue;
+
+      if (entry.startsWith("@")) {
+        const scopeDir = path.join(nmDir, entry);
+        const scopedEntries = this.vol.readdirSync(scopeDir) as string[];
+        for (const child of scopedEntries) {
+          const manifest = path.join(scopeDir, child, "package.json");
+          if (this.vol.existsSync(manifest)) {
+            const data = JSON.parse(this.vol.readFileSync(manifest, "utf8"));
+            result[`${entry}/${child}`] = data.version;
+          }
+        }
+      } else {
+        const manifest = path.join(nmDir, entry, "package.json");
+        if (this.vol.existsSync(manifest)) {
+          const data = JSON.parse(this.vol.readFileSync(manifest, "utf8"));
+          result[entry] = data.version;
+        }
+      }
+    }
+
+    return result;
+  }
+
+  // -----------------------------------------------------------------------
+  // Private helpers
+  // -----------------------------------------------------------------------
+
+  // Download, extract, transform, and wire up packages not already in node_modules
+  private async materializePackages(
+    tree: Map<string, ResolvedDependency>,
+    flags: InstallFlags,
+  ): Promise<string[]> {
+    const { onProgress } = flags;
+    const additions: string[] = [];
+
+    const nmRoot = path.join(this.workingDir, "node_modules");
+    this.vol.mkdirSync(nmRoot, { recursive: true });
+
+    const pending: Array<{
+      depName: string;
+      dep: ResolvedDependency;
+      targetDir: string;
+    }> = [];
+
+    for (const [depName, dep] of tree) {
+      const targetDir = path.join(nmRoot, depName);
+      const existingManifest = path.join(targetDir, "package.json");
+
+      if (this.vol.existsSync(existingManifest)) {
+        try {
+          const current = JSON.parse(
+            this.vol.readFileSync(existingManifest, "utf8"),
+          );
+          if (current.version === dep.version) {
+            onProgress?.(`Skipping ${depName}@${dep.version} (up to date)`);
+            continue;
+          }
+        } catch {
+          // corrupt manifest, reinstall
+        }
+      }
+
+      pending.push({ depName, dep, targetDir });
+    }
+
+    // Only need main-thread transformer as fallback when workers aren't available
+    const shouldTransform = isEagerTransform(flags.transformModules);
+    if (shouldTransform && !transformerReady) {
+      if (typeof Worker === "undefined") {
+        onProgress?.("Preparing module transformer...");
+        await prepareTransformer();
+      }
+      transformerReady = true;
+    }
+
+    // Safe to batch aggressively since extract + transform are offloaded to workers
+    // downloads stay work-conserving while archive inflation is serialized
+    const WORKER_COUNT = 6;
+    onProgress?.(`Downloading ${pending.length} package(s)...`);
+
+    const byDepth = new Map<number, typeof pending>();
+    for (const item of pending) {
+      const depth = item.depName.split("/node_modules/").length - 1;
+      const group = byDepth.get(depth) ?? [];
+      group.push(item);
+      byDepth.set(depth, group);
+    }
+
+    for (const depth of [...byDepth.keys()].sort((a, b) => a - b)) {
+      const group = byDepth.get(depth)!;
+      let nextPackage = 0;
+      const runLane = async () => {
+        while (nextPackage < group.length) {
+          const { depName, dep, targetDir } = group[nextPackage++];
+          onProgress?.(`  Fetching ${depName}@${dep.version}...`);
+
+          let extracted = false;
+          for (let attempt = 0; attempt < 2 && !extracted; attempt++) {
+            if (attempt > 0) {
+              onProgress?.(`  Retrying ${depName}@${dep.version} after incomplete extraction...`);
+              if (this.vol.existsSync(targetDir)) this.vol.removeTreeSync(targetDir);
+            }
+            try {
+              await downloadAndExtract(dep.tarballUrl, this.vol, targetDir, {
+                stripComponents: 1,
+                expectedShasum: dep.shasum,
+                expectedIntegrity: dep.integrity,
+              });
+              const manifestPath = path.join(targetDir, "package.json");
+              if (!this.vol.existsSync(manifestPath)) {
+                throw new Error(`Package archive did not contain ${manifestPath}`);
+              }
+              extracted = true;
+            } catch (error) {
+              if (attempt === 1) throw error;
+            }
+          }
+
+          if (shouldTransform) {
+            try {
+              const transformed = await convertPackage(
+                this.vol,
+                targetDir,
+                onProgress,
+              );
+              if (transformed > 0) {
+                onProgress?.(
+                  `  Transformed ${transformed} file(s) in ${depName}`,
+                );
+              }
+            } catch (err) {
+              onProgress?.(
+                `  Warning: transformation failed for ${depName}: ${err}`,
+              );
+            }
+          }
+
+          this.createBinStubs(nmRoot, depName, targetDir);
+
+          additions.push(depName);
+        }
+      };
+      await Promise.all(
+        Array.from({ length: Math.min(WORKER_COUNT, group.length) }, () => runLane()),
+      );
+    }
+
+    const incomplete = [...tree.keys()].filter((depName) =>
+      !this.vol.existsSync(path.join(nmRoot, depName, "package.json")),
+    );
+    if (incomplete.length > 0) {
+      throw new Error(`Installation incomplete: missing ${incomplete.join(", ")}`);
+    }
+
+    this.writeLockFile(tree);
+
+    // keep the tarball cache under its byte/age budget (fire and forget)
+    if (additions.length > 0) {
+      getTarballCache()
+        .then((cache) => cache?.prune())
+        .catch(() => {});
+    }
+
+    return additions;
+  }
+
+  private createBinStubs(
+    _nmRoot: string,
+    depName: string,
+    pkgDir: string,
+  ): void {
+    try {
+      const manifestPath = path.join(pkgDir, "package.json");
+      if (!this.vol.existsSync(manifestPath)) return;
+
+      const data = JSON.parse(this.vol.readFileSync(manifestPath, "utf8"));
+      const bins = normalizeBinField(depName, data.bin);
+      // Bin stubs live alongside the enclosing node_modules so nested
+      // deps (e.g. ember-cli/node_modules/foo) get their bins in the
+      // parent's .bin, not the top-level one where they'd collide with a
+      // hoisted version.
+      const binDir = path.join(enclosingNodeModules(pkgDir), ".bin");
+
+      for (const [cmd, relPath] of Object.entries(bins)) {
+        this.vol.mkdirSync(binDir, { recursive: true });
+        const target = path.join(pkgDir, relPath);
+        this.vol.writeFileSync(
+          path.join(binDir, cmd),
+          `node "${target}" "$@"\n`,
+        );
+      }
+    } catch {
+      // best-effort
+    }
+  }
+
+  private writeLockFile(tree: Map<string, ResolvedDependency>): void {
+    const entries: Record<string, { version: string; resolved: string }> = {};
+
+    for (const [depName, dep] of tree) {
+      entries[depName] = {
+        version: dep.version,
+        resolved: dep.tarballUrl,
+      };
+    }
+
+    const lockPath = path.join(
+      this.workingDir,
+      "node_modules",
+      ".package-lock.json",
+    );
+    this.vol.mkdirSync(path.join(this.workingDir, "node_modules"), {
+      recursive: true,
+    });
+    this.vol.writeFileSync(lockPath, JSON.stringify(entries, null, 2));
+
+    let rootPkg: { name?: string; version?: string } | undefined;
+    try {
+      const pjPath = path.join(this.workingDir, "package.json");
+      if (this.vol.existsSync(pjPath)) {
+        const pj = JSON.parse(this.vol.readFileSync(pjPath, "utf8"));
+        rootPkg = { name: pj.name, version: pj.version };
+      }
+    } catch {
+      /* */
+    }
+    writeNpmPackageLock(this.vol, this.workingDir, tree, rootPkg);
+  }
+
+  private async patchManifest(
+    depName: string,
+    versionSpec: string,
+    asDev: boolean,
+  ): Promise<void> {
+    const jsonPath = path.join(this.workingDir, "package.json");
+
+    let manifest: Record<string, unknown> = {};
+    if (this.vol.existsSync(jsonPath)) {
+      manifest = JSON.parse(this.vol.readFileSync(jsonPath, "utf8"));
+    }
+
+    const section = asDev ? "devDependencies" : "dependencies";
+    if (!manifest[section]) {
+      manifest[section] = {};
+    }
+    (manifest[section] as Record<string, string>)[depName] = versionSpec;
+
+    this.vol.writeFileSync(jsonPath, JSON.stringify(manifest, null, 2));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Convenience function
+// ---------------------------------------------------------------------------
+
+// One-shot install: `install("express@4.18.2", vol)`
+export async function install(
+  specifier: string,
+  vol: MemoryVolume,
+  flags?: InstallFlags,
+): Promise<InstallOutcome> {
+  const installer = new DependencyInstaller(vol);
+  return installer.install(specifier, undefined, flags);
+}
+
+export { RegistryClient } from "./registry-client";
+export type {
+  RegistryConfig,
+  VersionDetail,
+  PackageMetadata,
+} from "./registry-client";
+export type { ResolvedDependency, ResolutionConfig } from "./version-resolver";
+export type { ExtractionOptions } from "./archive-extractor";
+export { splitSpecifier };

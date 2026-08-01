@@ -1,0 +1,1586 @@
+// main-thread process lifecycle manager
+// spawns Web Worker processes, routes I/O, syncs VFS, tracks process tree
+
+import { EventEmitter } from "../polyfills/events";
+import type { MemoryVolume } from "../memory-volume";
+import { CDN_WA_SQLITE_WASM } from "../constants/cdn-urls";
+import { isInternalVfsPath } from "../constants/internal-vfs-paths";
+import { precompileWasm } from "../helpers/wasm-cache";
+import { WASM_CACHE_PATH, WASM_SAB_HEADER_BYTES, WASM_SAB_MAX_BYTES } from "../polyfills/sqlite";
+import { ProcessHandle } from "./process-handle";
+import { buildFileSystemBridge } from "../polyfills/fs";
+import { handleFsProxy } from "../helpers/napi-wasm-worker";
+import { isRecoverableWasmPath, prefetchWasmFromCdn } from "../helpers/wasm-cdn";
+import type {
+  SpawnConfig,
+  ProcessInfo,
+  MainToWorker_Init,
+  VFSBinarySnapshot,
+  WorkerToMain_SpawnRequest,
+  WorkerToMain_ForkRequest,
+  WorkerToMain_WorkerThreadRequest,
+  WorkerToMain_WasiWorkerRequest,
+  WorkerToMain_WasiWorkerTerminate,
+  WorkerToMain_SpawnSync,
+  WorkerToMain_HttpResponse,
+  WorkerToMain_HttpClientRequest,
+  WorkerToMain_SqlitePreload,
+} from "./worker-protocol";
+import type { VFSBridge } from "./vfs-bridge";
+import { getRuntimeHost } from "../host/runtime-host";
+import type { HostWorker } from "../host/types";
+import { SLOT_SIZE, decodeSyncSlot } from "./sync-channel";
+import type { PerformanceTracker } from "../performance-tracker";
+
+const MAX_PROCESS_DEPTH = 10;
+const MAX_PROCESSES = 50;
+
+// lean spawn mode: dirs excluded from spawn snapshots at any depth, hydrated
+// lazily by the worker. Mirrors the SDK's shallow-snapshot exclude set.
+const LEAN_EXCLUDE_DIR_NAMES = ["node_modules", ".npm", ".cache"];
+
+function revokeHostWorkerUrl(url: string | null | undefined): void {
+  if (!url) return;
+  try {
+    getRuntimeHost().revokeObjectUrl?.(url);
+  } catch {
+    /* ignore */
+  }
+}
+
+interface WasiBrokerChild {
+  worker: HostWorker;
+  url: string;
+  readyTimer: ReturnType<typeof setTimeout>;
+}
+
+interface WasiBrokerRoot extends WasiBrokerChild {
+  parentPid: number;
+  requestId: number;
+  source: string;
+  ipcListener: (msg: any) => void;
+  loadMessage: any | null;
+  children: Map<number, WasiBrokerChild>;
+}
+
+export class ProcessManager extends EventEmitter {
+  private _processes = new Map<number, ProcessHandle>();
+  private _nextPid = 100;
+  private _volume: MemoryVolume;
+  private _performance: PerformanceTracker | null;
+  private _vfsBridge: VFSBridge | null = null;
+  private _syncBuffer: SharedArrayBuffer | null = null;
+  private _processPorts = new Map<number, MessagePort[]>();
+  private _wasiWorkers = new Map<string, WasiBrokerRoot>();
+  private _nextWasiTid = 0x40000000;
+
+  // port → owning pid
+  private _serverPorts = new Map<number, number>();
+  // parent pid → child pids, used for exit deferral
+  private _childPids = new Map<number, Set<number>>();
+  // pids of children that inherit their parent's stdin. stdin-forward only
+  // routes to pids in this set. stdio:'pipe' kids get their own isolated stdin.
+  private _inheritStdinChildren = new Set<number>();
+  private _httpCallbacks = new Map<
+    number,
+    { pid: number; fn: (resp: WorkerToMain_HttpResponse) => void }
+  >();
+  private _nextHttpRequestId = 1;
+  private static readonly HTTP_REQUEST_TIMEOUT_MS = 300_000;
+
+  constructor(
+    volume: MemoryVolume,
+    performanceTracker: PerformanceTracker | null = null,
+  ) {
+    super();
+    this._volume = volume;
+    this._performance = performanceTracker;
+  }
+
+  setVFSBridge(bridge: VFSBridge): void {
+    this._vfsBridge = bridge;
+  }
+
+  setSyncBuffer(buf: SharedArrayBuffer): void {
+    this._syncBuffer = buf;
+  }
+
+  // "lean" spawns exclude node_modules etc. from snapshots; workers hydrate
+  // lazily over a sync fs proxy (needs SAB). Default "lean" — flip via the
+  // NodepodOptions.spawnSnapshot option.
+  private _spawnSnapshotMode: "full" | "lean" = "lean";
+  private _warnedLeanUnavailable = false;
+
+  setSpawnSnapshotMode(mode: "full" | "lean"): void {
+    this._spawnSnapshotMode = mode;
+  }
+
+  spawn(config: {
+    command: string;
+    args?: string[];
+    cwd?: string;
+    env?: Record<string, string>;
+    parentPid?: number;
+  }): ProcessHandle {
+    const stopSpawn = this._performance?.start("process.ready");
+    if (this._processes.size >= MAX_PROCESSES) {
+      throw new Error(`Process limit exceeded (max ${MAX_PROCESSES})`);
+    }
+
+    if (config.parentPid !== undefined) {
+      let depth = 0;
+      let pid: number | undefined = config.parentPid;
+      while (pid !== undefined && depth < MAX_PROCESS_DEPTH) {
+        const parent = this._processes.get(pid);
+        pid = parent?.parentPid;
+        depth++;
+      }
+      if (depth >= MAX_PROCESS_DEPTH) {
+        throw new Error(`Process tree depth limit exceeded (max ${MAX_PROCESS_DEPTH})`);
+      }
+    }
+
+    const pid = this._nextPid++;
+
+    // lean mode needs SAB in the worker (Atomics.wait for the lazy fs proxy)
+    let lean = this._spawnSnapshotMode === "lean";
+    if (lean && (typeof SharedArrayBuffer === "undefined" || !this._syncBuffer)) {
+      if (!this._warnedLeanUnavailable) {
+        this._warnedLeanUnavailable = true;
+        console.warn(
+          "[nodepod] spawnSnapshot 'lean' requires SharedArrayBuffer (COOP/COEP); falling back to full snapshots",
+        );
+      }
+      lean = false;
+    }
+
+    const stopSnapshot = this._performance?.start("process.snapshot");
+    const snapshot = this._vfsBridge
+      ? this._vfsBridge.createSnapshot(
+          lean ? { excludeDirNames: LEAN_EXCLUDE_DIR_NAMES } : undefined,
+        )
+      : this._createEmptySnapshot();
+    stopSnapshot?.();
+
+    const spawnConfig: SpawnConfig = {
+      command: config.command,
+      args: config.args ?? [],
+      cwd: config.cwd ?? "/",
+      env: config.env ?? {},
+      snapshot,
+      syncBuffer: this._syncBuffer ?? undefined,
+      parentPid: config.parentPid,
+    };
+
+    const stopWorker = this._performance?.start("process.workerConstruct");
+    const worker = this._createWorker();
+    stopWorker?.();
+    if (worker.__nodepodDirect) {
+      this._performance?.increment("process.directWorkers");
+    } else {
+      this._performance?.increment("process.embeddedWorkers");
+    }
+    const directWorker = Boolean(worker.__nodepodDirect);
+    const handle = new ProcessHandle(worker, spawnConfig, directWorker ? () => {
+      this._performance?.increment("process.workerFallbacks");
+      return this._createEmbeddedWorker();
+    } : undefined);
+    handle.on("ready", () => stopSpawn?.());
+    handle.on("worker-error", () => stopSpawn?.());
+    handle.on("exit", () => stopSpawn?.());
+    handle._setPid(pid);
+
+    this._processes.set(pid, handle);
+    this._wireHandleEvents(handle);
+
+    const transferPorts: MessagePort[] = [];
+    const ownedPorts: MessagePort[] = [];
+
+    // lean mode: dedicated fs proxy channel for the worker's own lazy reads
+    let lazyFsPort: MessagePort | undefined;
+    if (lean && snapshot.lazyDirNames) {
+      const lazyBridge = buildFileSystemBridge(this._volume, () => "/");
+      const lazyCh = new MessageChannel();
+      lazyCh.port1.onmessage = (e: MessageEvent) => {
+        const data = e.data;
+        if (!data || typeof data !== "object" || !data.__fs__) return;
+        this._handleFsProxyWithRecovery(data.__fs__, lazyBridge);
+      };
+      lazyCh.port1.start();
+      ownedPorts.push(lazyCh.port1);
+      transferPorts.push(lazyCh.port2);
+      lazyFsPort = lazyCh.port2;
+    }
+
+    const initMsg: MainToWorker_Init = {
+      type: "init",
+      pid,
+      cwd: spawnConfig.cwd,
+      env: spawnConfig.env,
+      snapshot: spawnConfig.snapshot,
+      syncBuffer: spawnConfig.syncBuffer,
+      lazyFsPort,
+      sqliteStartup: this._isDependencyManagementCommand(config.command, config.args ?? [])
+        ? "bytes"
+        : "engine",
+    };
+    this._processPorts.set(pid, ownedPorts);
+    try {
+      handle.init(initMsg, transferPorts);
+    } catch (err) {
+      this._cleanupProcessResources(pid);
+      this._processes.delete(pid);
+      try { worker.terminate(); } catch { /* ignore */ }
+      throw err;
+    }
+
+    this.emit("spawn", pid, config.command, config.args);
+    return handle;
+  }
+
+  private _isDependencyManagementCommand(command: string, args: string[]): boolean {
+    const name = command.replace(/\\/g, "/").split("/").pop()?.toLowerCase() ?? "";
+    const manager = name.replace(/\.(cmd|exe)$/, "");
+    if (manager !== "npm" && manager !== "pnpm" && manager !== "yarn" && manager !== "bun") {
+      return false;
+    }
+    const subcommand = args.find((arg) => !arg.startsWith("-"))?.toLowerCase();
+    return subcommand === undefined
+      || subcommand === "install"
+      || subcommand === "i"
+      || subcommand === "ci"
+      || subcommand === "add"
+      || subcommand === "remove"
+      || subcommand === "uninstall"
+      || subcommand === "update"
+      || subcommand === "up";
+  }
+
+
+  getProcess(pid: number): ProcessHandle | undefined {
+    return this._processes.get(pid);
+  }
+
+  listProcesses(): ProcessInfo[] {
+    const result: ProcessInfo[] = [];
+    for (const [pid, handle] of this._processes) {
+      result.push({
+        pid,
+        command: handle.command,
+        args: handle.args,
+        state: handle.state,
+        exitCode: handle.exitCode,
+        parentPid: handle.parentPid,
+      });
+    }
+    return result;
+  }
+
+  // kills process and all descendants recursively, cleans up server ports
+  kill(pid: number, signal: string = "SIGTERM"): boolean {
+    const handle = this._processes.get(pid);
+    if (!handle) return false;
+    handle.kill(signal);
+    this._killDescendants(pid, signal);
+    this._cleanupServerPorts(pid);
+    return true;
+  }
+
+  private _cleanupServerPorts(pid: number): void {
+    for (const [port, ownerPid] of this._serverPorts) {
+      if (ownerPid === pid) {
+        this._serverPorts.delete(port);
+        this.emit("server-close", pid, port);
+      }
+    }
+    const children = this._childPids.get(pid);
+    if (children) {
+      for (const childPid of children) {
+        this._cleanupServerPorts(childPid);
+      }
+    }
+  }
+
+  private _killDescendants(pid: number, signal: string): void {
+    const children = this._childPids.get(pid);
+    if (!children) return;
+    for (const childPid of children) {
+      const childHandle = this._processes.get(childPid);
+      if (childHandle && childHandle.state !== "exited") {
+        childHandle.kill(signal);
+        // stop stale output from dying workers leaking into the terminal
+        childHandle.removeAllListeners("stdout");
+        childHandle.removeAllListeners("stderr");
+      }
+      this._killDescendants(childPid, signal);
+    }
+  }
+
+  teardown(): void {
+    for (const [pid, handle] of this._processes) {
+      try { handle.kill("SIGKILL"); } catch {
+        /* ignore */
+      }
+    }
+    for (const pid of [...this._processes.keys()]) {
+      this._cleanupProcessResources(pid);
+    }
+    this._processes.clear();
+    this._serverPorts.clear();
+    this._childPids.clear();
+    this._inheritStdinChildren.clear();
+    for (const [requestId, entry] of this._httpCallbacks) {
+      entry.fn({
+        type: "http-response",
+        requestId,
+        statusCode: 503,
+        statusMessage: "Nodepod Teardown",
+        headers: {},
+        body: "Nodepod was torn down",
+      } as WorkerToMain_HttpResponse);
+    }
+    this._httpCallbacks.clear();
+  }
+
+  private _cleanupProcessResources(pid: number): void {
+    const ports = this._processPorts.get(pid);
+    if (ports) {
+      for (const port of ports) {
+        try { port.onmessage = null; port.close(); } catch { /* ignore */ }
+      }
+      this._processPorts.delete(pid);
+    }
+    this._inheritStdinChildren.delete(pid);
+    this._childPids.delete(pid);
+    for (const children of this._childPids.values()) children.delete(pid);
+    for (const [key, owned] of this._wasiWorkers) {
+      if (owned.parentPid !== pid) continue;
+      try { owned.worker.terminate(); } catch { /* ignore */ }
+      revokeHostWorkerUrl(owned.url);
+      clearTimeout(owned.readyTimer);
+      for (const child of owned.children.values()) {
+        clearTimeout(child.readyTimer);
+        try { child.worker.terminate(); } catch { /* ignore */ }
+        revokeHostWorkerUrl(child.url);
+      }
+      owned.children.clear();
+      const parent = this._processes.get(pid);
+      parent?.removeListener("ipc-message", owned.ipcListener);
+      this._wasiWorkers.delete(key);
+    }
+  }
+
+  private _wasiWorkerKey(pid: number, requestId: number): string {
+    return `${pid}:${requestId}`;
+  }
+
+  private _finishWasiWorker(parent: ProcessHandle, requestId: number, exitCode: number): void {
+    const key = this._wasiWorkerKey(parent.pid, requestId);
+    const owned = this._wasiWorkers.get(key);
+    if (!owned) return;
+    this._wasiWorkers.delete(key);
+    parent.removeListener("ipc-message", owned.ipcListener);
+    clearTimeout(owned.readyTimer);
+    try { owned.worker.terminate(); } catch { /* ignore */ }
+    revokeHostWorkerUrl(owned.url);
+    for (const child of owned.children.values()) {
+      clearTimeout(child.readyTimer);
+      try { child.worker.terminate(); } catch { /* ignore */ }
+      revokeHostWorkerUrl(child.url);
+    }
+    owned.children.clear();
+    if (!parent.workerExited) {
+      parent.postMessage({
+        type: "child-exit",
+        requestId,
+        exitCode,
+        stdout: "",
+        stderr: "",
+      });
+    }
+  }
+
+  get processCount(): number {
+    return this._processes.size;
+  }
+
+  registerServerPort(port: number, pid: number): void {
+    this._serverPorts.set(port, pid);
+  }
+
+  unregisterServerPort(port: number): void {
+    this._serverPorts.delete(port);
+  }
+
+  getServerPorts(): number[] {
+    return [...this._serverPorts.keys()];
+  }
+
+  // send HTTP request to the worker that owns the port
+  dispatchHttpRequest(
+    port: number,
+    method: string,
+    path: string,
+    headers: Record<string, string>,
+    body?: string | null,
+  ): Promise<{ statusCode: number; statusMessage: string; headers: Record<string, string | string[]>; body: string | ArrayBuffer }> {
+    const pid = this._serverPorts.get(port);
+    if (pid === undefined) {
+      return Promise.resolve({
+        statusCode: 503,
+        statusMessage: "Service Unavailable",
+        headers: { "Content-Type": "text/plain" },
+        body: `No server on port ${port}`,
+      });
+    }
+
+    const handle = this._processes.get(pid);
+    if (!handle || handle.state === "exited") {
+      this._serverPorts.delete(port);
+      return Promise.resolve({
+        statusCode: 503,
+        statusMessage: "Service Unavailable",
+        headers: { "Content-Type": "text/plain" },
+        body: `Server process exited (pid ${pid})`,
+      });
+    }
+
+    const requestId = this._nextHttpRequestId++;
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this._httpCallbacks.delete(requestId);
+        resolve({
+          statusCode: 504,
+          statusMessage: "Gateway Timeout",
+          headers: { "Content-Type": "text/plain" },
+          body: `No response from server on port ${port}`,
+        });
+      }, ProcessManager.HTTP_REQUEST_TIMEOUT_MS);
+
+      this._httpCallbacks.set(requestId, {
+        pid,
+        fn: (resp) => {
+          clearTimeout(timer);
+          this._httpCallbacks.delete(requestId);
+          resolve({
+            statusCode: resp.statusCode,
+            statusMessage: resp.statusMessage,
+            headers: resp.headers,
+            body: resp.body,
+          });
+        },
+      });
+
+      handle.postMessage({
+        type: "http-request",
+        requestId,
+        port,
+        method,
+        path,
+        headers,
+        body: body ?? null,
+      });
+    });
+  }
+
+  private _handleWorkerHttpClientRequest(
+    clientHandle: ProcessHandle,
+    msg: WorkerToMain_HttpClientRequest,
+  ): void {
+    this.dispatchHttpRequest(
+      msg.port,
+      msg.method,
+      msg.path,
+      msg.headers,
+      msg.body ?? null,
+    )
+      .then((resp) => {
+        let bodyVal: string | ArrayBuffer = "";
+        const transferList: Transferable[] = [];
+        if (resp.body instanceof ArrayBuffer) {
+          bodyVal = resp.body;
+          transferList.push(resp.body);
+        } else if (typeof resp.body === "string") {
+          bodyVal = resp.body;
+        }
+        clientHandle.postMessage(
+          {
+            type: "http-client-response",
+            requestId: msg.requestId,
+            statusCode: resp.statusCode,
+            statusMessage: resp.statusMessage,
+            headers: resp.headers,
+            body: bodyVal,
+          },
+          transferList,
+        );
+      })
+      .catch((err) => {
+        const message = err instanceof Error ? err.message : String(err);
+        clientHandle.postMessage({
+          type: "http-client-response",
+          requestId: msg.requestId,
+          statusCode: 502,
+          statusMessage: "Bad Gateway",
+          headers: { "Content-Type": "text/plain" },
+          body: message,
+        });
+      });
+  }
+
+  // returns owning pid, or -1 if no server found
+  dispatchWsUpgrade(
+    port: number,
+    uid: string,
+    path: string,
+    headers: Record<string, string>,
+  ): number {
+    const pid = this._serverPorts.get(port);
+    if (pid === undefined) {
+      return -1;
+    }
+
+    const handle = this._processes.get(pid);
+    if (!handle || handle.state === "exited") {
+      this._serverPorts.delete(port);
+      return -1;
+    }
+
+    handle.postMessage({ type: "ws-upgrade", uid, port, path, headers });
+    return pid;
+  }
+
+  dispatchWsData(pid: number, uid: string, frame: number[]): void {
+    const handle = this._processes.get(pid);
+    if (!handle || handle.state === "exited") return;
+    handle.postMessage({ type: "ws-data", uid, frame });
+  }
+
+  dispatchWsClose(pid: number, uid: string, code: number): void {
+    const handle = this._processes.get(pid);
+    if (!handle || handle.state === "exited") return;
+    handle.postMessage({ type: "ws-close", uid, code });
+  }
+
+  /**
+   * Try to load the worker bundle from a same-origin asset
+   * (dist/__worker__.js) so spawns don't need the embedded string copy.
+   * Fire-and-forget from boot; until (and unless) it resolves, spawns use
+   * the embedded bundle. Explicit `workerUrl` wins over auto-detection.
+   */
+  static probeExternalWorkerBundle(workerUrl?: string): Promise<void> {
+    const host = getRuntimeHost();
+    if (!host.probeProcessWorkerUrl) return Promise.resolve();
+    return host.probeProcessWorkerUrl(workerUrl).then(() => undefined);
+  }
+
+  static disposeGlobalResources(): void {
+    getRuntimeHost().disposeGlobalResources?.();
+  }
+
+  private _createWasiBootstrap(name: string): { worker: HostWorker; url: string } {
+    const bootstrap = `self.onmessage = (event) => {
+      if (!event.data || !event.data.__nodepod_wasi_init__) return;
+      const init = event.data;
+      globalThis.__nodepodWorkerData = init.workerData;
+      self.onmessage = null;
+      try {
+        (0, eval)(init.source);
+        self.postMessage({ __nodepod_broker_ready__: true });
+      } catch (error) {
+        self.postMessage({ __nodepod_worker_error__: String(error && error.stack || error) });
+      }
+    };`;
+    const worker = getRuntimeHost().createWorker({
+      type: "source",
+      source: bootstrap,
+      name,
+    });
+    return { worker, url: worker.__nodepodRevokeUrl ?? "" };
+  }
+
+  private _handleFsProxyWithRecovery(
+    request: { sab: Int32Array; type: string; payload: any[]; requestId?: number },
+    bridge: ReturnType<typeof buildFileSystemBridge>,
+  ): void {
+    const path = request.payload?.[0];
+    const canRecover = (request.type === "statSync" || request.type === "readFileSync")
+      && isRecoverableWasmPath(path)
+      && !this._volume.existsSync(path);
+    if (!canRecover) {
+      handleFsProxy(request, bridge);
+      return;
+    }
+    void prefetchWasmFromCdn(this._volume, path).finally(() => {
+      handleFsProxy(request, bridge);
+    });
+  }
+
+  private _notifyDelegatedThread(root: WasiBrokerRoot, errorOrTid: number, error: boolean, value: number): void {
+    const memory = root.loadMessage?.__emnapi__?.payload?.wasmMemory as WebAssembly.Memory | undefined;
+    if (!memory || !(memory.buffer instanceof SharedArrayBuffer)) return;
+    const result = new Int32Array(memory.buffer, errorOrTid, 2);
+    Atomics.store(result, 0, error ? 1 : 0);
+    Atomics.store(result, 1, value);
+    Atomics.notify(result, 1);
+  }
+
+  private _spawnDelegatedWasiThread(
+    root: WasiBrokerRoot,
+    fsBridge: ReturnType<typeof buildFileSystemBridge>,
+    payload: { startArg: number; errorOrTid: number },
+  ): void {
+    if (!root.loadMessage) {
+      this._notifyDelegatedThread(root, payload.errorOrTid, true, 6);
+      return;
+    }
+    const tid = this._nextWasiTid++;
+    let child: WasiBrokerChild | null = null;
+    const fail = (): void => {
+      this._notifyDelegatedThread(root, payload.errorOrTid, true, 6);
+      if (!child) return;
+      clearTimeout(child.readyTimer);
+      try { child.worker.terminate(); } catch { /* ignore */ }
+      try {
+        if (child.url) getRuntimeHost().revokeObjectUrl?.(child.url);
+      } catch { /* ignore */ }
+      root.children.delete(tid);
+    };
+    try {
+      const created = this._createWasiBootstrap(`napi-wasi-thread-${tid}`);
+      const readyTimer = setTimeout(fail, 30_000);
+      child = { ...created, readyTimer };
+      root.children.set(tid, child);
+      created.worker.onmessage = (event) => {
+        const data = event.data as any;
+        if (data && typeof data === "object" && data.__fs__) {
+          this._handleFsProxyWithRecovery(data.__fs__, fsBridge);
+          return;
+        }
+        if (data?.__nodepod_worker_error__) {
+          fail();
+          return;
+        }
+        if (data?.__nodepod_broker_ready__) {
+          clearTimeout(readyTimer);
+          created.worker.postMessage(root.loadMessage);
+          return;
+        }
+        const emnapi = data?.__emnapi__;
+        if (emnapi?.type === "loaded") {
+          created.worker.postMessage({
+            __emnapi__: {
+              type: "start",
+              payload: { tid, arg: payload.startArg },
+            },
+          });
+          this._notifyDelegatedThread(root, payload.errorOrTid, false, tid);
+          return;
+        }
+        if (emnapi?.type === "spawn-thread") {
+          this._spawnDelegatedWasiThread(root, fsBridge, emnapi.payload);
+          return;
+        }
+        if (emnapi?.type === "cleanup-thread") {
+          clearTimeout(readyTimer);
+          try { created.worker.terminate(); } catch { /* ignore */ }
+          revokeHostWorkerUrl(created.url);
+          root.children.delete(tid);
+        }
+      };
+      created.worker.onerror = fail;
+      created.worker.postMessage({
+        __nodepod_wasi_init__: true,
+        source: root.source,
+        workerData: null,
+      });
+    } catch {
+      fail();
+    }
+  }
+
+  resourceStats(): { processes: number; workers: number; messagePorts: number; pendingHttp: number } {
+    let messagePorts = 0;
+    for (const ports of this._processPorts.values()) messagePorts += ports.length;
+    let wasiWorkers = 0;
+    for (const root of this._wasiWorkers.values()) wasiWorkers += 1 + root.children.size;
+    return {
+      processes: this._processes.size,
+      workers: this._processes.size + wasiWorkers,
+      messagePorts,
+      pendingHttp: this._httpCallbacks.size,
+    };
+  }
+
+  private _createWorker(): HostWorker {
+    return getRuntimeHost().createWorker({ type: "process" });
+  }
+
+  private _createEmbeddedWorker(): HostWorker {
+    return getRuntimeHost().createWorker({ type: "process", embedded: true });
+  }
+
+  private _wireHandleEvents(handle: ProcessHandle): void {
+    // forward signals to all descendants, works whether parent is running or exited
+    handle.on("signal", (signal: string) => {
+      this._killDescendants(handle.pid, signal);
+    });
+
+    // forward stdin to children even when parent is blocked on Atomics.wait.
+    // only routes to stdio:'inherit' children; stdio:'pipe' kids are isolated.
+    handle.on("stdin-forward", (data: string) => {
+      const children = this._childPids.get(handle.pid);
+      if (children) {
+        for (const childPid of children) {
+          if (!this._inheritStdinChildren.has(childPid)) continue;
+          const childHandle = this._processes.get(childPid);
+          if (childHandle && childHandle.state !== "exited") {
+            childHandle.sendStdin(data);
+          }
+        }
+      }
+    });
+
+    handle.on("exit", (exitCode: number) => {
+      for (const [port, pid] of this._serverPorts) {
+        if (pid === handle.pid) {
+          this._serverPorts.delete(port);
+          this.emit("server-close", handle.pid, port);
+        }
+      }
+      // drain pending HTTP callbacks for this worker so they don't leak
+      for (const [reqId, entry] of this._httpCallbacks) {
+        if (entry.pid !== handle.pid) continue;
+        entry.fn({
+          type: "http-response",
+          requestId: reqId,
+          statusCode: 503,
+          statusMessage: "Worker Exited",
+          headers: {},
+          body: "Worker process exited before completing the request",
+        } as WorkerToMain_HttpResponse);
+      }
+      this.emit("exit", handle.pid, exitCode);
+      // delayed so event handlers finish first
+      setTimeout(() => {
+        this._cleanupProcessResources(handle.pid);
+        this._processes.delete(handle.pid);
+      }, 100);
+    });
+
+    handle.on("vfs-write", (path: string, content: ArrayBuffer, isDirectory: boolean) => {
+      if (this._vfsBridge) {
+        if (isDirectory) {
+          this._vfsBridge.handleWorkerMkdir(path);
+        } else {
+          this._vfsBridge.handleWorkerWrite(path, new Uint8Array(content));
+        }
+        if (!isInternalVfsPath(path)) {
+          this._vfsBridge.broadcastChange(path, content, isDirectory, handle.pid);
+        }
+      }
+    });
+
+    handle.on("vfs-delete", (path: string) => {
+      if (this._vfsBridge) {
+        this._vfsBridge.handleWorkerDelete(path);
+        if (!isInternalVfsPath(path)) {
+          this._vfsBridge.broadcastChange(path, null, false, handle.pid);
+        }
+      }
+    });
+
+    handle.on("vfs-snapshot", (snapshot: VFSBinarySnapshot) => {
+      if (!this._vfsBridge) return;
+      this._vfsBridge.handleWorkerSnapshot(snapshot);
+      for (const [pid, peer] of this._processes) {
+        if (pid === handle.pid || peer.state === "exited") continue;
+        const data = snapshot.data.slice(0);
+        peer.postMessage({
+          type: "vfs-snapshot",
+          snapshot: { ...snapshot, data },
+        }, [data]);
+      }
+    });
+
+    handle.on("spawn-request", (msg: WorkerToMain_SpawnRequest) => {
+      // Quote args that need it so spaces/metacharacters survive shell parsing.
+      const quoteShell = (a: string) =>
+        a === ""
+          ? "''"
+          : /^[a-zA-Z0-9_./:@%+=,-]+$/.test(a)
+            ? a
+            : `'${a.replace(/'/g, `'\\''`)}'`;
+      const fullCmd = msg.args.length
+        ? `${quoteShell(msg.command)} ${msg.args.map(quoteShell).join(" ")}`
+        : quoteShell(msg.command);
+      try {
+        const childHandle = this.spawn({
+          command: msg.command,
+          args: msg.args,
+          cwd: msg.cwd,
+          env: msg.env,
+          parentPid: handle.pid,
+        });
+
+        if (!this._childPids.has(handle.pid)) {
+          this._childPids.set(handle.pid, new Set());
+        }
+        this._childPids.get(handle.pid)!.add(childHandle.pid);
+
+        // remember stdio:inherit so stdin-forward routes parent's stdin here.
+        // msg.stdio can be the legacy string or node's [stdin, stdout, stderr].
+        const inheritsStdin = msg.stdio === "inherit"
+          || (Array.isArray(msg.stdio) && msg.stdio[0] === "inherit");
+        if (inheritsStdin) this._inheritStdinChildren.add(childHandle.pid);
+
+        // defer parent exit/done until child finishes (e.g. create-vite -> vite dev)
+        handle.holdExit();
+        handle.holdShellDone();
+
+        handle.postMessage({
+          type: "spawn-result",
+          requestId: msg.requestId,
+          pid: childHandle.pid,
+        });
+
+        // bare `node` invocations go through as direct execution
+        const isNodeBin = /(?:^|\/)node$/.test(msg.command);
+        const sendExec = () => {
+          if (isNodeBin && msg.args.length > 0) {
+            childHandle.exec({
+              type: "exec",
+              filePath: msg.args[0],
+              args: msg.args.slice(1),
+              cwd: msg.cwd,
+              env: msg.env,
+              isShell: false,
+            });
+          } else {
+            childHandle.exec({
+              type: "exec",
+              filePath: "",
+              args: msg.args,
+              cwd: msg.cwd,
+              env: msg.env,
+              isShell: true,
+              shellCommand: fullCmd,
+            });
+          }
+        };
+
+        if (childHandle.state === "running") {
+          sendExec();
+        } else {
+          childHandle.on("ready", sendExec);
+        }
+
+        // relay child output — direct emit if parent is done, postMessage otherwise
+        childHandle.on("stdout", (data: string) => {
+          if (handle.workerExited || handle.shellCommandDone) {
+            handle.emit("stdout", data);
+          } else {
+            handle.postMessage({
+              type: "child-output",
+              requestId: msg.requestId,
+              stream: "stdout",
+              data,
+            });
+          }
+        });
+        childHandle.on("stderr", (data: string) => {
+          if (handle.workerExited || handle.shellCommandDone) {
+            handle.emit("stderr", data);
+          } else {
+            handle.postMessage({
+              type: "child-output",
+              requestId: msg.requestId,
+              stream: "stderr",
+              data,
+            });
+          }
+        });
+
+        childHandle.on("stdin-raw-status", (isRaw: boolean) => {
+          handle.emit("stdin-raw-status", isRaw);
+        });
+
+        childHandle.on("exit", (exitCode: number) => {
+          if (!handle.workerExited) {
+            handle.postMessage({
+              type: "child-exit",
+              requestId: msg.requestId,
+              exitCode,
+              stdout: childHandle.stdout,
+              stderr: childHandle.stderr,
+            });
+          }
+          const children = this._childPids.get(handle.pid);
+          if (children) {
+            children.delete(childHandle.pid);
+            if (children.size === 0) this._childPids.delete(handle.pid);
+          }
+          this._inheritStdinChildren.delete(childHandle.pid);
+          handle.releaseExit();
+          handle.releaseShellDone();
+        });
+      } catch (e) {
+        handle.postMessage({
+          type: "spawn-result",
+          requestId: msg.requestId,
+          pid: -1,
+          error: e instanceof Error ? e.message : String(e),
+        });
+      }
+    });
+
+    handle.on("fork-request", (msg: WorkerToMain_ForkRequest) => {
+      try {
+        const childHandle = this.spawn({
+          command: "node",
+          args: [msg.modulePath, ...msg.args],
+          cwd: msg.cwd,
+          env: msg.env,
+          parentPid: handle.pid,
+        });
+
+        if (!this._childPids.has(handle.pid)) {
+          this._childPids.set(handle.pid, new Set());
+        }
+        this._childPids.get(handle.pid)!.add(childHandle.pid);
+        handle.holdExit();
+        handle.holdShellDone();
+
+        handle.postMessage({
+          type: "spawn-result",
+          requestId: msg.requestId,
+          pid: childHandle.pid,
+        });
+
+        const sendExec = () => {
+          childHandle.exec({
+            type: "exec",
+            filePath: msg.modulePath,
+            args: msg.args,
+            cwd: msg.cwd,
+            env: msg.env,
+            isShell: false,
+            isFork: true,
+          });
+        };
+
+        if (childHandle.state === "running") {
+          sendExec();
+        } else {
+          childHandle.on("ready", sendExec);
+        }
+
+        childHandle.on("stdout", (data: string) => {
+          if (handle.workerExited || handle.shellCommandDone) {
+            handle.emit("stdout", data);
+          } else {
+            handle.postMessage({
+              type: "child-output",
+              requestId: msg.requestId,
+              stream: "stdout",
+              data,
+            });
+          }
+        });
+        childHandle.on("stderr", (data: string) => {
+          if (handle.workerExited || handle.shellCommandDone) {
+            handle.emit("stderr", data);
+          } else {
+            handle.postMessage({
+              type: "child-output",
+              requestId: msg.requestId,
+              stream: "stderr",
+              data,
+            });
+          }
+        });
+
+        // IPC child → parent
+        childHandle.on("ipc-message", (ipcMsg: any) => {
+          const payload = ipcMsg?.data ?? ipcMsg;
+          if (!handle.workerExited) {
+            handle.postMessage({
+              type: "ipc-message",
+              targetRequestId: msg.requestId,
+              data: payload,
+            } as any);
+          }
+        });
+
+        // IPC parent → child
+        handle.on("ipc-message", (ipcMsg: any) => {
+          if (ipcMsg.targetRequestId === msg.requestId) {
+            childHandle.postMessage({
+              type: "ipc-message",
+              data: ipcMsg.data,
+            });
+          }
+        });
+
+        childHandle.on("exit", (exitCode: number) => {
+          if (!handle.workerExited) {
+            handle.postMessage({
+              type: "child-exit",
+              requestId: msg.requestId,
+              exitCode,
+              stdout: childHandle.stdout,
+              stderr: childHandle.stderr,
+            });
+          }
+          const children = this._childPids.get(handle.pid);
+          if (children) {
+            children.delete(childHandle.pid);
+            if (children.size === 0) this._childPids.delete(handle.pid);
+          }
+          this._inheritStdinChildren.delete(childHandle.pid);
+          handle.releaseExit();
+          handle.releaseShellDone();
+        });
+      } catch (e) {
+        handle.postMessage({
+          type: "spawn-result",
+          requestId: msg.requestId,
+          pid: -1,
+          error: e instanceof Error ? e.message : String(e),
+        });
+      }
+    });
+
+    handle.on("workerthread-request", (msg: WorkerToMain_WorkerThreadRequest) => {
+      try {
+        let modulePath = msg.modulePath;
+        // eval mode — write code to a temp VFS file
+        if (msg.isEval) {
+          const evalPath = `/__wt_eval_${msg.threadId}__.js`;
+          this._volume.writeFileSync(evalPath, msg.modulePath);
+          modulePath = evalPath;
+          if (this._vfsBridge) {
+            const encoder = new TextEncoder();
+            const content = encoder.encode(msg.modulePath).buffer as ArrayBuffer;
+            this._vfsBridge.handleWorkerWrite(evalPath, new Uint8Array(content));
+            this._vfsBridge.broadcastChange(evalPath, content, false, handle.pid);
+          }
+        }
+
+        const childHandle = this.spawn({
+          command: "node",
+          args: [modulePath],
+          cwd: msg.cwd,
+          env: msg.env,
+          parentPid: handle.pid,
+        });
+
+        if (!this._childPids.has(handle.pid)) {
+          this._childPids.set(handle.pid, new Set());
+        }
+        this._childPids.get(handle.pid)!.add(childHandle.pid);
+        handle.holdExit();
+        handle.holdShellDone();
+
+        handle.postMessage({
+          type: "spawn-result",
+          requestId: msg.requestId,
+          pid: childHandle.pid,
+        });
+
+        const sendExec = () => {
+          childHandle.exec({
+            type: "exec",
+            filePath: modulePath,
+            args: msg.args || [],
+            cwd: msg.cwd,
+            env: msg.env,
+            isShell: false,
+            isFork: true,
+            isWorkerThread: true,
+            workerData: msg.workerData,
+            threadId: msg.threadId,
+          });
+        };
+
+        if (childHandle.state === "running") {
+          sendExec();
+        } else {
+          childHandle.on("ready", sendExec);
+        }
+
+        childHandle.on("stdout", (data: string) => {
+          if (handle.workerExited || handle.shellCommandDone) {
+            handle.emit("stdout", data);
+          } else {
+            handle.postMessage({
+              type: "child-output",
+              requestId: msg.requestId,
+              stream: "stdout",
+              data,
+            });
+          }
+        });
+        childHandle.on("stderr", (data: string) => {
+          if (handle.workerExited || handle.shellCommandDone) {
+            handle.emit("stderr", data);
+          } else {
+            handle.postMessage({
+              type: "child-output",
+              requestId: msg.requestId,
+              stream: "stderr",
+              data,
+            });
+          }
+        });
+
+        childHandle.on("ipc-message", (ipcMsg: any) => {
+          const payload = ipcMsg?.data ?? ipcMsg;
+          if (!handle.workerExited) {
+            handle.postMessage({
+              type: "ipc-message",
+              targetRequestId: msg.requestId,
+              data: payload,
+            } as any);
+          }
+        });
+
+        handle.on("ipc-message", (ipcMsg: any) => {
+          if (ipcMsg.targetRequestId === msg.requestId) {
+            childHandle.postMessage({
+              type: "ipc-message",
+              data: ipcMsg.data,
+            });
+          }
+        });
+
+        childHandle.on("exit", (exitCode: number) => {
+          if (msg.isEval) {
+            try {
+              this._volume.unlinkSync(`/__wt_eval_${msg.threadId}__.js`);
+            } catch {
+              /* ignore */
+            }
+          }
+
+          if (!handle.workerExited) {
+            handle.postMessage({
+              type: "child-exit",
+              requestId: msg.requestId,
+              exitCode,
+              stdout: childHandle.stdout,
+              stderr: childHandle.stderr,
+            });
+          }
+          const children = this._childPids.get(handle.pid);
+          if (children) {
+            children.delete(childHandle.pid);
+            if (children.size === 0) this._childPids.delete(handle.pid);
+          }
+          this._inheritStdinChildren.delete(childHandle.pid);
+          handle.releaseExit();
+          handle.releaseShellDone();
+        });
+      } catch (e) {
+        handle.postMessage({
+          type: "spawn-result",
+          requestId: msg.requestId,
+          pid: -1,
+          error: e instanceof Error ? e.message : String(e),
+        });
+      }
+    });
+
+    handle.on("wasiworker-request", (msg: WorkerToMain_WasiWorkerRequest) => {
+      const key = this._wasiWorkerKey(handle.pid, msg.requestId);
+      try {
+        if (this._wasiWorkers.has(key)) throw new Error(`duplicate WASI worker request ${msg.requestId}`);
+        const { worker, url } = this._createWasiBootstrap(msg.name);
+        const fsBridge = buildFileSystemBridge(this._volume, () => "/");
+        const earlyMessages: unknown[] = [];
+        let ready = false;
+        let owned: WasiBrokerRoot;
+        const ipcListener = (ipcMsg: any): void => {
+          if (ipcMsg.targetRequestId !== msg.requestId) return;
+          if (ipcMsg.data?.__emnapi__?.type === "load") owned.loadMessage = ipcMsg.data;
+          if (!ready) {
+            earlyMessages.push(ipcMsg.data);
+            return;
+          }
+          worker.postMessage(ipcMsg.data);
+        };
+        const readyTimer = setTimeout(() => {
+          handle.postMessage({
+            type: "ipc-message",
+            targetRequestId: msg.requestId,
+            data: { __nodepod_worker_error__: "WASI worker ready handshake timed out" },
+          } as any);
+          this._finishWasiWorker(handle, msg.requestId, 1);
+        }, 30_000);
+        owned = {
+          worker,
+          url,
+          parentPid: handle.pid,
+          requestId: msg.requestId,
+          source: msg.source,
+          ipcListener,
+          readyTimer,
+          loadMessage: null,
+          children: new Map(),
+        };
+        this._wasiWorkers.set(key, owned);
+        handle.on("ipc-message", ipcListener);
+        worker.onmessage = (event) => {
+          const data = event.data as any;
+          if (data && typeof data === "object" && data.__fs__) {
+            this._handleFsProxyWithRecovery(data.__fs__, fsBridge);
+            return;
+          }
+          if (data && typeof data === "object" && data.__nodepod_worker_error__) {
+            handle.postMessage({
+              type: "ipc-message",
+              targetRequestId: msg.requestId,
+              data,
+            } as any);
+            this._finishWasiWorker(handle, msg.requestId, 1);
+            return;
+          }
+          if (data && typeof data === "object" && data.__nodepod_broker_ready__) {
+            ready = true;
+            clearTimeout(readyTimer);
+            for (const queued of earlyMessages.splice(0)) worker.postMessage(queued);
+          }
+          if (data?.__emnapi__?.type === "spawn-thread") {
+            this._spawnDelegatedWasiThread(owned, fsBridge, data.__emnapi__.payload);
+            return;
+          }
+          if (data && typeof data === "object" && data.__nodepod_worker_exit__ !== undefined) {
+            this._finishWasiWorker(handle, msg.requestId, Number(data.__nodepod_worker_exit__) || 0);
+            return;
+          }
+          handle.postMessage({ type: "ipc-message", targetRequestId: msg.requestId, data } as any);
+        };
+        worker.onerror = (event) => {
+          handle.postMessage({
+            type: "ipc-message",
+            targetRequestId: msg.requestId,
+            data: { __nodepod_worker_error__: event.message || "WASI worker error" },
+          } as any);
+          this._finishWasiWorker(handle, msg.requestId, 1);
+        };
+        worker.postMessage({
+          __nodepod_wasi_init__: true,
+          source: msg.source,
+          workerData: msg.workerData,
+        });
+        handle.postMessage({ type: "spawn-result", requestId: msg.requestId, pid: 0 });
+      } catch (error) {
+        handle.postMessage({
+          type: "spawn-result",
+          requestId: msg.requestId,
+          pid: -1,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    });
+
+    handle.on("wasiworker-terminate", (msg: WorkerToMain_WasiWorkerTerminate) => {
+      this._finishWasiWorker(handle, msg.requestId, 1);
+    });
+
+    handle.on("sqlite-preload", (msg: WorkerToMain_SqlitePreload) => {
+      handle.holdSync();
+      void this._handleSqlitePreload(handle, msg.sab).finally(() => {
+        handle.releaseSync();
+      });
+    });
+
+    handle.on("spawn-sync", (msg: WorkerToMain_SpawnSync) => {
+      if (!this._syncBuffer) {
+        return;
+      }
+
+      const quoteShell = (a: string) =>
+        a === ""
+          ? "''"
+          : /^[a-zA-Z0-9_./:@%+=,-]+$/.test(a)
+            ? a
+            : `'${a.replace(/'/g, `'\\''`)}'`;
+      const fullCmd = msg.shellCommand ??
+        (msg.args.length
+          ? `${quoteShell(msg.command)} ${msg.args.map(quoteShell).join(" ")}`
+          : quoteShell(msg.command));
+      const maxStdoutLen = (SLOT_SIZE - 3) * 4;
+      const { slot: syncSlotIndex } = decodeSyncSlot(msg.syncSlot);
+
+      const signalError = (exitCode: number) => {
+        try {
+          const int32 = new Int32Array(this._syncBuffer!);
+          const slotBase = syncSlotIndex * SLOT_SIZE;
+          Atomics.store(int32, slotBase + 1, exitCode);
+          Atomics.store(int32, slotBase + 2, 0);
+          Atomics.store(int32, slotBase, 2); // STATUS_ERROR
+          Atomics.notify(int32, slotBase);
+        } catch {
+          // buffer unusable, worker will time out
+        }
+      };
+
+      try {
+        const childHandle = this.spawn({
+          command: msg.command,
+          args: msg.args,
+          cwd: msg.cwd,
+          env: msg.env,
+          parentPid: handle.pid,
+        });
+
+        // must track for Ctrl+C signal propagation via _killDescendants
+        if (!this._childPids.has(handle.pid)) {
+          this._childPids.set(handle.pid, new Set());
+        }
+        this._childPids.get(handle.pid)!.add(childHandle.pid);
+
+        // spawnSync defaults to 'inherit' when stdio is omitted (matches node,
+        // since it's usually used for interactive children like npm install
+        // under create-vite).
+        const stdinInherits = !msg.stdio || msg.stdio[0] === "inherit";
+        if (stdinInherits) this._inheritStdinChildren.add(childHandle.pid);
+
+        handle.holdExit();
+        handle.holdShellDone();
+        handle.holdSync(); // parent is blocked on Atomics.wait — stdin has to bypass
+
+        const sendExec = () => {
+          childHandle.exec({
+            type: "exec",
+            filePath: "",
+            args: msg.args,
+            cwd: msg.cwd,
+            env: msg.env,
+            isShell: true,
+            shellCommand: fullCmd,
+          });
+        };
+
+        if (childHandle.state === "running") {
+          sendExec();
+        } else {
+          childHandle.on("ready", sendExec);
+        }
+
+        // parent is blocked on Atomics.wait, can't process postMessage — emit directly
+        childHandle.on("stdout", (data: string) => {
+          handle.emit("stdout", data);
+        });
+        childHandle.on("stderr", (data: string) => {
+          handle.emit("stderr", data);
+        });
+
+        childHandle.on("stdin-raw-status", (isRaw: boolean) => {
+          handle.emit("stdin-raw-status", isRaw);
+        });
+
+        childHandle.on("exit", (exitCode: number) => {
+          try {
+            const int32 = new Int32Array(this._syncBuffer!);
+            const encoder = new TextEncoder();
+            const slotBase = syncSlotIndex * SLOT_SIZE;
+            const stdoutBytes = encoder.encode(childHandle.stdout);
+            const truncatedLen = Math.min(stdoutBytes.byteLength, maxStdoutLen);
+
+            Atomics.store(int32, slotBase + 1, exitCode);
+            Atomics.store(int32, slotBase + 2, truncatedLen);
+
+            const uint8 = new Uint8Array(this._syncBuffer!);
+            const dataOffset = (slotBase + 3) * 4;
+            uint8.set(stdoutBytes.subarray(0, truncatedLen), dataOffset);
+
+            // last store wakes the waiting worker
+            Atomics.store(int32, slotBase, 1);
+            Atomics.notify(int32, slotBase);
+          } catch {
+            signalError(1);
+          }
+
+          const children = this._childPids.get(handle.pid);
+          if (children) {
+            children.delete(childHandle.pid);
+            if (children.size === 0) this._childPids.delete(handle.pid);
+          }
+          this._inheritStdinChildren.delete(childHandle.pid);
+
+          handle.releaseSync();
+          handle.releaseExit();
+          handle.releaseShellDone();
+        });
+
+        childHandle.on("worker-error", () => {
+          signalError(1);
+          const children = this._childPids.get(handle.pid);
+          if (children) {
+            children.delete(childHandle.pid);
+            if (children.size === 0) this._childPids.delete(handle.pid);
+          }
+          this._inheritStdinChildren.delete(childHandle.pid);
+          handle.releaseSync();
+          handle.releaseExit();
+          handle.releaseShellDone();
+        });
+      } catch {
+        signalError(1);
+      }
+    });
+
+    handle.on("server-listen", (port: number, hostname: string) => {
+      this.registerServerPort(port, handle.pid);
+      this.emit("server-listen", handle.pid, port, hostname);
+    });
+
+    handle.on("server-close", (port: number) => {
+      this.unregisterServerPort(port);
+      this.emit("server-close", handle.pid, port);
+    });
+
+    handle.on("http-response", (msg: WorkerToMain_HttpResponse) => {
+      const entry = this._httpCallbacks.get(msg.requestId);
+      if (entry) entry.fn(msg);
+    });
+
+    handle.on("http-client-request", (msg: WorkerToMain_HttpClientRequest) => {
+      this._handleWorkerHttpClientRequest(handle, msg);
+    });
+
+    handle.on("ws-frame", (msg: any) => {
+      this.emit("ws-frame", msg);
+    });
+
+    handle.on("cwd-change", (cwd: string) => {
+      this.emit("cwd-change", handle.pid, cwd);
+    });
+
+    handle.on("stdin-raw-status", (isRaw: boolean) => {
+      this.emit("stdin-raw-status", handle.pid, isRaw);
+    });
+
+    handle.on("worker-error", (message: string, stack?: string) => {
+      this.emit("error", handle.pid, message, stack);
+    });
+  }
+
+  private static readonly SAB_STATUS_PENDING = 0;
+  private static readonly SAB_STATUS_OK = 1;
+  private static readonly SAB_STATUS_FAIL = 2;
+
+  private async _handleSqlitePreload(
+    handle: ProcessHandle,
+    sab: Int32Array,
+  ): Promise<void> {
+    const notify = (status: number, byteLength = 0): void => {
+      Atomics.store(sab, 1, byteLength);
+      Atomics.store(sab, 0, status);
+      Atomics.notify(sab, 0);
+    };
+
+    try {
+      const payloadView = new Uint8Array(
+        sab.buffer,
+        WASM_SAB_HEADER_BYTES,
+        WASM_SAB_MAX_BYTES,
+      );
+
+      let bytes: Uint8Array;
+      if (this._volume.existsSync(WASM_CACHE_PATH)) {
+        bytes = new Uint8Array(this._volume.readFileSync(WASM_CACHE_PATH));
+      } else {
+        const resp = await fetch(CDN_WA_SQLITE_WASM);
+        if (!resp.ok) {
+          throw new Error(`fetch wa-sqlite.wasm failed: ${resp.status}`);
+        }
+        bytes = new Uint8Array(await resp.arrayBuffer());
+        if (this._vfsBridge) {
+          this._vfsBridge.handleWorkerWrite(WASM_CACHE_PATH, bytes);
+        } else {
+          const parent = WASM_CACHE_PATH.substring(
+            0,
+            WASM_CACHE_PATH.lastIndexOf("/"),
+          );
+          if (parent && !this._volume.existsSync(parent)) {
+            this._volume.mkdirSync(parent, { recursive: true });
+          }
+          this._volume.writeFileSync(WASM_CACHE_PATH, bytes);
+        }
+        precompileWasm(bytes);
+      }
+
+      if (bytes.byteLength > payloadView.byteLength) {
+        throw new Error(
+          `wa-sqlite.wasm too large for preload SAB (${bytes.byteLength} > ${payloadView.byteLength})`,
+        );
+      }
+
+      payloadView.set(bytes);
+      notify(ProcessManager.SAB_STATUS_OK, bytes.byteLength);
+    } catch (err) {
+      if (typeof console !== "undefined") {
+        console.warn("[node:sqlite] host preload failed:", err);
+      }
+      notify(ProcessManager.SAB_STATUS_FAIL);
+    }
+  }
+
+  private _createEmptySnapshot(): VFSBinarySnapshot {
+    return {
+      manifest: [],
+      data: new ArrayBuffer(0),
+    };
+  }
+
+  // content larger than this is broadcast as a path-only invalidation in lean
+  // mode — workers drop their copy and re-pull over the lazy fs proxy.
+  // TODO(plan 013/011): once lean spawns are the default, the invalidation
+  // path can become the norm for all sizes (pure pull model, no byte traffic).
+  private static readonly VFS_BROADCAST_MAX_BYTES = 4 * 1024 * 1024;
+
+  broadcastVFSChange(path: string, content: ArrayBuffer | null, isDirectory: boolean, excludePid: number): void {
+    // build the outgoing payload once — postMessage without a transfer list
+    // structured-clones per recipient, so no explicit per-recipient copy is
+    // needed on the main thread. copy only if the source is SAB-backed
+    // (TypeScript lets SAB satisfy ArrayBuffer; SAB can't be cloned to workers)
+    let payload: ArrayBuffer | null = null;
+    if (content) {
+      if (typeof SharedArrayBuffer !== "undefined" && (content as unknown) instanceof SharedArrayBuffer) {
+        payload = new ArrayBuffer(content.byteLength);
+        new Uint8Array(payload).set(new Uint8Array(content));
+      } else {
+        payload = content;
+      }
+    }
+
+    // size gate: only when workers can re-pull the bytes (lean mode + SAB)
+    const invalidateInstead =
+      payload !== null &&
+      !isDirectory &&
+      payload.byteLength > ProcessManager.VFS_BROADCAST_MAX_BYTES &&
+      this._spawnSnapshotMode === "lean" &&
+      this._syncBuffer !== null;
+
+    for (const [pid, handle] of this._processes) {
+      if (pid === excludePid || handle.state === "exited") continue;
+      try {
+        if (invalidateInstead) {
+          handle.postMessage({ type: "vfs-invalidate", path });
+        } else {
+          handle.postMessage({
+            type: "vfs-sync",
+            path,
+            content: payload,
+            isDirectory,
+          });
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+}

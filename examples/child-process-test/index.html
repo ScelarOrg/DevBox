@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>nodepod - child_process.spawn test</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: monospace; background: #1a1a2e; color: #e0e0e0; padding: 24px; }
+    h1 { font-size: 18px; margin-bottom: 8px; color: #fff; }
+    p { font-size: 13px; color: #888; margin-bottom: 20px; }
+    #output {
+      background: #0d0d1a;
+      border: 1px solid #333;
+      border-radius: 6px;
+      padding: 16px;
+      min-height: 400px;
+      white-space: pre-wrap;
+      font-size: 14px;
+      line-height: 1.6;
+      overflow-y: auto;
+    }
+    .stdout { color: #a8e6a3; }
+    .stderr { color: #e68a8a; }
+    .info { color: #8ac4e6; }
+    .dim { color: #555; }
+    .pass { color: #a8e6a3; }
+    .fail { color: #e68a8a; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <h1>nodepod - child_process.spawn test</h1>
+  <p>Tests that stdout/stderr streams from spawned child processes emit data events.</p>
+  <div id="output"></div>
+
+  <script type="module">
+    import { Nodepod } from "/dist/index.mjs";
+
+    const out = document.getElementById('output');
+    function log(text, cls = 'stdout') {
+      const span = document.createElement('span');
+      span.className = cls;
+      span.textContent = text + '\n';
+      out.appendChild(span);
+      out.scrollTop = out.scrollHeight;
+    }
+
+    log('Booting nodepod...', 'info');
+
+    const nodepod = await Nodepod.boot({
+      workdir: '/test',
+      files: {
+        '/test/test-spawn-stdout.js': `
+const { spawn } = require('child_process');
+const child = spawn('ls', ['-la', '/test']);
+
+let stdoutData = '';
+let stderrData = '';
+
+child.stdout.on('data', (chunk) => {
+  stdoutData += chunk.toString();
+});
+
+child.stderr.on('data', (chunk) => {
+  stderrData += chunk.toString();
+});
+
+child.on('exit', (code) => {
+  if (stdoutData.length > 0) {
+    console.log('PASS: stdout received ' + stdoutData.length + ' chars');
+    console.log('stdout content: ' + stdoutData.trim());
+  } else {
+    console.error('FAIL: stdout was empty');
+  }
+  console.log('Exit code: ' + code);
+});
+        `.trim(),
+
+        '/test/test-spawn-echo.js': `
+const { spawn } = require('child_process');
+const child = spawn('echo', ['hello from child process']);
+
+let stdoutData = '';
+
+child.stdout.on('data', (chunk) => {
+  stdoutData += chunk.toString();
+});
+
+child.on('exit', (code) => {
+  if (stdoutData.includes('hello from child process')) {
+    console.log('PASS: echo output captured via stdout stream');
+  } else if (stdoutData.length > 0) {
+    console.error('FAIL: stdout had data but wrong content: ' + stdoutData);
+  } else {
+    console.error('FAIL: stdout was empty');
+  }
+  console.log('Exit code: ' + code);
+});
+        `.trim(),
+
+        '/test/test-spawn-pipe.js': `
+const { spawn } = require('child_process');
+const child = spawn('cat', ['/test/test-spawn-stdout.js']);
+
+const chunks = [];
+
+child.stdout.on('data', (chunk) => {
+  chunks.push(chunk);
+});
+
+child.on('exit', (code) => {
+  const output = chunks.map(c => c.toString()).join('');
+  if (output.length > 0) {
+    console.log('PASS: piped ' + chunks.length + ' chunk(s), ' + output.length + ' total chars');
+  } else {
+    console.error('FAIL: no data piped from stdout');
+  }
+  console.log('Exit code: ' + code);
+});
+        `.trim(),
+
+        '/test/test-spawn-stderr.js': `
+const { spawn } = require('child_process');
+// Run a command that doesn't exist to trigger stderr
+const child = spawn('node', ['-e', 'console.error("stderr test output")']);
+
+let stderrData = '';
+
+child.stderr.on('data', (chunk) => {
+  stderrData += chunk.toString();
+});
+
+child.on('exit', (code) => {
+  if (stderrData.includes('stderr test output')) {
+    console.log('PASS: stderr captured correctly');
+  } else if (stderrData.length > 0) {
+    console.log('PASS: stderr received ' + stderrData.length + ' chars');
+  } else {
+    console.error('FAIL: stderr was empty');
+  }
+  console.log('Exit code: ' + code);
+});
+        `.trim(),
+
+        '/test/test-spawn-exit-code.js': `
+const { spawn } = require('child_process');
+const child = spawn('ls', ['/test']);
+
+let gotClose = false;
+let gotExit = false;
+
+child.on('exit', (code) => {
+  gotExit = true;
+  if (code === 0) {
+    console.log('PASS: exit event fired with code 0');
+  } else {
+    console.error('FAIL: unexpected exit code ' + code);
+  }
+});
+
+child.on('close', (code) => {
+  gotClose = true;
+  console.log('close event fired with code ' + code);
+});
+
+setTimeout(() => {
+  if (!gotExit) console.error('FAIL: exit event never fired');
+  if (!gotClose) console.log('NOTE: close event not fired (may not be implemented)');
+}, 3000);
+        `.trim(),
+      },
+    });
+
+    log('Booted!\n', 'info');
+
+    const tests = [
+      { name: 'Test 1: spawn ls, capture stdout', file: 'test-spawn-stdout.js' },
+      { name: 'Test 2: spawn echo, verify output', file: 'test-spawn-echo.js' },
+      { name: 'Test 3: spawn cat, pipe file content', file: 'test-spawn-pipe.js' },
+      { name: 'Test 4: capture stderr', file: 'test-spawn-stderr.js' },
+      { name: 'Test 5: exit code + events', file: 'test-spawn-exit-code.js' },
+    ];
+
+    for (const test of tests) {
+      log(`--- ${test.name} ---`, 'dim');
+      const proc = await nodepod.spawn('node', [test.file]);
+      proc.on('output', (text) => {
+        const line = text.trimEnd();
+        const cls = line.startsWith('PASS') ? 'pass' : 'stdout';
+        log(line, cls);
+      });
+      proc.on('error', (text) => log(text.trimEnd(), 'fail'));
+      await proc.completion;
+      log('', 'dim');
+    }
+
+    log('All tests complete.', 'info');
+  </script>
+</body>
+</html>

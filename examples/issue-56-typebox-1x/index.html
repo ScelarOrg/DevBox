@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>nodepod - issue #56 typebox 1.x TDZ</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: monospace; background: #1a1a2e; color: #e0e0e0; padding: 20px; line-height: 1.5; }
+    h1 { font-size: 18px; margin-bottom: 4px; color: #fff; }
+    p { font-size: 13px; color: #888; margin-bottom: 12px; max-width: 950px; }
+    a { color: #8ac4e6; }
+    code { background: #0d0d1a; padding: 2px 6px; border-radius: 3px; color: #a8e6a3; font-size: 12px; }
+    .pane {
+      background: #0d0d1a; border: 1px solid #333; border-radius: 6px;
+      padding: 12px; display: flex; flex-direction: column; min-height: 560px;
+    }
+    .pane h2 { font-size: 13px; margin-bottom: 8px; color: #8ac4e6; }
+    #output {
+      flex: 1; white-space: pre-wrap; font-size: 12px; line-height: 1.55;
+      overflow-y: auto; max-height: 70vh;
+    }
+    .stdout { color: #a8e6a3; }
+    .stderr { color: #e68a8a; }
+    .info { color: #8ac4e6; }
+    .dim { color: #666; }
+    .pass { color: #a8e6a3; font-weight: bold; }
+    .fail { color: #e68a8a; font-weight: bold; }
+    .warn { color: #e6c38a; }
+    .title { color: #c38ae6; font-weight: bold; }
+    .controls { display: flex; gap: 8px; margin-bottom: 12px; align-items: center; flex-wrap: wrap; }
+    button {
+      background: #2a2a4a; color: #e0e0e0; border: 1px solid #444;
+      padding: 6px 12px; border-radius: 4px; font-family: monospace; cursor: pointer;
+    }
+    button:hover { background: #3a3a5a; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+  </style>
+</head>
+<body>
+  <h1>nodepod - issue <a href="https://github.com/ScelarOrg/Nodepod/issues/56">#56</a> - packages using typebox 1.x throw on run</h1>
+  <p>
+    Reproduces the reporter's flow:
+    <code>npm i -g @mariozechner/pi-coding-agent</code> then <code>pi</code>, which throws
+    <code>ReferenceError: Cannot access 'Object' before initialization</code>
+    inside <code>typebox/build/type/engine/instantiate.mjs</code>.
+    Three buttons: the full reporter repro (slow, big install), a smaller direct
+    <code>typebox@^1</code> repro (fast, just <code>require('typebox')</code>), and an
+    install-free inline ESM repro that mimics the offending pattern (named import that
+    shadows the <code>Object</code> global) so we can confirm the TDZ failure mode without npm.
+  </p>
+
+  <div class="controls">
+    <button id="run-inline">run inline ESM (no npm) - fastest</button>
+    <button id="run-typebox">run npm i typebox@^1 + require - small repro</button>
+    <button id="run-pi">run npm i -g pi-coding-agent + pi - full repro from issue</button>
+    <button id="clear">clear log</button>
+  </div>
+
+  <div class="pane">
+    <h2>log</h2>
+    <div id="output"></div>
+  </div>
+
+  <!-- inline ESM repro: mimics typebox's shadowing-import pattern -->
+
+  <script id="file-inline-types-object" type="text/plain">// mimics typebox/build/type/types/object.mjs
+export function Object(properties, options = {}) {
+  return { '~kind': 'Object', type: 'object', properties, options };
+}
+export function IsObject(value) {
+  return value && value['~kind'] === 'Object';
+}
+export function ObjectOptions(type) {
+  const { properties, ...rest } = type;
+  return rest;
+}
+</script>
+
+  <script id="file-inline-types-array" type="text/plain">// mimics typebox/build/type/types/array.mjs
+export function Array(items, options = {}) {
+  return { '~kind': 'Array', type: 'array', items, options };
+}
+export function IsArray(value) {
+  return value && value['~kind'] === 'Array';
+}
+</script>
+
+  <script id="file-inline-engine-instantiate" type="text/plain">// mimics typebox/build/type/engine/instantiate.mjs (imports Object/Array)
+// '../types/' because this file lives at /app/engine/, mirrors typebox layout
+import { Object, IsObject, ObjectOptions } from '../types/object.mjs';
+import { Array, IsArray } from '../types/array.mjs';
+
+export function Instantiate(type) {
+  if (IsObject(type)) return Object(type.properties, ObjectOptions(type));
+  if (IsArray(type))  return Array(type.items);
+  return type;
+}
+export const PROBE = 'instantiate-loaded';
+</script>
+
+  <script id="file-inline-main" type="text/plain">import { Instantiate, PROBE } from './engine/instantiate.mjs';
+console.log('main: loaded engine. PROBE=' + PROBE);
+const obj = { '~kind': 'Object', type: 'object', properties: { x: { type: 'number' } } };
+const out = Instantiate(obj);
+console.log('main: Instantiate returned', JSON.stringify(out));
+</script>
+
+  <!-- direct typebox repro: npm install + require -->
+
+
+  <script id="file-typebox-package-json" type="text/plain">{
+  "name": "typebox-min-repro",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "dependencies": {
+    "typebox": "^1.0.0"
+  }
+}
+</script>
+
+  <script id="file-typebox-runner" type="text/plain">// pre-fix this required-and-died at module eval (TDZ)
+console.log('about to require typebox...');
+try {
+  const tb = require('typebox');
+  console.log('typebox loaded ok. exports:', Object.keys(tb).slice(0, 20).join(','));
+} catch (e) {
+  console.error('typebox load FAILED:', e && e.message);
+  console.error('stack:', e && e.stack);
+  process.exit(1);
+}
+</script>
+
+  <script id="file-typebox-runner-esm" type="text/plain">// esm variant: import() instead of require
+console.log('about to import typebox...');
+try {
+  const tb = await import('typebox');
+  console.log('typebox loaded ok. exports:', Object.keys(tb).slice(0, 20).join(','));
+} catch (e) {
+  console.error('typebox import FAILED:', e && e.message);
+  console.error('stack:', e && e.stack);
+  process.exit(1);
+}
+</script>
+
+  <script type="module">
+    import { Nodepod } from "/dist/index.mjs";
+
+    const out = document.getElementById('output');
+    const runInlineBtn = document.getElementById('run-inline');
+    const runTypeboxBtn = document.getElementById('run-typebox');
+    const runPiBtn = document.getElementById('run-pi');
+    const clearBtn = document.getElementById('clear');
+
+    function log(text, cls = 'stdout') {
+      const span = document.createElement('span');
+      span.className = cls;
+      span.textContent = text + '\n';
+      out.appendChild(span);
+      out.scrollTop = out.scrollHeight;
+    }
+    function readFile(id) {
+      return document.getElementById(id).textContent;
+    }
+    function disableButtons(d) {
+      runInlineBtn.disabled = d; runTypeboxBtn.disabled = d; runPiBtn.disabled = d;
+    }
+    clearBtn.addEventListener('click', () => { out.textContent = ''; });
+
+    async function mountFiles(pod, files) {
+      for (const [path, content] of Object.entries(files)) {
+        await pod.fs.writeFile(path, content);
+      }
+    }
+    async function runCommand(pod, command, args, cwd) {
+      const proc = await pod.spawn(command, args, { cwd: cwd || pod.cwd });
+      proc.on('output', (t) => log(t.trimEnd(), 'stdout'));
+      proc.on('error',  (t) => log(t.trimEnd(), 'stderr'));
+      return proc;
+    }
+
+    // ----- variant A: inline ESM, no install -----
+    async function runInline() {
+      disableButtons(true);
+      try {
+        log('=== variant A: inline ESM (no npm) ===', 'title');
+        log('booting nodepod (workdir=/app) ...', 'info');
+        const pod = await Nodepod.boot({ watermark: false, workdir: '/app' });
+        log('booted.\n', 'info');
+
+        await mountFiles(pod, {
+          '/app/types/object.mjs':         readFile('file-inline-types-object'),
+          '/app/types/array.mjs':          readFile('file-inline-types-array'),
+          '/app/engine/instantiate.mjs':   readFile('file-inline-engine-instantiate'),
+          '/app/main.mjs':                 readFile('file-inline-main'),
+        });
+        log('files mounted. running node main.mjs ...\n', 'info');
+
+        const proc = await runCommand(pod, 'node', ['main.mjs'], '/app');
+        const res = await proc.completion;
+        if (res.exitCode === 0) {
+          log(`\nPASS: inline ESM module loaded. exit=${res.exitCode}`, 'pass');
+        } else {
+          log(`\nREPRODUCED: inline ESM threw during load. exit=${res.exitCode}`, 'fail');
+        }
+      } catch (e) {
+        log(`uncaught: ${e?.stack || e}`, 'fail');
+      } finally {
+        disableButtons(false);
+      }
+    }
+
+    // ----- variant B: install typebox@^1 directly and require it -----
+    async function runTypebox() {
+      disableButtons(true);
+      try {
+        log('=== variant B: npm i typebox@^1 + require ===', 'title');
+        log('booting nodepod (workdir=/app) ...', 'info');
+        const pod = await Nodepod.boot({ watermark: false, workdir: '/app' });
+        log('booted.\n', 'info');
+
+        await mountFiles(pod, {
+          '/app/package.json': readFile('file-typebox-package-json'),
+          '/app/run.cjs':      readFile('file-typebox-runner'),
+          '/app/run.mjs':      readFile('file-typebox-runner-esm'),
+        });
+        log('files mounted.\n', 'info');
+
+        log('--- npm install ---', 'title');
+        const inst = await runCommand(pod, 'npm', ['install'], '/app');
+        const instRes = await inst.completion;
+        if (instRes.exitCode !== 0) {
+          log(`npm install failed (exit=${instRes.exitCode})`, 'fail');
+          return;
+        }
+        log('npm install done.\n', 'pass');
+
+        log('--- node run.cjs (require typebox) ---', 'title');
+        const cjs = await runCommand(pod, 'node', ['run.cjs'], '/app');
+        const cjsRes = await cjs.completion;
+        log(`exit=${cjsRes.exitCode}`, cjsRes.exitCode === 0 ? 'pass' : 'fail');
+
+        log('\n--- node run.mjs (import typebox) ---', 'title');
+        const mjs = await runCommand(pod, 'node', ['run.mjs'], '/app');
+        const mjsRes = await mjs.completion;
+        log(`exit=${mjsRes.exitCode}`, mjsRes.exitCode === 0 ? 'pass' : 'fail');
+
+        if (cjsRes.exitCode !== 0 || mjsRes.exitCode !== 0) {
+          log(`\nREPRODUCED issue #56 on at least one of cjs/esm load paths.`, 'fail');
+        } else {
+          log(`\nNOT reproduced - typebox loaded cleanly on both paths.`, 'pass');
+        }
+      } catch (e) {
+        log(`uncaught: ${e?.stack || e}`, 'fail');
+      } finally {
+        disableButtons(false);
+      }
+    }
+
+    // ----- variant C: full reporter repro -----
+    async function runPi() {
+      disableButtons(true);
+      try {
+        log('=== variant C: npm i -g @mariozechner/pi-coding-agent + pi ===', 'title');
+        log('this matches the reporter\'s exact commands. takes a while.', 'dim');
+        log('booting nodepod ...', 'info');
+        const pod = await Nodepod.boot({ watermark: false, workdir: '/' });
+        log('booted.\n', 'info');
+
+        log('--- npm i -g @mariozechner/pi-coding-agent ---', 'title');
+        const inst = await runCommand(pod, 'npm', ['i', '-g', '@mariozechner/pi-coding-agent'], '/');
+        const instRes = await inst.completion;
+        if (instRes.exitCode !== 0) {
+          log(`global install failed (exit=${instRes.exitCode})`, 'fail');
+          return;
+        }
+        log('install done.\n', 'pass');
+
+        log('--- pi (just run it; reporter says it errors immediately) ---', 'title');
+        const piProc = await runCommand(pod, 'pi', [], '/');
+        // pi may try to read stdin / open a TTY. give it 30s then give up.
+        const piRes = await Promise.race([
+          piProc.completion,
+          new Promise((r) => setTimeout(() => r({ exitCode: '<timeout>', __t: true }), 30000)),
+        ]);
+        if (piRes.__t) { try { piProc.kill(); } catch {} }
+        log(`\npi exit=${piRes.exitCode}`,
+          (piRes.exitCode === 0) ? 'pass' : 'fail');
+        log(piRes.exitCode === 0
+          ? `NOT reproduced - pi started cleanly.`
+          : `REPRODUCED issue #56: pi threw during typebox module load.`,
+          piRes.exitCode === 0 ? 'pass' : 'fail');
+      } catch (e) {
+        log(`uncaught: ${e?.stack || e}`, 'fail');
+      } finally {
+        disableButtons(false);
+      }
+    }
+
+    runInlineBtn.addEventListener('click', runInline);
+    runTypeboxBtn.addEventListener('click', runTypebox);
+    runPiBtn.addEventListener('click', runPi);
+  </script>
+</body>
+</html>

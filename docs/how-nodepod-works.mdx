@@ -1,0 +1,1091 @@
+# How Nodepod Works: A Browser-Native Node.js Runtime
+
+## Table of Contents
+
+- [Introduction — What Is Nodepod?](#introduction)
+- [Quick Start — The 10-Second Version](#quick-start)
+- [Architecture Overview](#architecture-overview)
+- [The Virtual Filesystem — MemoryVolume](#the-virtual-filesystem)
+- [The JavaScript Engine — ScriptEngine](#the-javascript-engine)
+- [The Module System — require() in the Browser](#the-module-system)
+- [ESM-to-CJS Transforms — Making Modern Code Work](#esm-to-cjs-transforms)
+- [The Sync/Async Bridge — SyncThenable and SyncPromise](#the-sync-async-bridge)
+- [Node.js Polyfills — Reimplementing the Standard Library](#nodejs-polyfills)
+  - [Filesystem (fs)](#polyfill-fs)
+  - [HTTP Server and Client](#polyfill-http)
+  - [Streams](#polyfill-streams)
+  - [Buffer](#polyfill-buffer)
+  - [EventEmitter](#polyfill-events)
+  - [Process](#polyfill-process)
+  - [Path](#polyfill-path)
+  - [Crypto](#polyfill-crypto)
+  - [Net (TCP)](#polyfill-net)
+  - [Zlib (Compression)](#polyfill-zlib)
+  - [Child Process](#polyfill-child-process)
+  - [Readline](#polyfill-readline)
+  - [Other Polyfills](#polyfill-others)
+  - [Stub Modules](#polyfill-stubs)
+- [The Shell — A Custom Bash Interpreter](#the-shell)
+  - [Tokenizer](#shell-tokenizer)
+  - [Parser](#shell-parser)
+  - [Interpreter](#shell-interpreter)
+  - [Built-in Commands](#shell-builtins)
+- [Package Management — npm in the Browser](#package-management)
+  - [Registry Client](#registry-client)
+  - [Version Resolution](#version-resolution)
+  - [Archive Extraction](#archive-extraction)
+  - [Module Transformation](#module-transformation)
+- [The Process Model — WebContainers-Style Workers](#the-process-model)
+  - [ProcessManager](#process-manager)
+  - [ProcessHandle](#process-handle)
+  - [Process Worker Entry](#process-worker-entry)
+  - [VFS Bridge and Sync](#vfs-bridge)
+  - [Sync Channel — True Blocking execSync](#sync-channel)
+  - [Offload Workers](#offload-workers)
+- [The SDK — Clean Public API](#the-sdk)
+  - [Nodepod.boot()](#nodepod-boot)
+  - [NodepodFS](#nodepod-fs)
+  - [NodepodProcess](#nodepod-process)
+  - [NodepodTerminal](#nodepod-terminal)
+- [The Service Worker Bridge — RequestProxy](#the-service-worker-bridge)
+- [Build System and Configuration](#build-system)
+- [Key Patterns and Gotchas](#key-patterns)
+- [Conclusion](#conclusion)
+
+---
+
+<a id="introduction"></a>
+## Introduction — What Is Nodepod?
+
+Nodepod is a **browser-native Node.js runtime environment**. It runs real Node.js code — filesystem operations, CommonJS `require()`, npm package installation, HTTP servers, shell commands — entirely inside the browser. No server. No Docker container. No WebAssembly port of Node.js. Just pure JavaScript polyfills, an in-memory filesystem, and a clever execution engine.
+
+Think of it as building a miniature operating system inside a browser tab:
+
+- An **in-memory filesystem** ([`src/memory-volume.ts`](src/memory-volume.ts)) replaces the kernel's VFS
+- A **JavaScript execution engine** ([`src/script-engine.ts`](src/script-engine.ts)) replaces the Node.js runtime
+- **50+ polyfill modules** ([`src/polyfills/`](src/polyfills/)) replace Node.js's standard library
+- A **custom shell interpreter** ([`src/shell/`](src/shell/)) replaces Bash
+- A **package manager** ([`src/packages/`](src/packages/)) replaces npm
+- **Web Workers** ([`src/threading/`](src/threading/)) replace OS processes
+- A **Service Worker bridge** ([`src/request-proxy.ts`](src/request-proxy.ts)) replaces the network stack
+
+The result: you can `npm install express`, write a server, and hit it with HTTP requests — all running inside a single browser tab.
+
+### Source Layout
+
+```
+nodepod/
+  src/                            # ~120 TypeScript files
+    script-engine.ts              # Core JS execution engine (~3,375 lines)
+    memory-volume.ts              # In-memory virtual filesystem (~941 lines)
+    engine-factory.ts             # Factory for different execution modes
+    engine-types.ts               # Shared interfaces
+    syntax-transforms.ts          # ESM-to-CJS conversion
+    module-transformer.ts         # esbuild-powered bulk transforms
+    request-proxy.ts              # Service Worker HTTP bridge (~680 lines)
+    cross-origin.ts               # CORS proxy helpers
+    index.ts                      # Public API barrel + createWorkspace()
+    polyfills/                    # 50+ Node.js module polyfills
+    shell/                        # Custom shell interpreter (~6,600 lines total)
+      shell-parser.ts             # Tokenizer + recursive-descent parser
+      shell-interpreter.ts        # NodepodShell class — AST executor
+      shell-builtins.ts           # Built-in command registry
+      shell-types.ts              # Types and AST node definitions
+      commands/                   # 11 specialized command modules
+        git.ts                    # Full in-memory git (~2,100 lines)
+        npm.ts                    # npm CLI frontend
+        pnpm.ts                   # pnpm CLI frontend
+        yarn.ts                   # yarn CLI frontend
+        bun.ts                    # bun CLI frontend
+        node.ts                   # node command dispatch
+        file-ops.ts               # cat, cp, mv, rm, mkdir, etc.
+        directory.ts              # ls, cd, pwd, basename, etc.
+        text-processing.ts        # echo, grep, sed, sort, etc.
+        search.ts                 # find, xargs
+        shell-env.ts              # export, which, test, date, etc.
+    packages/                     # npm registry client + installer
+    threading/                    # Web Worker process model (16 files)
+    sdk/                          # Clean public SDK (Nodepod, NodepodFS, etc.)
+    helpers/                      # Byte encoding, digest, event-loop, WASM cache
+    constants/                    # CDN URLs, config values, mock OS data
+    types/                        # TypeScript interfaces
+```
+
+---
+
+<a id="quick-start"></a>
+## Quick Start — The 10-Second Version
+
+```typescript
+import { Nodepod } from 'nodepod';
+import { Terminal } from '@xterm/xterm';
+import { FitAddon } from '@xterm/addon-fit';
+
+// Boot a nodepod instance with some initial files
+const nodepod = await Nodepod.boot({
+  files: {
+    '/index.js': 'console.log("Hello from the browser!")',
+    '/server.js': `
+      const express = require('express');
+      const app = express();
+      app.get('/', (req, res) => res.send('Hello World'));
+      app.listen(3000);
+    `
+  }
+});
+
+// Create an interactive terminal
+const terminal = nodepod.createTerminal({ Terminal, FitAddon });
+terminal.attach('#terminal');
+
+// Run a script programmatically
+const proc = await nodepod.spawn('node', ['index.js']);
+await proc.completion; // { stdout: "Hello from the browser!\n", exitCode: 0 }
+
+// Use the filesystem
+await nodepod.fs.writeFile('/test.txt', 'hello');
+const content = await nodepod.fs.readFile('/test.txt', 'utf8'); // "hello"
+```
+
+Source: [`src/sdk/nodepod.ts`](src/sdk/nodepod.ts) — `Nodepod.boot()`, `spawn()`, `createTerminal()`.
+
+### Headless mode (browser or Node)
+
+Same SDK surface without terminal/preview UI. HTTP works via `pod.request()`; on Node a localhost ingress also exposes `/__virtual__/{instanceId}/{port}/...` URLs.
+
+```typescript
+// Browser / isomorphic — Web Workers, no Service Worker by default
+import { Nodepod } from "@scelar/nodepod";
+const pod = await Nodepod.boot({ headless: true });
+const res = await pod.request(3000, { method: "GET", path: "/" });
+
+// Node / Bun agents & CI — worker_threads + local HTTP
+import { Nodepod } from "@scelar/nodepod/headless";
+const nodePod = await Nodepod.boot();
+await fetch(`${nodePod.port(3000)}/`);
+```
+
+Host seam: [`src/host/`](src/host/) (`RuntimeHost`, browser vs Node adapters). Entry: [`src/headless.ts`](src/headless.ts).
+
+---
+
+<a id="architecture-overview"></a>
+## Architecture Overview
+
+Here's how the pieces fit together at the highest level:
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                      SDK Layer                           │
+│  Nodepod.boot() → NodepodFS, NodepodProcess, NodepodTerminal │
+│  (src/sdk/)                                              │
+├─────────────────────────────────────────────────────────┤
+│                    Core Engine                            │
+│  ScriptEngine ←→ MemoryVolume ←→ SyntaxTransforms        │
+│  (src/script-engine.ts, memory-volume.ts, etc.)          │
+├─────────────────────────────────────────────────────────┤
+│                   Process Model                           │
+│  ProcessManager → ProcessHandle → Web Workers             │
+│  VFSBridge, SyncChannel, SharedVFS                        │
+│  (src/threading/)                                         │
+├─────────────────────────────────────────────────────────┤
+│                  Node.js Polyfills                         │
+│  fs, http, stream, buffer, events, crypto, path, ...      │
+│  (src/polyfills/)                                         │
+├─────────────────────────────────────────────────────────┤
+│                  Shell Interpreter                         │
+│  Tokenizer → Parser → AST → Interpreter                   │
+│  53+ builtins + npm/git/node tools (ls, grep, cat, sed, ...)   │
+│  (src/shell/)                                             │
+├─────────────────────────────────────────────────────────┤
+│                 Package Management                         │
+│  Registry Client → Version Resolver → Archive Extractor    │
+│  (src/packages/)                                          │
+├─────────────────────────────────────────────────────────┤
+│                  Network Bridge                            │
+│  RequestProxy ←→ Service Worker ←→ Virtual HTTP Servers    │
+│  (src/request-proxy.ts)                                   │
+└─────────────────────────────────────────────────────────┘
+```
+
+The flow for running `node server.js` in the terminal:
+
+1. **NodepodTerminal** captures the keystrokes and assembles the command string
+2. **Nodepod.createTerminal()** wiring sends the command to a **persistent shell worker**
+3. The worker's **NodepodShell** parses the command, recognizes `node` as a registered command
+4. **executeNodeBinary()** creates a **ScriptEngine**, reads the file from **MemoryVolume**
+5. The engine converts ESM to CJS via **syntax-transforms**, evaluates with `eval()`
+6. `require('express')` resolves through **buildResolver()**, hitting the **CORE_MODULES** registry or reading from VFS
+7. `app.listen(3000)` registers in the **HTTP polyfill's server registry**
+8. The worker posts a `server-listen` message to the main thread
+9. **ProcessManager** tells **RequestProxy** to register port 3000
+10. Incoming HTTP requests (via Service Worker or `dispatchRequest()`) are routed back to the worker
+
+---
+
+<a id="the-virtual-filesystem"></a>
+## The Virtual Filesystem — MemoryVolume
+
+**Source:** [`src/memory-volume.ts`](src/memory-volume.ts) (~942 lines)
+
+The `MemoryVolume` is the foundation of everything. It's an in-memory tree structure that implements a POSIX-like filesystem API.
+
+### Internal Structure
+
+```typescript
+// src/memory-volume.ts
+interface VolumeNode {
+  kind: 'file' | 'directory' | 'symlink';
+  content?: Uint8Array;              // file data
+  children?: Map<string, VolumeNode>; // directory entries
+  target?: string;                    // symlink target
+  modified: number;                   // timestamp
+}
+```
+
+The root of the tree is a single `VolumeNode` of kind `directory`. All paths are normalized to POSIX format with a leading `/`.
+
+### Synchronous API
+
+MemoryVolume provides **30+ synchronous methods** that mirror Node.js's `fs` module:
+
+- `readFileSync`, `writeFileSync`, `mkdirSync({recursive})`, `readdirSync`, `statSync`, `lstatSync`, `unlinkSync`, `rmdirSync`, `renameSync`, `symlinkSync`, `readlinkSync`, `linkSync`, `copyFileSync`, `appendFileSync`, `truncateSync`, `existsSync`, `accessSync`, `realpathSync`, `chmodSync`, `chownSync`
+
+Source: `readFileSync`, `writeFileSync`, `mkdirSync`, etc. methods in `memory-volume.ts`.
+
+### File Watchers
+
+`watch(target, opts?, cb?)` creates watchers that fire on file changes. When a file is written or deleted, `triggerWatchers()` walks the directory tree upward, firing all registered watchers (including recursive parent watchers). This is critical for **Hot Module Replacement** — Vite watches files through this mechanism.
+
+### Snapshots
+
+MemoryVolume can serialize its entire state for cross-boundary transfer:
+
+- `toSnapshot()` — JSON format with base64-encoded file data
+- `fromBinarySnapshot()` — high-performance binary format using a flat `ArrayBuffer` with a manifest. This is how workers get an initial copy of the filesystem.
+
+### Global Change Listeners
+
+`onGlobalChange(cb)` enables the chokidar polyfill to bridge VFS changes into Vite's HMR system. Every write/delete broadcasts to all listeners.
+
+### Stream APIs
+
+`createReadStream()` and `createWriteStream()` return stream-like objects with `on(event, cb)` and `pipe()` APIs. Since the VFS is synchronous, `createReadStream` pushes the entire file content as a single chunk via `setTimeout`.
+
+---
+
+<a id="the-javascript-engine"></a>
+## The JavaScript Engine — ScriptEngine
+
+**Source:** [`src/script-engine.ts`](src/script-engine.ts) (~3,375 lines)
+
+This is the heart of the runtime. ScriptEngine implements the CommonJS `require()` system, module resolution, ESM-to-CJS conversion, `eval()`-based execution, and the SyncPromise/SyncThenable machinery.
+
+### How Code Execution Works
+
+When you call `engine.execute(code, filename)`:
+
+1. **Write to VFS**: The code is written to the virtual filesystem at `filename`
+2. **Create module record**: A `ModuleRecord` with `id`, `filename`, `exports`, etc.
+3. **Strip shebang**: Remove `#!/usr/bin/env node` lines
+4. **Strip TypeScript**: If the file looks like TS, regex-based stripping removes type annotations. Handles `interface`, `type`, generics, `as`, `enum` (converted to plain objects), `readonly`, access modifiers, `declare` blocks.
+5. **Convert ESM to CJS**: `convertModuleSyntax()` transforms `import`/`export` to `require()`/`module.exports`
+6. **Handle top-level await**: If detected, strips `await` keywords and replaces with `__syncAwait()`
+7. **Build wrapper**: The code is wrapped in a function with sandboxed parameters
+8. **Eval**: `(0, eval)(wrapper)` executes in sloppy mode (indirect eval)
+9. **Call wrapper**: The wrapper function is called with all sandbox arguments
+
+### The Module Wrapper
+
+Every module is wrapped in a function (`buildModuleWrapper`) that injects sandboxed globals:
+
+```javascript
+(function($exports, $require, $module, $filename, $dirname,
+          $process, $console, $importMeta, $asyncLoad, $syncAwait, $SyncPromise) {
+  var exports = $exports;
+  var require = $require;
+  var module = $module;
+  var __filename = $filename;
+  var __dirname = $dirname;
+  var process = $process;
+  var console = $console;
+  var Promise = $SyncPromise; // ← SyncPromise replaces native Promise!
+
+  // Vite compatibility:
+  var __vite_injected_original_filename = $filename;
+  var __vite_injected_original_dirname = $dirname;
+
+  // Hide browser globals in Node.js mode:
+  var document = undefined;
+  var window = undefined;
+  var HTMLElement = undefined;
+
+  return (function() { /* YOUR CODE HERE */ }).call(this);
+})
+```
+
+The key insight: `Promise` is replaced with `SyncPromise` — a custom Promise subclass that enables synchronous resolution. More on this in the [Sync/Async Bridge](#the-sync-async-bridge) section.
+
+### The REPL
+
+`createREPL()` returns a persistent REPL using a generator function. The generator runs an infinite loop yielding results. It first tries evaluating as an expression (`("(" + code + ")")`), then falls back to statement execution.
+
+---
+
+<a id="the-module-system"></a>
+## The Module System — require() in the Browser
+
+**Source:** [`src/script-engine.ts`](src/script-engine.ts) — `buildResolver()`
+
+### Resolution Algorithm
+
+When `require('express')` is called, `resolveId()` runs:
+
+1. **Strip prefix**: Remove `node:` prefix, handle `file://` URLs, query strings, hash fragments
+2. **Check built-ins**: Look up in `CORE_MODULES` (100+ entries)
+3. **Handle special stubs**: `@rollup/rollup-*` and `@rolldown/binding-*` return pre-built stubs
+4. **Package imports**: `#`-prefixed imports use `package.json` `imports` field
+5. **Relative/absolute paths**: Resolve with `tryFile()` — tries exact path, then `package.json` `main`, then `INDEX_FILES`, then extension probing
+6. **node_modules walk**: Walk up directory tree, try `package.json` `exports` (with conditions: `node`, `browser`, `require`, `import`, `default`), then `browser`/`module`/`main` fields
+7. **Extension probing**: `.js`, `.ts`, `.jsx`, `.tsx`, `.mjs`, `.cjs`, `.json`
+8. **Index files**: `index.js`, `index.ts`, `index.tsx`, `index.mjs`, `index.cjs`
+
+### The CORE_MODULES Registry
+
+The `CORE_MODULES` map contains 100+ entries mapping module names to polyfill implementations. Notable patterns:
+
+- Subpath exports: `util/types`, `path/posix`, `timers/promises`, `stream/promises`, `dns/promises`
+- Internal stream classes: `_stream_readable`, `_stream_writable`, etc.
+- `child_process` uses a lazy `Proxy` (`shellExecProxy`) that delegates to `_shellExecPolyfill` once the shell is loaded
+- Massive stub objects for `@rollup/rollup-*` and `@rolldown/binding-*` so Vite's internal Rolldown usage doesn't crash
+
+### Module Loading
+
+`loadModule()` handles the actual loading:
+
+1. Cache check → JSON parse → `.node` empty stub → Read source → Strip shebang/TypeScript
+2. For `.cjs`: only rewrite `import()` and `import.meta`
+3. For others: full `convertModuleSyntax()` (ESM → CJS)
+4. Detect top-level await, create child resolver with propagated `deAsyncImports` flag
+5. Strip TLA, build wrapper, `(0, eval)()`, call with sandbox args
+6. WASM retry: if `WebAssembly.Module` fails due to >8MB, rewrap as async
+
+### The `fs` Special Case
+
+`require('fs')` returns a **per-engine filesystem bridge** from `buildFileSystemBridge(volume, getCwd)`, not the raw polyfill. This wires all operations to the specific `MemoryVolume` instance.
+
+---
+
+<a id="esm-to-cjs-transforms"></a>
+## ESM-to-CJS Transforms — Making Modern Code Work
+
+**Source:** [`src/syntax-transforms.ts`](src/syntax-transforms.ts) (~630 lines)
+
+### AST-Based Conversion
+
+`esmToCjsViaAst()` uses **acorn** to parse source into an AST, then applies patches:
+
+```javascript
+// Input (ESM)
+import express from 'express';
+export const port = 3000;
+
+// Output (CJS)
+const express = require("express");
+Object.defineProperty(exports, "port", { enumerable: true, get: () => port });
+const port = 3000;
+```
+
+Key behaviors:
+- **Mixed exports**: `exports.default` vs `module.exports` depending on whether both default + named exports exist
+- **Live bindings**: `export let`/`export var` use `Object.defineProperty` with getters; `export const` uses plain assignment
+- **Re-exports**: `export { default as X } from '...'` uses `__esModule` interop
+- **Regex fallback**: `esmToCjsViaRegex()` handles the most common forms when acorn parsing fails
+
+### Dynamic Import Rewriting
+
+`import()` is rewritten to `__asyncLoad()`, which wraps the resolver in a `SyncThenable` with ESM interop.
+
+### Bulk Package Transformation
+
+During `npm install`, [`src/module-transformer.ts`](src/module-transformer.ts) bulk-transforms packages using esbuild-wasm in Web Workers:
+
+1. Walk all `.js`/`.jsx` files in a package directory (batches of 50)
+2. Check for ESM syntax, offload transform to worker pool
+3. Post-process: patch `import('node:X')` → `Promise.resolve(require('X'))`
+4. `.mjs` files and `"type": "module"` packages are **never** converted
+
+---
+
+<a id="the-sync-async-bridge"></a>
+## The Sync/Async Bridge — SyncThenable and SyncPromise
+
+**Source:** [`src/script-engine.ts`](src/script-engine.ts)
+
+This is one of the cleverest parts of nodepod. Node.js's `require()` is synchronous, but many operations involve async code. Nodepod bridges this with a custom Promise system.
+
+### SyncThenable
+
+A lightweight Promise-like that fires `.then()` **synchronously** — it already holds the resolved value:
+
+```typescript
+class SyncThenable<T> {
+  constructor(private _value: T) {}
+  then<R>(fn?: (v: T) => R): SyncThenable<R> {
+    return new SyncThenable(fn ? fn(this._value) : this._value as any);
+  }
+}
+```
+
+### SyncPromise
+
+A real `Promise` subclass injected as the `Promise` global inside module wrappers. It tracks synchronous resolution and has fast paths in `.then()`, `.all()`, `.race()`, `.resolve()`.
+
+### syncAwait()
+
+Probes whether a value can be synchronously unwrapped:
+
+```typescript
+function syncAwait(val) {
+  let syncResult, gotSync = false;
+  val?.then?.(v => { syncResult = v; gotSync = true; });
+  return gotSync ? syncResult : val;
+}
+```
+
+### De-Async Propagation
+
+When `loadModule()` detects top-level await, it sets `deAsyncImports = true` on the child resolver. In "full" mode, `stripTopLevelAwait()` (in syntax-transforms.ts) strips `async` from all functions and replaces ALL `await` with `__syncAwait()`. This is necessary because `async` functions return native Promises (the intrinsic `%Promise%`, not overridable), which `syncAwait()` can't unwrap.
+
+This propagates transitively through the entire require chain.
+
+---
+
+<a id="nodejs-polyfills"></a>
+## Node.js Polyfills — Reimplementing the Standard Library
+
+Nodepod reimplements **50+ Node.js built-in modules** in [`src/polyfills/`](src/polyfills/).
+
+<a id="polyfill-fs"></a>
+### Filesystem (`fs`)
+
+**Source:** [`src/polyfills/fs.ts`](src/polyfills/fs.ts)
+
+Created per-engine by `buildFileSystemBridge(volume, getCwd)`. Provides:
+
+- **30+ sync methods**: `readFileSync`, `writeFileSync`, `mkdirSync`, `readdirSync`, `statSync`, `lstatSync`, `unlinkSync`, `rmdirSync`, `renameSync`, plus `openSync`/`closeSync`/`readSync`/`writeSync` for fd-based ops
+- **Async counterparts**: All sync methods have callback-based wrappers via `queueMicrotask`
+- **Streams**: `createReadStream` / `createWriteStream` with `open`/`close`/`path`/`fd`/`bytesWritten`/`bytesRead` properties
+- **Watchers**: `watch`, `watchFile` (50ms polling), `unwatchFile`
+- **Promises namespace**: `fs.promises.*` with full API including `rm({recursive, force})`
+- **Dirent class**: For `readdir({ withFileTypes: true })`
+- **Constants**: `F_OK=0`, `R_OK=4`, `W_OK=2`, `X_OK=1`
+
+<a id="polyfill-http"></a>
+### HTTP Server and Client
+
+**Source:** [`src/polyfills/http.ts`](src/polyfills/http.ts) (~1,449 lines)
+
+One of the most complex polyfills:
+
+- **`IncomingMessage`** — extends `Readable`, with `method`, `url`, `headers`, `httpVersion`, static `build()` factory
+- **`ServerResponse`** — extends `Writable`, with `statusCode`, `setHeader()`, `writeHead()`, `write()`, `end()`, plus Express helpers (`send()`, `json()`, `status()`, `redirect()`)
+- **`Server`** — wraps `TcpServer`, `listen(port)`, `close()`, `address()`, `dispatchRequest()` for routing requests through the real framework handler
+- **`ClientRequest`** — backed by `fetch()`. **Localhost requests** are intercepted and dispatched directly to the virtual server registry (no network). WebSocket upgrade via `_bridgeWebSocket()`
+- **Server registry** — `Map<number, Server>` keyed by port. `getServer(port)`, `dispatchRequest()`, and ownership tracking by PID
+- **WebSocket frame codec** — `decodeFrame()` and `encodeFrame()` handling RFC 6455 frames with masking
+
+<a id="polyfill-streams"></a>
+### Streams
+
+**Source:** [`src/polyfills/stream.ts`](src/polyfills/stream.ts)
+
+`Readable`, `Writable`, `Duplex`, `Transform`, `PassThrough`, `Stream` base class, plus `pipeline()` and `finished()`. The `_readableState` shim is crucial — many libraries access internal stream state directly.
+
+<a id="polyfill-buffer"></a>
+### Buffer
+
+**Source:** [`src/polyfills/buffer.ts`](src/polyfills/buffer.ts)
+
+`BufferPolyfill` extends `Uint8Array` natively. Full integer read/write suite (UInt8/16/32, Int8/16/32, BigUInt64, BigInt64, Float, Double — all in BE/LE variants). A `Proxy` wrapper allows deprecated `Buffer(size)` syntax.
+
+<a id="polyfill-events"></a>
+### EventEmitter
+
+**Source:** [`src/polyfills/events.ts`](src/polyfills/events.ts)
+
+Critical design: **lazy `_reg()` initializer**. Express uses `Object.create(EventEmitter.prototype)` which bypasses the constructor, leaving `_registry` undefined. The `_reg()` method lazily initializes it. **Every** EventEmitter method must use `this._reg()`.
+
+Also includes a **VFS-to-chokidar HMR bridge**: when chokidar's FSWatcher adds a `change` listener, the bridge subscribes to `MemoryVolume.onGlobalChange()` and forwards file changes. This is how Vite's HMR works in nodepod.
+
+<a id="polyfill-process"></a>
+### Process
+
+**Source:** [`src/polyfills/process.ts`](src/polyfills/process.ts)
+
+`buildProcessEnv(config?)` creates a per-engine `process` object:
+
+- `env` with `NODE_ENV=development`, `TERM=xterm-256color`, `COLORTERM=truecolor`, etc.
+- `cwd()` / `chdir(dir)`, `platform: 'linux'`, `arch: 'x64'`
+- `version: 'v22.12.0'`, `versions.webcontainer = '1.0.0'`
+- `exit(code)` throws an Error (can't actually terminate)
+- `nextTick(fn)` → `queueMicrotask(fn)`
+- `hrtime()` backed by `performance.now()`
+
+**`fabricateStream()`** creates stdout/stderr that write **real ANSI escape sequences** — `clearLine`, `cursorTo`, `moveCursor` are not no-ops. Terminal UI libraries depend on them.
+
+**Critical:** `const _nativeConsole = console` captured at module load time prevents infinite recursion when the engine overrides `globalThis.console`.
+
+<a id="polyfill-path"></a>
+### Path
+
+**Source:** [`src/polyfills/path.ts`](src/polyfills/path.ts)
+
+Pure POSIX: `join`, `resolve`, `normalize`, `dirname`, `basename`, `extname`, `relative`, `parse`, `format`, `isAbsolute`. `sep = '/'`, `delimiter = ':'`.
+
+<a id="polyfill-crypto"></a>
+### Crypto
+
+**Source:** [`src/polyfills/crypto.ts`](src/polyfills/crypto.ts)
+
+- **Random**: `randomBytes()`, `randomUUID()`, `randomInt()`, `randomFill`/`randomFillSync` via `crypto.getRandomValues()`
+- **Hash / HMAC**: async via `crypto.subtle`; sync via [`sync-digest.ts`](src/polyfills/sync-digest.ts) (real SHA-1/256/384/512/MD5 + HMAC)
+- **KDF**: real `pbkdf2` / `pbkdf2Sync` / `hkdfSync`; real `scrypt`/`scryptSync` via `@noble/hashes`
+- **KeyObject**, `timingSafeEqual` (throws on length mismatch), `getCiphers`/`getHashes`
+- Gaps: `createCipheriv`/`createDecipheriv` throw; sync asymmetric `sign`/`verify` throw; prime/key-pair generation is stubbed
+
+<a id="polyfill-net"></a>
+### Net (TCP)
+
+**Source:** [`src/polyfills/net.ts`](src/polyfills/net.ts)
+
+Simulated `TcpSocket` (extends Duplex) and `TcpServer` (extends EventEmitter). Port 0 picks random from range 3000–4000. `address()` includes `host` alias (Elysia compatibility).
+
+<a id="polyfill-zlib"></a>
+### Zlib
+
+**Source:** [`src/polyfills/zlib.ts`](src/polyfills/zlib.ts)
+
+Gzip/deflate/inflate via pako, brotli via CDN WASM. Transform stream classes (`Gzip`, `Gunzip`, etc.), `_handle.close` stub for next/tar compatibility, `_processChunk()` for synchronous processing.
+
+<a id="polyfill-child-process"></a>
+### Child Process
+
+**Source:** [`src/polyfills/child_process.ts`](src/polyfills/child_process.ts) (~2,288 lines)
+
+The most complex polyfill. Key components:
+
+- **`executeNodeBinary()`** — core script runner: resolves path, creates ScriptEngine, hooks `process.exit()` to throw, runs via `runFileTLA()`, monitors event loop (stays alive while `getRefCount() > 0` or servers exist)
+- **`exec()`** — runs inline through `NodepodShell`
+- **`execSync()`** — fast path for trivial commands, then true blocking via `Atomics.wait()`
+- **`spawn()`** — delegates to child worker if `_spawnChildFn` set, else inline shell
+- **`fork()`** — requires `_forkChildFn`, wires IPC messaging
+- **`handleSyncCommand()`** — fast-path for version checks, `echo`, `pwd`, `which`, `cat`, `ls`, `test`
+
+<a id="polyfill-readline"></a>
+### Readline
+
+**Source:** [`src/polyfills/readline.ts`](src/polyfills/readline.ts)
+
+Critical for `@clack/prompts` and `inquirer`:
+
+- `emitKeypressEvents(stream)` — parses `data` events into `keypress` events with `{ name, ctrl, meta, shift }`
+- `Interface` — tracks `line` and `cursor` on **every keystroke** (not just Enter), because `@clack/prompts` reads these directly
+- `_activeInterfaceCount` tracking prevents `executeNodeBinary` from exiting while prompts are open
+
+<a id="polyfill-others"></a>
+### Other Polyfills
+
+| Module | Source | Key Details |
+|--------|--------|-------------|
+| `url` | [`src/polyfills/url.ts`](src/polyfills/url.ts) | Wraps browser `URL` + legacy `parse`/`format`/`resolve`, `fileURLToPath`, `pathToFileURL` |
+| `querystring` | [`src/polyfills/querystring.ts`](src/polyfills/querystring.ts) | `parse`, `stringify` with custom separators, `maxKeys` |
+| `util` | [`src/polyfills/util.ts`](src/polyfills/util.ts) | `format` (sprintf), `inspect` (recursive renderer), `promisify`, `inherits`, `isDeepStrictEqual`, `parseArgs`, `styleText` (ANSI) |
+| `os` | [`src/polyfills/os.ts`](src/polyfills/os.ts) | Mock Linux data: `platform()='linux'`, `arch()='x64'`, `cpus()` (2 virtual), `totalmem()` (4GB) |
+| `tty` | [`src/polyfills/tty.ts`](src/polyfills/tty.ts) | `isatty()` returns `false`, `ReadStream`/`WriteStream` stubs |
+| `assert` | [`src/polyfills/assert.ts`](src/polyfills/assert.ts) | Full: `ok`, `equal`, `deepEqual`, `throws`, `rejects`, `match`, `fail`, `AssertionError` class |
+| `string_decoder` | [`src/polyfills/string_decoder.ts`](src/polyfills/string_decoder.ts) | `StringDecoder` wrapping `TextDecoder` |
+| `timers` | [`src/polyfills/timers.ts`](src/polyfills/timers.ts) | Maps to browser globals + `timers/promises` |
+| `constants` | [`src/polyfills/constants.ts`](src/polyfills/constants.ts) | OS signals (SIGKILL=9, SIGTERM=15...), errno (ENOENT=-2...), filesystem constants |
+| `punycode` | [`src/polyfills/punycode.ts`](src/polyfills/punycode.ts) | Full Punycode/IDNA encoding (RFC 3492) with `toASCII`/`toUnicode` |
+| `chokidar` | [`src/polyfills/chokidar.ts`](src/polyfills/chokidar.ts) | `PathWatcher` on MemoryVolume with glob/ignore/depth support |
+| `ws` | [`src/polyfills/ws.ts`](src/polyfills/ws.ts) | `WebSocket` client + `WebSocketServer` with loopback/BroadcastChannel/native modes, frame encode/decode |
+| `readdirp` | [`src/polyfills/readdirp.ts`](src/polyfills/readdirp.ts) | Recursive `DirectoryScanner` with glob filters, `async iterator` support |
+| `esbuild` | [`src/polyfills/esbuild.ts`](src/polyfills/esbuild.ts) | CDN-loaded esbuild-wasm with volume plugin, `build()`, `transform()`, `context()`, platform-aware condition orders |
+| `rollup` | [`src/polyfills/rollup.ts`](src/polyfills/rollup.ts) | CDN-loaded `@rollup/browser` + acorn-based `parseAst` (with JSX fallback) |
+| `module` | [`src/polyfills/module.ts`](src/polyfills/module.ts) | `Module` constructor function (not plain object — Next.js checks prototype), `createRequire`, 74 `builtinModules` |
+| `worker_threads` | [`src/polyfills/worker_threads.ts`](src/polyfills/worker_threads.ts) | Real `Worker` class backed by Web Workers via fork infrastructure, `MessagePort`/`MessageChannel` |
+| `perf_hooks` | [`src/polyfills/perf_hooks.ts`](src/polyfills/perf_hooks.ts) | Wraps `globalThis.performance` + `PerformanceObserver` stub |
+| `https` | [`src/polyfills/https.ts`](src/polyfills/https.ts) | Thin facade over `http`, forces `'https'` protocol on client requests |
+| `console` | [`src/polyfills/console.ts`](src/polyfills/console.ts) | Per-engine console wrapper with `onConsole` callback routing |
+| `volume-registry` | [`src/polyfills/volume-registry.ts`](src/polyfills/volume-registry.ts) | Shared VFS registry for cross-module volume access |
+
+<a id="polyfill-stubs"></a>
+### Stub Modules
+
+Impossible to implement in the browser:
+
+| Module | Behavior |
+|--------|----------|
+| `dns` | Lookups via Cloudflare DNS-over-HTTPS; localhost short-circuits to `127.0.0.1` |
+| `vm` | Uses browser `eval()` / `new Function()` — no real V8 isolates. `Script` class, `createContext`, `compileFunction`, `Module`/`SourceTextModule`/`SyntheticModule` stubs |
+| `v8` | Returns zeros for all heap stats, JSON-based `serialize`/`deserialize` |
+| `tls`, `dgram`, `cluster`, `http2`, `inspector`, `domain`, `diagnostics_channel`, `async_hooks` | Throw on use |
+| `fsevents` | macOS-only native module, throws |
+| `lightningcss` | CSS processing stub (real processing via CDN WASM when needed) |
+| `quic` | QUIC protocol stub |
+| `repl` | REPL stub |
+| `sea` | Single Executable Applications stub |
+| `sqlite` | WASM-backed `DatabaseSync` via wa-sqlite (~586 KB lazy-loaded), MemoryVolume persistence |
+| `trace_events` | Trace events stub |
+| `wasi` | WebAssembly System Interface stub |
+
+---
+
+<a id="the-shell"></a>
+## The Shell — A Custom Bash Interpreter
+
+**Source:** [`src/shell/`](src/shell/)
+
+The shell replaced a 7.4MB WASM Bash dependency with a custom lightweight interpreter.
+
+### Pipeline
+
+```
+User input: "echo $HOME | grep user && ls -la /tmp"
+    │
+    ▼
+expandCommandSubstitution()   [shell-interpreter.ts]
+  → resolves $(...) and `backtick` recursively
+    │
+    ▼
+tokenize(input, env, lastExit) [shell-parser.ts]
+  → character-by-character scan, variable expansion, quoting
+    │
+    ▼
+Parser.parseList()             [shell-parser.ts]
+  → recursive descent: list → pipeline → command
+    │
+    ▼
+ListNode AST
+  { entries: [
+      { pipeline: [echo, grep], next: "&&" },
+      { pipeline: [ls] }
+    ] }
+    │
+    ▼
+execList → execPipeline → execCommand  [shell-interpreter.ts]
+  → chains stdout→stdin across pipes
+  → dispatches to: builtin | alias | registered command | PATH | not found
+```
+
+<a id="shell-tokenizer"></a>
+### Tokenizer
+
+**Source:** [`src/shell/shell-parser.ts`](src/shell/shell-parser.ts) — `tokenize()`
+
+Handles operators (`|`, `&&`, `||`, `;`, `>`, `>>`, `<`, `2>&1`), single/double quoting, backslash escapes, `#` comments.
+
+**Variable expansion** (`expandVariables()`): `$VAR`, `${VAR:-default}`, `${VAR:=default}`, `$?`, `$$`, `$0`, `$#`, tilde expansion.
+
+**Glob expansion** (`expandGlob()`): `*` and `?` patterns matched against VFS directory contents.
+
+<a id="shell-parser"></a>
+### Parser
+
+**Source:** [`src/shell/shell-parser.ts`](src/shell/shell-parser.ts) — `Parser` class
+
+Recursive-descent producing `ListNode` → `PipelineNode` → `CommandNode` AST. `parseCommand()` separates leading `KEY=value` assignments from args and redirects.
+
+<a id="shell-interpreter"></a>
+### Interpreter
+
+**Source:** [`src/shell/shell-interpreter.ts`](src/shell/shell-interpreter.ts) — `NodepodShell` class
+
+- `exec()` serializes concurrent calls via `_execQueue` mutex
+- `execCommand()` dispatches: **builtin** → **alias** → **source** → **registered command** → **PATH search** → **not found (127)**
+- `expandCommandSubstitution()` handles `$(...)` and backticks before tokenization
+- `applyRedirects()` handles `>`, `>>`, `<`, `2>&1`
+- `resolveFromPath()` searches `PATH` directories, reads bin stubs to extract JS entry points
+
+<a id="shell-builtins"></a>
+### Built-in Commands
+
+53+ builtins across 5 modules under `src/shell/commands/`, plus registered tools (`node`, `npx`, `npm`/`pnpm`/`yarn`/`bun`/`bunx`, `git`) and interpreter specials (`alias`, `source`, `history`, `sh -c`). Redirects include `>`, `>>`, `<`, `2>&1`, `2>`, and `2>>`.
+
+**File ops** (`file-ops.ts`): `cat` (-n/-b/-s/-E/-T/-A), `head` (-n/-c), `tail`, `touch`, `cp` (-r), `mv`, `rm` (-rf), `mkdir` (-p), `rmdir` (-p), `chmod` (stores file modes via VFS), `wc` (-l/-w/-c/-m/-L), `tee` (-a), `readlink` / `ln` (real VFS symlinks and hard links), `write`
+
+**Directory** (`directory.ts`): `ls` (-l/-a/-A/-R/-1/-h/-S/-t/-r/-F/-d/-i with ANSI colors), `cd` (including `cd -`), `pwd`, `basename`, `dirname`, `realpath`
+
+**Text processing** (`text-processing.ts`): `echo` (-n/-e), `printf` (full format strings), `grep` (-i/-v/-c/-l/-n/-r/-o/-w/-E with context and ANSI highlighting), `sed` (s///d, addresses, -i), `sort` (-r/-n/-u/-f/-h/-V/-k), `uniq` (-c/-d/-u), `tr` (-d/-s/-c with POSIX char classes), `cut` (-d/-f/-b), `rev`, `paste`, `comm`, `diff` (-q/-u, LCS-based), `seq`, `yes`
+
+**Search** (`search.ts`): `find` (-name/-iname/-type/-maxdepth/-size/-mtime/-empty/-delete/-exec), `xargs` (-n/-I/-0)
+
+**Shell env** (`shell-env.ts`): `export`, `unset`, `env`, `which` (-a), `type`, `true`/`false`, `exit`, `clear`, `test`/`[` (including `-h`/`-L` symlink checks), `date` (format strings), `sleep`
+
+**Package managers** (`npm.ts`, `pnpm.ts`, `yarn.ts`, `bun.ts` + `src/packages/pm-cli.ts`): install/run/exec plus real `outdated`/`audit`/`ping`/`whoami`/`fund`/`cache clean`, `.npmrc` config, `npm pkg`, lockfile-aware `npm ci`, and `npm pack` tarballs. Global installs (`-g`) are rejected.
+
+**Node runner** (`node.ts`): `node` command dispatch
+
+**Git** (`git.ts`): In-memory git on the VFS. Local: `init`, `add`, `commit`, `status`, `log`, `show`, `diff`, `branch`, `checkout`/`switch`, `restore`, `clean`, `merge` (3-way with conflicts), `cherry-pick`, `revert`, `rebase` (linear), `tag`, `blame`, `stash`, `reset`, `rm`, `rev-parse`, `config`. Remotes (`clone`/`push`/`pull`/`fetch`) use the GitHub API when `GITHUB_TOKEN` is set — not the raw git protocol.
+
+---
+
+<a id="package-management"></a>
+## Package Management — npm in the Browser
+
+**Source:** [`src/packages/`](src/packages/)
+
+<a id="registry-client"></a>
+### Registry Client
+
+**Source:** [`src/packages/registry-client.ts`](src/packages/registry-client.ts)
+
+- `fetchManifest(name)` — `GET https://registry.npmjs.org/<name>` with abbreviated metadata format
+- `downloadArchive(url)` — fetches tarball as `ArrayBuffer`
+- Results cached in a `Map`
+
+<a id="version-resolution"></a>
+### Version Resolution
+
+**Source:** [`src/packages/version-resolver.ts`](src/packages/version-resolver.ts)
+
+Full semver: exact, ranges (`>=1.2.0 <3`), caret (`^`), tilde (`~`), hyphen, X-ranges, OR unions, pre-release, npm aliases. `padVersion()` handles partial versions. Dependency tree walked recursively with circular detection and parallel batches of 8.
+
+<a id="archive-extraction"></a>
+### Archive Extraction
+
+**Source:** [`src/packages/archive-extractor.ts`](src/packages/archive-extractor.ts)
+
+`parseTarArchive()` is a generator reading 512-byte blocks. Gzip decompression via pako. `stripComponents: 1` strips npm's `package/` prefix. Extraction offloaded to Web Workers for performance.
+
+<a id="module-transformation"></a>
+### Module Transformation
+
+**Source:** [`src/module-transformer.ts`](src/module-transformer.ts)
+
+`convertPackage()` walks `.js`/`.jsx` files, checks for ESM syntax, transforms in worker-offloaded batches of 50 via esbuild-wasm. JSX auto-detected via heuristic. `.mjs` files never converted.
+
+### End-to-End Install Flow
+
+```
+installer.install("express@4.18.2")
+  │
+  ├─ splitSpecifier() → { name: "express", version: "4.18.2" }
+  │
+  ├─ resolveDependencyTree()
+  │    ├─ fetchManifest("express") from registry
+  │    ├─ pickBestMatch() via satisfiesRange()
+  │    └─ walkDependency() recursively (8 concurrent)
+  │
+  ├─ materializePackages()
+  │    ├─ Skip already-installed packages
+  │    ├─ downloadAndExtract() in batches of 12
+  │    ├─ convertPackage() — ESM to CJS via esbuild
+  │    └─ createBinStubs() in node_modules/.bin/
+  │
+  └─ writeLockFile() → node_modules/.package-lock.json
+```
+
+---
+
+<a id="the-process-model"></a>
+## The Process Model — WebContainers-Style Workers
+
+**Source:** [`src/threading/`](src/threading/) (16 files)
+
+Each spawned process runs in its own Web Worker with its own `MemoryVolume`, `ScriptEngine`, and `NodepodShell`.
+
+### Architecture
+
+```
+Main Thread                          Web Workers
+┌──────────────────┐                ┌─────────────┐
+│  ProcessManager   │───spawn()────→│  Worker #1   │
+│    ├─ handles[]   │←──messages───│  (shell)     │
+│    ├─ _childPids  │                └─────────────┘
+│    ├─ _serverPorts│                ┌─────────────┐
+│  VFSBridge       │───vfs-sync───→│  Worker #2   │
+│  SyncChannel     │←──spawn-sync──│  (node app)  │
+│  SharedVFS (SAB) │───shared mem──→│              │
+└──────────────────┘                └─────────────┘
+```
+
+<a id="process-manager"></a>
+### ProcessManager
+
+**Source:** [`src/threading/process-manager.ts`](src/threading/process-manager.ts)
+
+- **Spawning**: Max 50 processes, max 10 depth. Transfers VFS binary snapshot (zero-copy via `Transferable`).
+- **Process tree**: `_childPids: Map<number, Set<number>>`
+- **Signal propagation**: `kill(pid, signal)` recursively kills all descendants
+- **VFS sync**: `broadcastVFSChange()` sends to all workers except originator
+- **HTTP dispatch**: `dispatchHttpRequest(port, ...)` routes to owning worker
+- **Sync handling**: On `spawn-sync`, spawns child, routes output directly to blocked parent's handle (since parent can't process `postMessage`)
+
+The worker blob URL comes from `PROCESS_WORKER_BUNDLE` — a pre-bundled IIFE of `process-worker-entry.ts` embedded as a string literal.
+
+<a id="process-handle"></a>
+### ProcessHandle
+
+**Source:** [`src/threading/process-handle.ts`](src/threading/process-handle.ts)
+
+Per-process main-thread wrapper with:
+- **Exit deferral**: `holdExit()`/`releaseExit()` — parent waits for children (handles `create-vite` pattern where scaffolding exits but dev server keeps running)
+- **25+ message types** from worker dispatched as EventEmitter events
+- **Sync blocking tracking**: `_syncBlockedCount` tracks if worker is blocked on `Atomics.wait()`
+
+<a id="process-worker-entry"></a>
+### Process Worker Entry
+
+**Source:** [`src/threading/process-worker-entry.ts`](src/threading/process-worker-entry.ts)
+
+Each worker runs its own volume, engine, and shell. The `onmessage` handler routes 15+ message types. **Critical**: `handleShellExec()` calls `shellExec()` directly (not `child_process.exec()`) to avoid infinite worker recursion.
+
+<a id="vfs-bridge"></a>
+### VFS Bridge and Sync
+
+Three-tier synchronization:
+
+1. **Binary snapshot** at spawn time ([`src/threading/vfs-bridge.ts`](src/threading/vfs-bridge.ts) — `createSnapshot()`)
+2. **Async messages** for ongoing changes — worker write → main thread → broadcast to all other workers
+3. **SharedArrayBuffer** ([`src/threading/shared-vfs.ts`](src/threading/shared-vfs.ts)) — optional zero-copy synchronous reads, 64MB buffer, max 16,384 files
+
+**Echo prevention**: `_suppressVFSWatch` flag prevents worker-originated writes from being re-broadcast back.
+
+<a id="sync-channel"></a>
+### Sync Channel — True Blocking execSync
+
+**Source:** [`src/threading/sync-channel.ts`](src/threading/sync-channel.ts)
+
+```
+Worker (blocked)                    Main Thread
+  allocateSlot()
+  post spawn-sync ──────────────→  spawn child worker
+  Atomics.wait() ← blocks          child runs...
+  ... blocked ...                   child exits
+  ... blocked ...                   writeResult(slot, exitCode, stdout)
+  ← wakes up ←── Atomics.notify()
+  read result from shared memory
+```
+
+64 slots, 16KB each. Status values: 0=pending, 1=complete, 2=error. Timeout: 120 seconds.
+
+<a id="offload-workers"></a>
+### Offload Workers
+
+**Source:** [`src/threading/offload.ts`](src/threading/offload.ts), [`src/threading/worker-pool.ts`](src/threading/worker-pool.ts), [`src/threading/task-queue.ts`](src/threading/task-queue.ts)
+
+Separate pool for CPU-intensive tasks (esbuild transforms, tarball extraction, bundling). Workers created from embedded JS source string (Blob URL). Priority queue dispatches to pool (min 1, max `hardwareConcurrency` capped at 6, idle reap after 30s). Falls back to main-thread execution if Workers fail.
+
+---
+
+<a id="the-sdk"></a>
+## The SDK — Clean Public API
+
+**Source:** [`src/sdk/`](src/sdk/)
+
+<a id="nodepod-boot"></a>
+### Nodepod.boot()
+
+**Source:** [`src/sdk/nodepod.ts`](src/sdk/nodepod.ts)
+
+```typescript
+const nodepod = await Nodepod.boot({
+  files: { '/index.js': 'console.log("hi")' },
+  env: { NODE_ENV: 'production' },
+  workdir: '/app',
+  swUrl: '/sw.js',
+  onServerReady: (port, url) => { }
+});
+```
+
+Boot: check prerequisites (Worker + SAB) → create core components → populate VFS → create standard dirs → init shell → register Service Worker.
+
+Constructor wires: VFS change broadcasting, `server-listen`/`server-close` → RequestProxy, SharedVFS + SyncChannel if SAB available.
+
+<a id="nodepod-fs"></a>
+### NodepodFS
+
+**Source:** [`src/sdk/nodepod-fs.ts`](src/sdk/nodepod-fs.ts) (109 lines)
+
+Async facade over MemoryVolume. `writeFile` auto-creates parent dirs. `rmdir({recursive})` does recursive delete. `watch()` delegates to `volume.watch()`.
+
+<a id="nodepod-process"></a>
+### NodepodProcess
+
+**Source:** [`src/sdk/nodepod-process.ts`](src/sdk/nodepod-process.ts) (103 lines)
+
+EventEmitter handle returned by `spawn()`. Events: `output`, `error`, `exit`. `completion` Promise resolves on exit. `write(data)` sends stdin. `kill()` sends SIGINT. Deliberately "dumb" — all wiring done by `Nodepod.spawn()`.
+
+<a id="nodepod-terminal"></a>
+### NodepodTerminal
+
+**Source:** [`src/sdk/nodepod-terminal.ts`](src/sdk/nodepod-terminal.ts) (~350 lines)
+
+xterm.js-based terminal (peer dependency, not bundled):
+
+- **Line editing**: character input, backspace, Ctrl+U (clear before cursor), Ctrl+K (clear after)
+- **History**: up/down arrows with saved current line
+- **Raw mode**: forwards keystrokes directly to process (for interactive CLI tools)
+- **Cooked mode**: line-buffered with local echo
+- **Ctrl+C**: aborts via AbortController, writes `^C\r\n`, shows prompt
+- **Ctrl+L**: clears screen, re-renders prompt + current input
+- **Persistent shell worker**: spawned once, reused for all commands
+- **Default theme**: GitHub Dark (18 ANSI colors)
+
+---
+
+<a id="the-service-worker-bridge"></a>
+## The Service Worker Bridge — RequestProxy
+
+**Source:** [`src/request-proxy.ts`](src/request-proxy.ts) (~680 lines)
+
+Bridges Service Worker HTTP requests to virtual servers:
+
+1. **Registration**: `initServiceWorker()` registers SW with `MessageChannel`
+2. **Interception**: SW intercepts `/__virtual__/{port}/...` URLs
+3. **Routing**: Main thread dispatches to owning worker via ProcessManager
+4. **Response**: Flows back through the chain
+
+Also handles:
+- **WebSocket bridge** via `BroadcastChannel("nodepod-ws")` — relays connect/send/close between iframe previews and virtual servers
+- **Streaming responses**: `stream-start`/`stream-chunk`/`stream-end` protocol
+- **Fallback**: 404 responses with `originalUrl` fall back to real network fetch
+
+---
+
+<a id="build-system"></a>
+## Build System and Configuration
+
+### Library Build
+
+**Source:** [`vite.lib.config.js`](vite.lib.config.js)
+
+Vite produces `dist/index.mjs` (ESM) and `dist/index.cjs` (CJS).
+
+**Inline Process Worker Plugin**: Pre-bundles `process-worker-entry.ts` with esbuild into a self-contained IIFE, embeds as a string literal (`PROCESS_WORKER_BUNDLE`). At runtime: `new Worker(URL.createObjectURL(new Blob([PROCESS_WORKER_BUNDLE])))`. This avoids consumer bundlers failing to resolve worker chunk URLs.
+
+**Externals**: Only peer deps (`@xterm/*`) and `node:*` builtins externalized. Runtime deps (pako, acorn, comlink) inlined.
+
+### CDN Dependencies
+
+Several large dependencies loaded at runtime:
+
+| Dependency | CDN URL | Source |
+|-----------|---------|--------|
+| esbuild-wasm (0.20.0) | `esm.sh/esbuild-wasm@0.20.0` | [`src/constants/cdn-urls.ts`](src/constants/cdn-urls.ts) |
+| pako (2.1.0) | `esm.sh/pako@2.1.0` | [`src/constants/config.ts`](src/constants/config.ts) |
+| @rollup/browser (4.9.0) | `esm.sh/@rollup/browser@4.9.0` | [`src/constants/cdn-urls.ts`](src/constants/cdn-urls.ts) |
+| brotli-wasm (3.0.1) | `esm.sh/brotli-wasm@3.0.1` | [`src/constants/cdn-urls.ts`](src/constants/cdn-urls.ts) |
+| lightningcss-wasm (1.31.1) | `esm.sh/lightningcss-wasm@1.31.1` | [`src/constants/cdn-urls.ts`](src/constants/cdn-urls.ts) |
+
+`cdnImport()` uses `new Function("url", "return import(url)")` to hide dynamic imports from bundlers.
+
+### Configuration Constants
+
+**Source:** [`src/constants/config.ts`](src/constants/config.ts)
+
+- **Versions**: Node v22.12.0, npm 10.0.0, pnpm 9.15.4, yarn 4.6.0, bun 1.1.38, git 2.43.0
+- **Mock OS**: Linux x64, 2 CPUs, 4GB RAM
+- **Timeouts**: sync ops 120s, worker idle 30s, HTTP dispatch safety 120s
+- **Limits**: max resolve depth 50, module cache 2000, max workers 6
+- **Port range**: 3000–4000
+
+### Helpers
+
+- [`src/helpers/byte-encoding.ts`](src/helpers/byte-encoding.ts) — `bytesToBase64`, `base64ToBytes`, `bytesToHex`, `bytesToLatin1` (chunked at 8192 bytes to avoid stack overflow)
+- [`src/helpers/digest.ts`](src/helpers/digest.ts) — `quickDigest()` DJB2-variant hash for cache keys
+- [`src/helpers/event-loop.ts`](src/helpers/event-loop.ts) — `ref()`/`unref()`/`getRefCount()` controlling when `executeNodeBinary` should exit. Context-aware (per-process in worker mode, global in legacy mode).
+- [`src/helpers/wasm-cache.ts`](src/helpers/wasm-cache.ts) — Background `WebAssembly.compile()` cache for `.wasm` files, avoiding redundant compilation.
+
+---
+
+<a id="key-patterns"></a>
+## Key Patterns and Gotchas
+
+### 1. The `_reg()` Pattern
+Express uses `Object.create(EventEmitter.prototype)` bypassing the constructor. Every EventEmitter method must use `this._reg()` for lazy `_registry` initialization.
+
+### 2. ESM Replacement Trailing Semicolons
+All AST replacement strings in `syntax-transforms.ts` must include trailing semicolons, or the next statement merges.
+
+### 3. `await` Stripping Paren Safety
+Acorn doesn't produce `ParenthesizedExpression` nodes. Replacing from `node.start` to `node.argument.start` for `await (expr)` eats the opening `(`. Fix: replace only the 5-char `await` keyword + whitespace.
+
+### 4. No `async` in CORE_MODULES Polyfills
+`async` functions return native Promises that `syncAwait()` can't unwrap. Polyfills use `.then()` chains or synchronous returns.
+
+### 5. `fabricateStream.write()` Must Route Through `writeFn`
+Without this, `process.stdout.write(...)` silently discards data. `console.log` works independently (via `onConsole` callback), which masked this bug.
+
+### 6. Terminal Ctrl+C Must Not Clear `activeAbort`
+The exec callback checks `signal.aborted` to skip duplicate prompt/cwd-update. Clearing it causes state desync.
+
+### 7. Shell `cd` Owns the Working Directory
+Shell's `cd` updates `ctx.cwd`, `shell.cwd`, `ctx.env.PWD`, AND `process.chdir()`. Never default to `process.cwd()` as fallback — use `getShellCwd()`.
+
+### 8. Worker Bundle Staleness
+`process-worker-entry.ts` is pre-bundled at Vite `buildStart`. Changes require restarting `npm run dev`.
+
+### 9. Module Cache Ordering
+Once cached, a module isn't re-processed even if a later load needs full de-async. Loading order matters.
+
+### 10. Async Server Registration
+`TcpServer.listen()` uses `queueMicrotask`. Need `setTimeout(r, 100)` after `runFile` before checking `getServer(port)`.
+
+### 11. `_nativeConsole` Capture
+Both `script-engine.ts` and `process.ts` capture `const _nativeConsole = console` at load time. Without this, wrapped console fallback paths infinite-recurse.
+
+### 12. stdin Must Only Emit `data`
+`sendStdin()` emits only `data` events. `emitKeypressEvents()` parses those into `keypress` events. Emitting both causes double events.
+
+### 13. `demoteLexicalRequire`
+`.mjs` files declaring `const require = createRequire(...)` cause TDZ after esmToCjs converts `import` → `require()`. Fix: post-process to demote `const/let require =` → `require =` so the wrapper's `var require` is reused.
+
+### 14. Conditional Exports Must Include `"node"`
+Packages like `crossws`, `srvx`, `undici` use `"node"` conditional exports. Without `node: true` in the condition set, they fall back to `"default"` which may be a generic/browser adapter missing required APIs.
+
+---
+
+<a id="conclusion"></a>
+## Conclusion
+
+Nodepod is a JavaScript program pretending to be an operating system:
+
+| Real System | Nodepod Equivalent |
+|-------------|-------------------|
+| Linux kernel VFS | `MemoryVolume` — in-memory tree of `VolumeNode` objects |
+| Node.js runtime | `ScriptEngine` — eval-based execution with sandboxed globals |
+| Node.js standard library | 50+ polyfill modules in `src/polyfills/` |
+| Bash shell | `NodepodShell` — recursive-descent parser + interpreter |
+| npm CLI | `DependencyInstaller` — registry client + semver resolver + tar extractor |
+| OS processes | Web Workers with typed 25+ message protocol |
+| Kernel IPC | `SharedArrayBuffer` + `Atomics.wait()` for true blocking |
+| TCP/HTTP networking | In-process server registry + Service Worker bridge |
+
+The trick that makes it all work is the **SyncPromise/SyncThenable** system. By replacing `Promise` globally and carefully stripping `async`/`await` where needed, nodepod makes Node.js's fundamentally synchronous `require()` system work in a browser.
+
+The result: you can `npm install` real packages, run real frameworks, and serve real HTTP responses — all in a browser tab.
+
+### By the Numbers
+
+| Metric | Value |
+|--------|-------|
+| Total source files | ~120 TypeScript files |
+| ScriptEngine | ~3,375 lines |
+| Polyfill files | 50+ |
+| Shell builtins | 53+ commands + registered tools |
+| Shell code (parser + interpreter + commands) | ~6,600 lines |
+| child_process polyfill | ~2,288 lines |
+| Threading system | 16 files |
+| Worker message types | 25+ bidirectional |
+| Max concurrent processes | 50 |
+| Max process tree depth | 10 |
+| Sync channel slots | 64 (16KB each) |
+| Package install concurrency | 12 parallel |
+| Offload worker pool max | 6 |
+
+---
+
+*This post was generated from the nodepod source code at [`nodepod/nodepod/src/`](src/). All file references point to actual source files in the repository.*

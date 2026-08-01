@@ -1,0 +1,23 @@
+# Source (included via "files" in package.json, but just in case)
+# Keep src/ and dist/ — they're in the "files" field
+
+# Development files
+docs/
+examples/
+static/
+coverage/
+.github/
+
+# Config files
+tsconfig.json
+tsconfig.build.json
+vite.lib.config.js
+vitest.config.ts
+.gitignore
+.eslintrc*
+.prettierrc*
+
+# Misc
+CONTRIBUTING.md
+CHANGELOG.md
+*.tsbuildinfo

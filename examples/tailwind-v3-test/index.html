@@ -1,0 +1,614 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>nodepod - tailwind v3 + vite 8 reproduction</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: monospace; background: #1a1a2e; color: #e0e0e0; padding: 20px; line-height: 1.5; }
+    h1 { font-size: 18px; margin-bottom: 4px; color: #fff; }
+    p { font-size: 13px; color: #888; margin-bottom: 12px; max-width: 900px; }
+    code { background: #0d0d1a; padding: 2px 6px; border-radius: 3px; color: #a8e6a3; font-size: 12px; }
+    .layout { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .pane {
+      background: #0d0d1a; border: 1px solid #333; border-radius: 6px;
+      padding: 12px; display: flex; flex-direction: column; min-height: 560px;
+    }
+    .pane h2 { font-size: 13px; margin-bottom: 8px; color: #8ac4e6; }
+    #output {
+      flex: 1; white-space: pre-wrap; font-size: 12px; line-height: 1.55;
+      overflow-y: auto; max-height: 540px;
+    }
+    #frame { flex: 1; border: 1px solid #333; border-radius: 4px; background: #fff; min-height: 400px; }
+    #status {
+      font-size: 12px; padding: 6px 10px; border-radius: 3px;
+      background: #181830; color: #aaa; border: 1px solid #222; margin-bottom: 8px;
+    }
+    .stdout { color: #a8e6a3; }
+    .stderr { color: #e68a8a; }
+    .info { color: #8ac4e6; }
+    .dim { color: #666; }
+    .pass { color: #a8e6a3; font-weight: bold; }
+    .fail { color: #e68a8a; font-weight: bold; }
+    .warn { color: #e6c38a; }
+    .title { color: #c38ae6; font-weight: bold; }
+    .controls { display: flex; gap: 8px; margin-bottom: 12px; align-items: center; flex-wrap: wrap; }
+    button {
+      background: #2a2a4a; color: #e0e0e0; border: 1px solid #444;
+      padding: 6px 12px; border-radius: 4px; font-family: monospace; cursor: pointer;
+    }
+    button:hover { background: #3a3a5a; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+  </style>
+</head>
+<body>
+  <h1>nodepod - tailwind v3 + vite 8 + react reproduction</h1>
+  <p>
+    Mirrors a real-world ai-landing template: <code>tailwindcss@^3.4.7</code> +
+    <code>postcss@^8.4.39</code> + <code>autoprefixer@^10.4.19</code> +
+    <code>vite@^8.0.8</code> + <code>react@^18.3.1</code>. Tailwind v3 is pure JS
+    (no WASM), so any 5xx on <code>/src/index.css</code> isolates a
+    nodepod-side bug rather than a Tailwind-Oxide WASM issue.
+  </p>
+  <p>
+    The <b>"v8 + jsx-runtime"</b> button uses <code>"jsx": "react-jsx"</code>
+    (no <code>import React</code> needed). The <b>"v7 baseline"</b> button uses
+    <code>vite@^7.3.1</code> as a sanity check that the same project works on
+    the older bundler.
+  </p>
+
+  <div class="controls">
+    <button id="run-v8">run tailwind v3 + vite 8 + react 18 (matches user template)</button>
+    <button id="run-v7">run tailwind v3 + vite 7 + react 18 (baseline)</button>
+    <button id="clear">clear log</button>
+  </div>
+
+  <div class="layout">
+    <div class="pane">
+      <h2>log</h2>
+      <div id="output"></div>
+    </div>
+    <div class="pane">
+      <h2>preview iframe</h2>
+      <div id="status">idle</div>
+      <iframe id="frame" sandbox="allow-scripts allow-same-origin allow-forms allow-popups"></iframe>
+    </div>
+  </div>
+
+  <!-- ====== shared project files ====== -->
+
+  <script id="file-index-html" type="text/plain"><!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>tailwind v3 inside nodepod</title>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="module" src="/src/main.tsx"><\/script>
+</body>
+</html>
+</script>
+
+  <script id="file-tsconfig" type="text/plain">{
+  "compilerOptions": {
+    "target": "ES2020",
+    "useDefineForClassFields": true,
+    "lib": ["ES2020", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "skipLibCheck": true,
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "jsx": "react-jsx",
+    "strict": true
+  },
+  "include": ["src"]
+}
+</script>
+
+  <script id="file-vite-env-d-ts" type="text/plain">/// <reference types="vite/client" />
+</script>
+
+  <script id="file-postcss-config" type="text/plain">export default {
+  plugins: {
+    tailwindcss: {},
+    autoprefixer: {},
+  },
+};
+</script>
+
+  <script id="file-tailwind-config" type="text/plain">/** @type {import('tailwindcss').Config} */
+export default {
+  content: ["./index.html", "./src/**/*.{js,ts,jsx,tsx}"],
+  theme: { extend: {} },
+  plugins: [],
+};
+</script>
+
+  <script id="file-vite-config" type="text/plain">import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+
+export default defineConfig({
+  plugins: [react()],
+  server: { host: "0.0.0.0", port: 5173, strictPort: true },
+});
+</script>
+
+  <script id="file-index-css" type="text/plain">@tailwind base;
+@tailwind components;
+@tailwind utilities;
+</script>
+
+  <script id="file-main-tsx" type="text/plain">import React from "react";
+import ReactDOM from "react-dom/client";
+import App from "./App";
+import "./index.css";
+
+ReactDOM.createRoot(document.getElementById("root")!).render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>,
+);
+</script>
+
+  <script id="file-app-tsx" type="text/plain">export default function App() {
+  return (
+    <main className="min-h-screen bg-gradient-to-br from-slate-50 to-slate-100 flex items-center justify-center p-6">
+      <div className="max-w-xl text-center space-y-4">
+        <h1 className="text-4xl font-semibold tracking-tight text-slate-900">
+          Tailwind v3 + Vite + React inside nodepod
+        </h1>
+        <p className="text-slate-600">
+          If you see a styled gradient page with this heading, /src/index.css
+          made it through Vite's PostCSS + Tailwind v3 pipeline correctly.
+        </p>
+        <button
+          className="px-4 py-2 rounded bg-slate-900 text-slate-50 hover:bg-slate-800 transition"
+          onClick={() => alert("works!")}
+        >
+          click me
+        </button>
+      </div>
+    </main>
+  );
+}
+</script>
+
+  <!-- ====== variants: differ only in package.json ====== -->
+
+  <script id="file-package-json-v8" type="text/plain">{
+  "name": "tailwind-v3-vite-8",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0 --port 5173",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.1",
+    "autoprefixer": "^10.4.19",
+    "postcss": "^8.4.39",
+    "tailwindcss": "^3.4.7",
+    "typescript": "^5.4.5",
+    "vite": "^8.0.8"
+  }
+}
+</script>
+
+  <script id="file-package-json-v7" type="text/plain">{
+  "name": "tailwind-v3-vite-7",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0 --port 5173",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.1",
+    "autoprefixer": "^10.4.19",
+    "postcss": "^8.4.39",
+    "tailwindcss": "^3.4.7",
+    "typescript": "^5.4.5",
+    "vite": "^7.3.1"
+  }
+}
+</script>
+
+  <script type="module">
+    import { Nodepod } from "/dist/index.mjs";
+
+    const out = document.getElementById('output');
+    const frame = document.getElementById('frame');
+    const statusEl = document.getElementById('status');
+    const runV8Btn = document.getElementById('run-v8');
+    const runV7Btn = document.getElementById('run-v7');
+    const clearBtn = document.getElementById('clear');
+
+    function log(text, cls = 'stdout') {
+      const span = document.createElement('span');
+      span.className = cls;
+      span.textContent = text + '\n';
+      out.appendChild(span);
+      out.scrollTop = out.scrollHeight;
+    }
+    function setStatus(text, cls = '') {
+      statusEl.textContent = text;
+      statusEl.className = cls;
+    }
+    // any inner closing-script tag inside a <script type="text/plain"> block
+    // closes the outer block (HTML5 script-data tokenization). encode the
+    // single inner one in file-index-html as `<\/...>` and restore it here.
+    function readFile(id) {
+      return document.getElementById(id).textContent.replace(/<\\\/script>/g, '<' + '/script>');
+    }
+
+    clearBtn.addEventListener('click', () => { out.textContent = ''; });
+
+    function disableButtons(disabled) {
+      runV8Btn.disabled = disabled;
+      runV7Btn.disabled = disabled;
+    }
+
+    async function mountFiles(pod, files) {
+      const writes = [];
+      for (const [path, content] of Object.entries(files)) {
+        writes.push(pod.fs.writeFile(path, content));
+      }
+      await Promise.all(writes);
+    }
+
+    async function runCommand(pod, command, args = []) {
+      const hasRootPath = args.some((a) => a.startsWith('/'));
+      const proc = await pod.spawn(command, args, {
+        cwd: hasRootPath ? '/' : pod.cwd,
+      });
+      proc.on('output', (t) => log(t.trimEnd(), 'stdout'));
+      proc.on('error', (t) => log(t.trimEnd(), 'stderr'));
+      return proc;
+    }
+
+    async function runVariant(variant, label) {
+      disableButtons(true);
+      frame.removeAttribute('src');
+      setStatus('booting ...', 'warn');
+
+      const pkgId = variant === 'v8' ? 'file-package-json-v8' : 'file-package-json-v7';
+
+      try {
+        log(`=== ${label} ===`, 'title');
+
+        let serverUrl = null;
+        const serverReadyPromise = new Promise((resolve) => {
+          window.__onServerReady = (url) => { serverUrl = url; resolve(url); };
+        });
+
+        log('booting nodepod (workdir=/app) ...', 'info');
+        const pod = await Nodepod.boot({
+          watermark: false,
+          workdir: '/app',
+          allowedFetchDomains: null,
+          onServerReady: (port, url) => {
+            log(`[onServerReady] port=${port} url=${url}`, 'info');
+            window.__onServerReady(url);
+          },
+        });
+        log('booted.\n', 'info');
+
+        log('writing project files via pod.fs.writeFile ...', 'info');
+        await mountFiles(pod, {
+          '/app/package.json':       readFile(pkgId),
+          '/app/vite.config.ts':     readFile('file-vite-config'),
+          '/app/tsconfig.json':      readFile('file-tsconfig'),
+          '/app/postcss.config.js':  readFile('file-postcss-config'),
+          '/app/tailwind.config.js': readFile('file-tailwind-config'),
+          '/app/index.html':         readFile('file-index-html'),
+          '/app/src/main.tsx':       readFile('file-main-tsx'),
+          '/app/src/App.tsx':        readFile('file-app-tsx'),
+          '/app/src/index.css':      readFile('file-index-css'),
+          '/app/src/vite-env.d.ts':  readFile('file-vite-env-d-ts'),
+        });
+        log('files mounted.\n', 'info');
+
+        log('--- npm install ---', 'title');
+        const installProc = await runCommand(pod, 'npm', ['install']);
+        const installRes = await installProc.completion;
+        if (installRes.exitCode !== 0) {
+          log(`npm install failed (exit=${installRes.exitCode})`, 'fail');
+          setStatus('install failed', 'fail');
+          return;
+        }
+        log('npm install done.\n', 'pass');
+
+        // diagnostic kept available but disabled by default. set
+        //   window.__nodepodTailwindV3Probe = true
+        // in devtools before clicking the button to enable. The diagnostic
+        // helped confirm the issue #54 root cause (path.dirname stripped
+        // leading `./` causing glob-parent to mis-account base length).
+        const enableProbe = !!(window).__nodepodTailwindV3Probe;
+        log('--- diagnostic: probing tailwind v3 content scan ---', 'title');
+        if (!enableProbe) {
+          log('(probe disabled; set window.__nodepodTailwindV3Probe = true to enable)', 'dim');
+        }
+        try {
+          if (!enableProbe) throw new Error('probe disabled');
+          // node -e isn't wired up in nodepod's spawn router, so write a
+          // probe script to disk and execute it.
+          const probeScript = [
+            "const fs = require('fs');",
+            "const path = require('path');",
+            "console.log('cwd=' + process.cwd());",
+            "",
+            "  // EXPERIMENT -1: try fast-glob with the EXACT tailwind options on relative globs.",
+            "  // tailwind's call is fastGlob.async(pattern, { absolute: true }) -- no cwd specified.",
+            "  // if this returns 0 files, fast-glob itself fails on relative globs in our env.",
+            "  console.log('--- experiment -1: fast-glob relative globs WITHOUT explicit cwd ---');",
+            "  try {",
+            "    const fg = require('fast-glob');",
+            "    const r1 = fg.sync('./src/**/*.{js,ts,jsx,tsx}', { absolute: true });",
+            "    console.log('  fast-glob({absolute:true}) for ./src/**/*.{js,ts,jsx,tsx} returned ' + r1.length + ' files: ' + JSON.stringify(r1));",
+            "    const r2 = fg.sync('./src/**/*.{js,ts,jsx,tsx}', {});",
+            "    console.log('  fast-glob({}) for ./src/**/*.{js,ts,jsx,tsx} returned ' + r2.length + ' files: ' + JSON.stringify(r2));",
+            "    const r3 = fg.sync('src/**/*.{js,ts,jsx,tsx}', {});",
+            "    console.log('  fast-glob({}) for src/**/*.{js,ts,jsx,tsx} (no leading dot) returned ' + r3.length + ' files: ' + JSON.stringify(r3));",
+            "    const r4 = fg.sync('/app/src/**/*.{js,ts,jsx,tsx}', { absolute: true });",
+            "    console.log('  fast-glob({absolute:true}) for /app/src/**/*.{js,ts,jsx,tsx} returned ' + r4.length + ' files: ' + JSON.stringify(r4));",
+            "    // also try readdirSync directly with withFileTypes to see Dirent values",
+            "    const dirents = fs.readdirSync('/app/src', { withFileTypes: true });",
+            "    for (const d of dirents) {",
+            "      console.log('  Dirent /app/src/' + d.name + ' isFile=' + d.isFile() + ' isDirectory=' + d.isDirectory() + ' isSymbolicLink=' + d.isSymbolicLink());",
+            "    }",
+            "    // try at /app",
+            "    const dirents2 = fs.readdirSync('/app', { withFileTypes: true });",
+            "    for (const d of dirents2) {",
+            "      console.log('  Dirent /app/' + d.name + ' isFile=' + d.isFile() + ' isDirectory=' + d.isDirectory());",
+            "    }",
+            "  } catch (e) {",
+            "    console.log('  exp-1 threw: ' + e.message);",
+            "  }",
+            "",
+            "  // EXPERIMENT 0: trace what tailwind actually hands fast-glob.",
+            "  // monkey-patch fast-glob.async + fast-glob.sync to log every call,",
+            "  // then run tailwind+postcss and watch what tailwind asks fast-glob for.",
+            "  console.log('--- experiment 0: fast-glob call log ---');",
+            "  try {",
+            "    const fg = require('fast-glob');",
+            "    const origAsync = fg.async ? fg.async.bind(fg) : null;",
+            "    const origSync = fg.sync ? fg.sync.bind(fg) : null;",
+            "    const origDefault = fg.bind ? fg.bind(null) : null;",
+            "    const log_call = (label, src, args) => {",
+            "      console.log('  fastglob.' + label + ' called from tailwind:');",
+            "      console.log('    pattern=' + JSON.stringify(args[0]));",
+            "      console.log('    options=' + JSON.stringify(args[1] || {}));",
+            "    };",
+            "    if (origAsync) fg.async = function(...a) { log_call('async', null, a); return origAsync(...a).then(r => { console.log('    -> ' + r.length + ' files'); return r; }); };",
+            "    if (origSync) fg.sync = function(...a) { log_call('sync', null, a); const r = origSync(...a); console.log('    -> ' + r.length + ' files'); return r; };",
+            "  } catch (e) {",
+            "    console.log('  monkey-patch threw: ' + e.message);",
+            "  }",
+            "",
+            "  // dump the parseFilePath function from content.js so we can see",
+            "  // exactly how tailwind splits a glob into base/glob.",
+            "  console.log('--- tailwindcss content.js parseFilePath ---');",
+            "  try {",
+            "    const src = fs.readFileSync('/app/node_modules/tailwindcss/lib/lib/content.js', 'utf8');",
+            "    const idx = src.indexOf('function parseFilePath');",
+            "    if (idx !== -1) console.log(src.slice(idx, idx + 1500));",
+            "    else console.log('  parseFilePath not found in content.js');",
+            "    // also show resolveContentFiles or similar",
+            "    const idx2 = src.indexOf('resolvedChangedContent');",
+            "    if (idx2 !== -1) console.log('--- resolvedChangedContent ---\\n' + src.slice(idx2, idx2 + 1500));",
+            "  } catch (e) { console.log('  read content.js threw: ' + e.message); }",
+            "",
+            "(async () => {",
+            "  const postcss = require('postcss');",
+            "  const tailwindcss = require('tailwindcss');",
+            "  const css = fs.readFileSync('/app/src/index.css', 'utf8');",
+            "",
+            "  // EXPERIMENT 1: pass raw content directly to bypass file scanning entirely.",
+            "  // if THIS still finds 0 utilities, tailwind's class extractor itself is broken.",
+            "  // if THIS finds utilities, the bug is in the file-scanning code path.",
+            "  console.log('--- experiment 1: raw content (skips file scanning) ---');",
+            "  try {",
+            "    const out = await postcss([",
+            "      tailwindcss({",
+            "        content: [{ raw: '<div class=\"min-h-screen bg-gradient-to-br from-slate-50\"></div>', extension: 'html' }],",
+            "        theme: { extend: {} },",
+            "        plugins: [],",
+            "      })",
+            "    ]).process(css, { from: '/app/src/index.css' });",
+            "    const out_css = out.css || '';",
+            "    const found_min_h = out_css.indexOf('.min-h-screen');",
+            "    const found_bg_grad = out_css.indexOf('.bg-gradient-to-br');",
+            "    console.log('  raw-content output length=' + out_css.length);",
+            "    console.log('  found .min-h-screen at offset=' + found_min_h);",
+            "    console.log('  found .bg-gradient-to-br at offset=' + found_bg_grad);",
+            "  } catch (e) {",
+            "    console.log('  experiment 1 threw: ' + e.message);",
+            "  }",
+            "",
+            "  // EXPERIMENT 2: pass an absolute-path content array. takes file-scanning",
+            "  // out of any cwd-relative resolution, but still uses the actual files.",
+            "  console.log('--- experiment 2: absolute-path content (skips relative resolution) ---');",
+            "  try {",
+            "    const out = await postcss([",
+            "      tailwindcss({",
+            "        content: ['/app/src/App.tsx', '/app/src/main.tsx', '/app/index.html'],",
+            "        theme: { extend: {} },",
+            "        plugins: [],",
+            "      })",
+            "    ]).process(css, { from: '/app/src/index.css' });",
+            "    const out_css = out.css || '';",
+            "    const found_min_h = out_css.indexOf('.min-h-screen');",
+            "    const found_bg_grad = out_css.indexOf('.bg-gradient-to-br');",
+            "    console.log('  abs-path output length=' + out_css.length);",
+            "    console.log('  found .min-h-screen at offset=' + found_min_h);",
+            "    console.log('  found .bg-gradient-to-br at offset=' + found_bg_grad);",
+            "  } catch (e) {",
+            "    console.log('  experiment 2 threw: ' + e.message);",
+            "  }",
+            "",
+            "  // EXPERIMENT 3b: REPLICATE THE BROKEN CASE with monkey-patching active.",
+            "  // This is the exact call vite makes; we now capture every fast-glob call.",
+            "  console.log('--- experiment 3b: postcss(tailwind(config-path)) -- the broken case ---');",
+            "  try {",
+            "    // clear tailwind's shared cache between calls",
+            "    const sharedState = require('tailwindcss/lib/lib/sharedState.js');",
+            "    if (sharedState && sharedState.contextSourcesMap) sharedState.contextSourcesMap.clear();",
+            "    if (sharedState && sharedState.contextMap) sharedState.contextMap.clear();",
+            "    if (sharedState && sharedState.configContextMap) sharedState.configContextMap.clear();",
+            "    const out = await postcss([tailwindcss('/app/tailwind.config.js')]).process(css, { from: '/app/src/index.css', to: '/app/src/index.css' });",
+            "    const out_css = out.css || '';",
+            "    const found_min_h = out_css.indexOf('.min-h-screen');",
+            "    console.log('  config-path output length=' + out_css.length);",
+            "    console.log('  found .min-h-screen at offset=' + found_min_h);",
+            "  } catch (e) {",
+            "    console.log('  experiment 3b threw: ' + e.message);",
+            "  }",
+            "",
+            "  // EXPERIMENT 3: invoke tailwind's defaultExtractor directly on App.tsx content.",
+            "  // this tells us whether the regex/extractor finds candidates in our content.",
+            "  console.log('--- experiment 3: defaultExtractor directly on App.tsx ---');",
+            "  try {",
+            "    const defaultExtractor = require('tailwindcss/src/lib/defaultExtractor.js').defaultExtractor",
+            "      || require('tailwindcss/lib/lib/defaultExtractor.js').defaultExtractor;",
+            "    const apptsx = fs.readFileSync('/app/src/App.tsx', 'utf8');",
+            "    console.log('  App.tsx contents length=' + apptsx.length + ' first 100=' + JSON.stringify(apptsx.slice(0, 100)));",
+            "    if (typeof defaultExtractor === 'function') {",
+            "      const ctx = { tailwindConfig: { separator: ':', prefix: '' } };",
+            "      const ext = defaultExtractor(ctx);",
+            "      const candidates = typeof ext === 'function' ? ext(apptsx) : ext;",
+            "      console.log('  defaultExtractor returned ' + (candidates && candidates.length) + ' candidates');",
+            "      console.log('  first 20 candidates: ' + JSON.stringify((candidates || []).slice(0, 20)));",
+            "    } else {",
+            "      console.log('  defaultExtractor is not a function: ' + typeof defaultExtractor);",
+            "    }",
+            "  } catch (e) {",
+            "    console.log('  experiment 3 threw: ' + e.message + ' stack=' + (e.stack||'').split('\\n').slice(0,3).join(' | '));",
+            "  }",
+            "})();",
+            "",
+          ].join('\n');
+          await pod.fs.writeFile('/app/__nodepod_probe.cjs', probeScript);
+          const probeProc = await pod.spawn('node', ['/app/__nodepod_probe.cjs'], { cwd: '/app' });
+          probeProc.on('output', (t) => log(t.trimEnd(), 'info'));
+          probeProc.on('error', (t) => log(t.trimEnd(), 'stderr'));
+          await probeProc.completion;
+        } catch (e) {
+          if (e.message !== 'probe disabled') log('probe failed: ' + e.message, 'stderr');
+        }
+        log('', 'dim');
+
+        log('--- npm run dev ---', 'title');
+        setStatus('starting dev server ...', 'warn');
+        const devProc = await runCommand(pod, 'npm', ['run', 'dev']);
+
+        // race: onServerReady vs dev process exits vs 90s timeout
+        const timeoutMs = 90000;
+        const url = await Promise.race([
+          serverReadyPromise,
+          devProc.completion.then((res) => ({ __exited: true, res })),
+          new Promise((r) => setTimeout(() => r({ __timeout: true }), timeoutMs)),
+        ]);
+
+        if (url && url.__exited) {
+          log(`\ndev process exited before port was bound. exit=${url.res.exitCode}`, 'fail');
+          setStatus('dev exited early', 'fail');
+          return;
+        }
+        if (url && url.__timeout) {
+          log(`\ntimed out after ${timeoutMs}ms waiting for onServerReady`, 'fail');
+          setStatus('timeout', 'fail');
+          devProc.kill();
+          return;
+        }
+
+        log(`\nonServerReady fired with ${url}. probing via SW proxy ...`, 'info');
+        setStatus('probing ...', 'warn');
+
+        // probe: index, the css (this is the one that 500'd in user reports),
+        // and a dep-optimized chunk so we'd notice rolldown trouble too.
+        const base = url.endsWith('/') ? url : url + '/';
+        const probeUrls = [
+          url,
+          new URL('src/index.css', base).toString(),
+          new URL('node_modules/.vite/deps/react.js', base).toString(),
+        ];
+
+        let allOk = false;
+        const results = {};
+        const probeStart = performance.now();
+        // Tailwind v3 is pure JS so should be FAST. Give it 3 minutes max -- if
+        // it's not done by then something is genuinely broken.
+        while (performance.now() - probeStart < 180000) {
+          allOk = true;
+          for (const u of probeUrls) {
+            try {
+              const res = await fetch(u, { cache: 'no-store' });
+              results[u] = `${res.status} ${res.statusText}`;
+              if (!res.ok) {
+                allOk = false;
+                log(`  ${u.replace(url, '<root>')} -> ${res.status} ${res.statusText}`,
+                    res.status >= 500 ? 'fail' : 'warn');
+              }
+            } catch (e) {
+              allOk = false;
+              results[u] = `threw: ${e.message}`;
+              log(`  ${u.replace(url, '<root>')} -> threw: ${e.message}`, 'fail');
+            }
+          }
+          if (allOk) break;
+          await new Promise((r) => setTimeout(r, 1500));
+        }
+
+        log('', 'dim');
+        for (const [u, status] of Object.entries(results)) {
+          log(`  ${u.replace(url, '<root>')} -> ${status}`, status.startsWith('200') ? 'pass' : 'fail');
+        }
+
+        if (allOk) {
+          log(`\nPASS: dev server reachable. pointing iframe at ${url}`, 'pass');
+          setStatus('ready', 'pass');
+          frame.src = url;
+        } else {
+          log(
+            `\nFAIL: at least one URL never returned 200. ` +
+            `if /src/index.css is the one failing with 5xx, check the log above ` +
+            `for "[nodepod] dispatchRequest async error on GET /src/index.css: ..." ` +
+            `which surfaces Vite's actual middleware exception.`,
+            'fail'
+          );
+          setStatus('FAIL (see log)', 'fail');
+          frame.src = url;
+        }
+      } catch (e) {
+        log(`\nuncaught: ${e?.stack || e}`, 'fail');
+        setStatus('uncaught', 'fail');
+      } finally {
+        disableButtons(false);
+      }
+    }
+
+    runV8Btn.addEventListener('click',
+      () => runVariant('v8', 'tailwind v3 + vite 8 + react 18'));
+    runV7Btn.addEventListener('click',
+      () => runVariant('v7', 'tailwind v3 + vite 7 + react 18'));
+  </script>
+</body>
+</html>

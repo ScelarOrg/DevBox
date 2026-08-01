@@ -1,0 +1,760 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>nodepod - issue #54 tailwind v4</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: monospace; background: #1a1a2e; color: #e0e0e0; padding: 20px; line-height: 1.5; }
+    h1 { font-size: 18px; margin-bottom: 4px; color: #fff; }
+    p { font-size: 13px; color: #888; margin-bottom: 12px; max-width: 900px; }
+    a { color: #8ac4e6; }
+    code { background: #0d0d1a; padding: 2px 6px; border-radius: 3px; color: #a8e6a3; font-size: 12px; }
+    .layout { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .pane {
+      background: #0d0d1a; border: 1px solid #333; border-radius: 6px;
+      padding: 12px; display: flex; flex-direction: column; min-height: 560px;
+    }
+    .pane h2 { font-size: 13px; margin-bottom: 8px; color: #8ac4e6; }
+    #output {
+      flex: 1; white-space: pre-wrap; font-size: 12px; line-height: 1.55;
+      overflow-y: auto; max-height: 540px;
+    }
+    #frame { flex: 1; border: 1px solid #333; border-radius: 4px; background: #fff; min-height: 400px; }
+    #status {
+      font-size: 12px; padding: 6px 10px; border-radius: 3px;
+      background: #181830; color: #aaa; border: 1px solid #222; margin-bottom: 8px;
+    }
+    .stdout { color: #a8e6a3; }
+    .stderr { color: #e68a8a; }
+    .info { color: #8ac4e6; }
+    .dim { color: #666; }
+    .pass { color: #a8e6a3; font-weight: bold; }
+    .fail { color: #e68a8a; font-weight: bold; }
+    .warn { color: #e6c38a; }
+    .title { color: #c38ae6; font-weight: bold; }
+    .controls { display: flex; gap: 8px; margin-bottom: 12px; align-items: center; flex-wrap: wrap; }
+    button {
+      background: #2a2a4a; color: #e0e0e0; border: 1px solid #444;
+      padding: 6px 12px; border-radius: 4px; font-family: monospace; cursor: pointer;
+    }
+    button:hover { background: #3a3a5a; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    label { font-size: 12px; color: #aaa; }
+  </style>
+</head>
+<body>
+  <h1>nodepod - issue <a href="https://github.com/ScelarOrg/Nodepod/issues/54">#54</a> - tailwind v4 react app fails with 504</h1>
+  <p>
+    Reproduces the reporter's flow from the issue thread: boot nodepod with
+    <code>workdir: '/app'</code>, mount a Vite + React-TS project that uses
+    <code>tailwindcss@^4</code> and <code>@tailwindcss/vite@^4</code> via
+    <code>pod.fs.writeFile</code>, spawn <code>npm install</code>, then spawn
+    <code>npm run dev</code>, and point an iframe at the url surfaced by
+    <code>onServerReady</code>. The reporter says native-CSS React apps work
+    but tailwind v4 apps fail with 504 Gateway Timeout on the dep-optimized
+    chunks (<code>node_modules/.vite/deps/react.js</code> etc) and the console
+    surfaces <code>Package "lightningcss-wasm32-wasi" does not exist in the
+    registry</code>.
+  </p>
+
+  <div class="controls">
+    <button id="run-tw4">run tailwind v4 + vite 7 + react-ts (reproduces 504)</button>
+    <button id="run-tw4-v8">run tailwind v4 + vite 8 + react-ts</button>
+    <button id="run-plain">run plain css + react-ts (reporter says this works)</button>
+    <button id="clear">clear log</button>
+  </div>
+
+  <div class="layout">
+    <div class="pane">
+      <h2>log</h2>
+      <div id="output"></div>
+    </div>
+    <div class="pane">
+      <h2>preview iframe</h2>
+      <div id="status">idle</div>
+      <iframe id="frame" sandbox="allow-scripts allow-same-origin allow-forms allow-popups"></iframe>
+    </div>
+  </div>
+
+  <!-- shared project files: index.html, main.tsx, App.tsx, tsconfigs -->
+
+  <script id="file-index-html" type="text/plain"><!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>tailwind v4 inside nodepod</title>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="module" src="/src/main.tsx"><\/script>
+</body>
+</html>
+</script>
+
+  <script id="file-tsconfig" type="text/plain">{
+  "files": [],
+  "references": [
+    { "path": "./tsconfig.app.json" },
+    { "path": "./tsconfig.node.json" }
+  ]
+}
+</script>
+
+  <script id="file-tsconfig-app" type="text/plain">{
+  "compilerOptions": {
+    "target": "ES2020",
+    "useDefineForClassFields": true,
+    "lib": ["ES2020", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "skipLibCheck": true,
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "jsx": "react-jsx",
+    "strict": true
+  },
+  "include": ["src"]
+}
+</script>
+
+  <script id="file-tsconfig-node" type="text/plain">{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2023"],
+    "module": "ESNext",
+    "skipLibCheck": true,
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "strict": true
+  },
+  "include": ["vite.config.ts"]
+}
+</script>
+
+  <script id="file-vite-env-d-ts" type="text/plain">/// <reference types="vite/client" />
+</script>
+
+  <!-- ====== tailwind v4 variant ====== -->
+
+  <script id="file-package-json-tw4-v7" type="text/plain">{
+  "name": "tailwind-v4-react-ts",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.1.13",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.5.0",
+    "tailwindcss": "^4.1.13",
+    "typescript": "~5.6.0",
+    "vite": "7.3.1"
+  }
+}
+</script>
+
+  <script id="file-package-json-tw4-v8" type="text/plain">{
+  "name": "tailwind-v4-react-ts",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.1.13",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^5.0.0",
+    "tailwindcss": "^4.1.13",
+    "typescript": "~5.6.0",
+    "vite": "8.0.10"
+  }
+}
+</script>
+
+  <script id="file-vite-config-tw4" type="text/plain">import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+import tailwindcss from '@tailwindcss/vite';
+
+export default defineConfig({
+  plugins: [react(), tailwindcss()],
+  server: {
+    host: '0.0.0.0',
+    port: 5173,
+    strictPort: true,
+  },
+});
+</script>
+
+  <script id="file-index-css-tw4" type="text/plain">@import "tailwindcss";
+</script>
+
+  <script id="file-main-tsx-tw4" type="text/plain">import { StrictMode } from 'react';
+import { createRoot } from 'react-dom/client';
+import App from './App.tsx';
+import './index.css';
+
+createRoot(document.getElementById('root')!).render(
+  <StrictMode>
+    <App />
+  </StrictMode>,
+);
+</script>
+
+  <script id="file-app-tsx-tw4" type="text/plain">import { useState } from 'react';
+
+function App() {
+  const [count, setCount] = useState(0);
+  return (
+    <div className="min-h-screen bg-slate-900 text-slate-100 p-8 font-sans">
+      <h1 className="text-2xl font-bold text-cyan-300 mb-2">
+        Hello from Tailwind v4 + Vite + React inside nodepod
+      </h1>
+      <p className="text-slate-400 mb-4">
+        If you see this with the cyan heading, Tailwind v4 ran end-to-end through the SW proxy.
+      </p>
+      <button
+        onClick={() => setCount((c) => c + 1)}
+        className="px-4 py-2 rounded bg-cyan-500 hover:bg-cyan-400 text-slate-900 font-semibold"
+      >
+        count is {count}
+      </button>
+    </div>
+  );
+}
+
+export default App;
+</script>
+
+  <!-- ====== plain css variant (reporter's "this works" path) ====== -->
+
+  <script id="file-package-json-plain" type="text/plain">{
+  "name": "plain-css-react-ts",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.5.0",
+    "typescript": "~5.6.0",
+    "vite": "7.3.1"
+  }
+}
+</script>
+
+  <script id="file-vite-config-plain" type="text/plain">import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+
+export default defineConfig({
+  plugins: [react()],
+  server: {
+    host: '0.0.0.0',
+    port: 5173,
+    strictPort: true,
+  },
+});
+</script>
+
+  <script id="file-index-css-plain" type="text/plain">body {
+  margin: 0;
+  font-family: system-ui, -apple-system, sans-serif;
+  background: #0f172a;
+  color: #e2e8f0;
+}
+
+.app {
+  min-height: 100vh;
+  padding: 32px;
+}
+
+.app h1 { color: #67e8f9; margin-bottom: 8px; }
+.app p  { color: #94a3b8; margin-bottom: 16px; }
+
+.app button {
+  padding: 8px 16px;
+  border-radius: 4px;
+  background: #06b6d4;
+  color: #0f172a;
+  font-weight: 600;
+  border: 0;
+  cursor: pointer;
+}
+.app button:hover { background: #22d3ee; }
+</script>
+
+  <script id="file-main-tsx-plain" type="text/plain">import { StrictMode } from 'react';
+import { createRoot } from 'react-dom/client';
+import App from './App.tsx';
+import './index.css';
+
+createRoot(document.getElementById('root')!).render(
+  <StrictMode>
+    <App />
+  </StrictMode>,
+);
+</script>
+
+  <script id="file-app-tsx-plain" type="text/plain">import { useState } from 'react';
+
+function App() {
+  const [count, setCount] = useState(0);
+  return (
+    <div className="app">
+      <h1>Hello from plain CSS + Vite + React inside nodepod</h1>
+      <p>If you see this with the cyan heading, dev server is reachable through the SW proxy.</p>
+      <button onClick={() => setCount((c) => c + 1)}>count is {count}</button>
+    </div>
+  );
+}
+
+export default App;
+</script>
+
+  <script type="module">
+    import { Nodepod } from "/dist/index.mjs";
+
+    const out = document.getElementById('output');
+    const frame = document.getElementById('frame');
+    const statusEl = document.getElementById('status');
+    const runTw4Btn = document.getElementById('run-tw4');
+    const runTw4V8Btn = document.getElementById('run-tw4-v8');
+    const runPlainBtn = document.getElementById('run-plain');
+    const clearBtn = document.getElementById('clear');
+
+    function log(text, cls = 'stdout') {
+      const span = document.createElement('span');
+      span.className = cls;
+      span.textContent = text + '\n';
+      out.appendChild(span);
+      out.scrollTop = out.scrollHeight;
+    }
+    function setStatus(text, cls = '') {
+      statusEl.textContent = text;
+      statusEl.className = cls;
+    }
+    // any inner closing-script tag inside a <script type="text/plain"> block
+    // closes the outer block (HTML5 script-data tokenization). we encode the
+    // single inner one in file-index-html as `<\/...>` and restore it here.
+    function readFile(id) {
+      return document.getElementById(id).textContent.replace(/<\\\/script>/g, '<' + '/script>');
+    }
+
+    clearBtn.addEventListener('click', () => { out.textContent = ''; });
+
+    function disableButtons(disabled) {
+      runTw4Btn.disabled = disabled;
+      runTw4V8Btn.disabled = disabled;
+      runPlainBtn.disabled = disabled;
+    }
+
+    // mirror of reporter's mountFiles()
+    async function mountFiles(pod, files) {
+      const writes = [];
+      for (const [path, content] of Object.entries(files)) {
+        writes.push(pod.fs.writeFile(path, content));
+      }
+      await Promise.all(writes);
+    }
+
+    // mirror of reporter's runCommand()
+    async function runCommand(pod, command, args = []) {
+      const hasRootPath = args.some((a) => a.startsWith('/'));
+      const proc = await pod.spawn(command, args, {
+        cwd: hasRootPath ? '/' : pod.cwd,
+      });
+      proc.on('output', (t) => log(t.trimEnd(), 'stdout'));
+      proc.on('error', (t) => log(t.trimEnd(), 'stderr'));
+      return proc;
+    }
+
+    async function runVariant(variant, label) {
+      disableButtons(true);
+      frame.removeAttribute('src');
+      setStatus('booting ...', 'warn');
+
+      // pick file ids per variant
+      const fileMap = variant === 'tw4-v7' ? {
+        pkg:    'file-package-json-tw4-v7',
+        vite:   'file-vite-config-tw4',
+        css:    'file-index-css-tw4',
+        main:   'file-main-tsx-tw4',
+        app:    'file-app-tsx-tw4',
+      } : variant === 'tw4-v8' ? {
+        pkg:    'file-package-json-tw4-v8',
+        vite:   'file-vite-config-tw4',
+        css:    'file-index-css-tw4',
+        main:   'file-main-tsx-tw4',
+        app:    'file-app-tsx-tw4',
+      } : {
+        pkg:    'file-package-json-plain',
+        vite:   'file-vite-config-plain',
+        css:    'file-index-css-plain',
+        main:   'file-main-tsx-plain',
+        app:    'file-app-tsx-plain',
+      };
+
+      try {
+        log(`=== ${label} ===`, 'title');
+
+        let serverUrl = null;
+        const serverReadyPromise = new Promise((resolve) => {
+          window.__onServerReady = (url) => { serverUrl = url; resolve(url); };
+        });
+
+        log('booting nodepod (workdir=/app) ...', 'info');
+        const pod = await Nodepod.boot({
+          watermark: false,
+          workdir: '/app',
+          allowedFetchDomains: null,
+          onServerReady: (port, url) => {
+            log(`[onServerReady] port=${port} url=${url}`, 'info');
+            window.__onServerReady(url);
+          },
+        });
+        log('booted.\n', 'info');
+
+        log('writing project files via pod.fs.writeFile ...', 'info');
+        await mountFiles(pod, {
+          '/app/package.json':       readFile(fileMap.pkg),
+          '/app/vite.config.ts':     readFile(fileMap.vite),
+          '/app/tsconfig.json':      readFile('file-tsconfig'),
+          '/app/tsconfig.app.json':  readFile('file-tsconfig-app'),
+          '/app/tsconfig.node.json': readFile('file-tsconfig-node'),
+          '/app/index.html':         readFile('file-index-html'),
+          '/app/src/main.tsx':       readFile(fileMap.main),
+          '/app/src/App.tsx':        readFile(fileMap.app),
+          '/app/src/index.css':      readFile(fileMap.css),
+          '/app/src/vite-env.d.ts':  readFile('file-vite-env-d-ts'),
+        });
+        log('files mounted.\n', 'info');
+
+        log('--- npm install ---', 'title');
+        const installProc = await runCommand(pod, 'npm', ['install']);
+        const installRes = await installProc.completion;
+        if (installRes.exitCode !== 0) {
+          log(`npm install failed (exit=${installRes.exitCode})`, 'fail');
+          setStatus('install failed', 'fail');
+          return;
+        }
+        log('npm install done.\n', 'pass');
+
+        // diagnostic probe, opt-in via window.__nodepodTailwindV4Probe = true
+        // in devtools before clicking. exercises oxide Scanner.scan directly
+        // so we can isolate oxide vs vite issues without the full dev server.
+        const enableV4Probe = !!(window).__nodepodTailwindV4Probe;
+        log('--- diagnostic: probing tailwind v4 oxide scanner ---', 'title');
+        if (!enableV4Probe) {
+          log('(probe disabled; set window.__nodepodTailwindV4Probe = true to enable)', 'dim');
+        }
+        const diagStart = performance.now();
+        try {
+          if (!enableV4Probe) throw new Error('probe disabled');
+          const probeScript = [
+            "const fs = require('fs');",
+            "const path = require('path');",
+            "console.log('cwd=' + process.cwd());",
+            "// helper: timed wrapper that returns ms",
+            "function tick(label, fn) {",
+            "  const t0 = Date.now();",
+            "  let r, err;",
+            "  try { r = fn(); } catch (e) { err = e; }",
+            "  const dt = Date.now() - t0;",
+            "  if (err) { console.log('[' + dt + 'ms] ' + label + ' THREW: ' + err.message + ' :: ' + (err.stack||'').split('\\n').slice(0,4).join(' | ')); return null; }",
+            "  console.log('[' + dt + 'ms] ' + label);",
+            "  return r;",
+            "}",
+            "// monkey-patch fs to log every call oxide makes. shows us what is",
+            "// happening during those 60-90s scans where oxide returns 0 candidates.",
+            "// only logs slow/failed/interesting ones so we don't flood with",
+            "// successful millisecond reads.",
+            "const fsCallLog = [];",
+            "function wrapFs(name) {",
+            "  const orig = fs[name];",
+            "  if (typeof orig !== 'function') return;",
+            "  fs[name] = function(...a) {",
+            "    const t0 = Date.now();",
+            "    try {",
+            "      const r = orig.apply(this, a);",
+            "      const dt = Date.now() - t0;",
+            "      if (dt > 100 || /readdirSync|statSync|readFileSync|existsSync|lstatSync|realpathSync/.test(name)) {",
+            "        const argSummary = a.length > 0 ? (typeof a[0] === 'string' ? a[0] : JSON.stringify(a[0])) : '';",
+            "        fsCallLog.push({ t: t0, dt, name, arg: argSummary.slice(0, 200), ok: true });",
+            "      }",
+            "      return r;",
+            "    } catch (e) {",
+            "      const dt = Date.now() - t0;",
+            "      const argSummary = a.length > 0 ? (typeof a[0] === 'string' ? a[0] : JSON.stringify(a[0])) : '';",
+            "      fsCallLog.push({ t: t0, dt, name, arg: argSummary.slice(0, 200), ok: false, err: e.message });",
+            "      throw e;",
+            "    }",
+            "  };",
+            "}",
+            "['readdirSync','statSync','lstatSync','readFileSync','existsSync','realpathSync','readlinkSync','accessSync','openSync','readSync','closeSync'].forEach(wrapFs);",
+            "function dumpFsLog(label) {",
+            "  console.log('--- fs calls during ' + label + ' (' + fsCallLog.length + ' total) ---');",
+            "  // group by op name and arg",
+            "  const counts = {};",
+            "  let slowOps = [];",
+            "  for (const c of fsCallLog) {",
+            "    const k = c.name + (c.ok ? '' : ' FAIL');",
+            "    counts[k] = (counts[k] || 0) + 1;",
+            "    if (c.dt > 1000) slowOps.push(c);",
+            "  }",
+            "  for (const k of Object.keys(counts).sort()) console.log('  ' + k + ': ' + counts[k]);",
+            "  if (slowOps.length) {",
+            "    console.log('  slow ops (>1s):');",
+            "    for (const c of slowOps.slice(0, 20)) console.log('    [' + c.dt + 'ms] ' + c.name + '(' + c.arg + ')' + (c.ok ? '' : ' THREW: ' + c.err));",
+            "  }",
+            "  fsCallLog.length = 0;",
+            "}",
+            "(async () => {",
+            "  const t_total = Date.now();",
+            "  let oxide;",
+            "  oxide = tick('require @tailwindcss/oxide', () => require('@tailwindcss/oxide'));",
+            "  if (!oxide) return;",
+            "  console.log('  exports=' + Object.keys(oxide).join(','));",
+            "  if (typeof oxide.Scanner !== 'function') { console.log('Scanner not exported'); return; }",
+            "  // dumps wasi-worker.mjs and the napi-rs runtime entry so we can",
+            "  // see what the worker bootstrap actually does.",
+            "  console.log('--- experiment 0a: wasi-worker.mjs structure ---');",
+            "  try {",
+            "    const workerPath = '/app/node_modules/@tailwindcss/oxide-wasm32-wasi/wasi-worker.mjs';",
+            "    const main = fs.readFileSync(workerPath, 'utf8');",
+            "    console.log('  size: ' + main.length + ' bytes');",
+            "    console.log('  full source:\\n' + main);",
+            "  } catch (e) { console.log('  exp0a threw: ' + e.message); }",
+            "  console.log('');",
+            "  console.log('--- experiment 0b: @napi-rs/wasm-runtime main entry ---');",
+            "  try {",
+            "    const wasmRuntime = require.resolve('@napi-rs/wasm-runtime');",
+            "    console.log('  resolved: ' + wasmRuntime);",
+            "    const src = fs.readFileSync(wasmRuntime, 'utf8');",
+            "    console.log('  size: ' + src.length + ' bytes');",
+            "    // hunt for instantiateNapiModuleSync, postMessage to worker",
+            "    for (const needle of ['instantiateNapiModuleSync', 'postMessage', 'onCreateWorker', 'load', 'loaded', 'createOnMessage', 'spawnWorker']) {",
+            "      const i = src.indexOf(needle);",
+            "      if (i >= 0) console.log('  \"' + needle + '\" at ' + i + ': ' + JSON.stringify(src.slice(Math.max(0, i-100), i+250)));",
+            "    }",
+            "  } catch (e) { console.log('  exp0b threw: ' + e.message); }",
+            "  console.log('');",
+            "",
+            "  // experiment 1: explicit absolute base + broad pattern, mirrors what",
+            "  // @tailwindcss/vite hands oxide for auto-detected sources.",
+            "  fsCallLog.length = 0;",
+            "  const s1 = tick('exp1 new Scanner({base:/app, pattern:**/*})', () => new oxide.Scanner({ sources: [{ base: '/app', pattern: '**/*', negated: false }] }));",
+            "  if (s1) {",
+            "    const c1 = tick('exp1 .scan()', () => s1.scan());",
+            "    if (c1) {",
+            "      console.log('  exp1 candidates: ' + c1.length);",
+            "      console.log('  exp1 sample (first 30): ' + JSON.stringify(c1.slice(0, 30)));",
+            "      const stringify = (c) => typeof c === 'string' ? c : (c.candidate || c.name || '');",
+            "      console.log('  exp1 contains min-h-screen=' + c1.some(c => stringify(c).includes('min-h-screen')) + '  contains text-cyan-300=' + c1.some(c => stringify(c).includes('cyan-300')));",
+            "    }",
+            "    dumpFsLog('exp1');",
+            "  }",
+            "  // experiment 2: scoped to /app/src so we exclude node_modules entirely",
+            "  fsCallLog.length = 0;",
+            "  const s2 = tick('exp2 new Scanner({base:/app/src, pattern:**/*})', () => new oxide.Scanner({ sources: [{ base: '/app/src', pattern: '**/*', negated: false }] }));",
+            "  if (s2) {",
+            "    const c2 = tick('exp2 .scan()', () => s2.scan());",
+            "    if (c2) {",
+            "      console.log('  exp2 candidates: ' + c2.length);",
+            "      console.log('  exp2 sample (first 20): ' + JSON.stringify(c2.slice(0, 20)));",
+            "    }",
+            "    dumpFsLog('exp2 (only 4 files in /app/src, baseline)');",
+            "  }",
+            "  // experiment 3: pass App.tsx directly (single file pattern)",
+            "  const s3 = tick('exp3 new Scanner({base:/app/src, pattern:App.tsx})', () => new oxide.Scanner({ sources: [{ base: '/app/src', pattern: 'App.tsx', negated: false }] }));",
+            "  if (s3) {",
+            "    const c3 = tick('exp3 .scan()', () => s3.scan());",
+            "    if (c3) {",
+            "      console.log('  exp3 candidates: ' + c3.length);",
+            "      console.log('  exp3 sample (first 20): ' + JSON.stringify(c3.slice(0, 20)));",
+            "    }",
+            "  }",
+            "  // experiment 4: pass file content directly via scanFiles",
+            "  if (typeof oxide.scanFiles === 'function') {",
+            "    const apptsxContent = fs.readFileSync('/app/src/App.tsx', 'utf8');",
+            "    const c4 = tick('exp4 oxide.scanFiles([{content,extension:tsx}])', () => oxide.scanFiles([{ content: apptsxContent, extension: 'tsx' }]));",
+            "    if (c4) {",
+            "      console.log('  exp4 candidates: ' + c4.length);",
+            "      console.log('  exp4 sample (first 20): ' + JSON.stringify(c4.slice(0, 20)));",
+            "    }",
+            "  } else {",
+            "    console.log('experiment 4 skipped: oxide.scanFiles not exported');",
+            "  }",
+            "  console.log('--- v4 oxide diagnostic total: ' + (Date.now() - t_total) + 'ms ---');",
+            "  // force-exit, the WASI worker keeps a loop ref alive even after",
+            "  // oxide unrefs it (BroadcastChannel inside the worker etc).",
+            "  process.exit(0);",
+            "})().catch((e) => { console.error('probe IIFE threw:', e); process.exit(1); });",
+            "",
+          ].join('\n');
+          await pod.fs.writeFile('/app/__nodepod_v4_probe.cjs', probeScript);
+          const probeProc = await pod.spawn('node', ['/app/__nodepod_v4_probe.cjs'], { cwd: '/app' });
+          probeProc.on('output', (t) => log(t.trimEnd(), 'info'));
+          probeProc.on('error', (t) => log(t.trimEnd(), 'stderr'));
+          await probeProc.completion;
+        } catch (e) {
+          if (e.message !== 'probe disabled') log('v4 probe failed: ' + e.message, 'stderr');
+        }
+        const diagDur = ((performance.now() - diagStart) / 1000).toFixed(1);
+        log(`--- diagnostic finished in ${diagDur}s (wall-clock from spawn to exit) ---`, 'info');
+        log('', 'dim');
+
+        log('--- npm run dev ---', 'title');
+        setStatus('starting dev server ...', 'warn');
+        const devProc = await runCommand(pod, 'npm', ['run', 'dev']);
+
+        // race: onServerReady vs dev process exits vs 90s timeout
+        const timeoutMs = 90000;
+        const url = await Promise.race([
+          serverReadyPromise,
+          devProc.completion.then((res) => ({ __exited: true, res })),
+          new Promise((r) => setTimeout(() => r({ __timeout: true }), timeoutMs)),
+        ]);
+
+        if (url && url.__exited) {
+          log(`\ndev process exited before port was bound. exit=${url.res.exitCode}`, 'fail');
+          setStatus('dev exited early', 'fail');
+          return;
+        }
+        if (url && url.__timeout) {
+          log(`\ntimed out after ${timeoutMs}ms waiting for onServerReady`, 'fail');
+          setStatus('timeout', 'fail');
+          devProc.kill();
+          return;
+        }
+
+        log(`\nonServerReady fired with ${url}. probing via SW proxy ...`, 'info');
+        setStatus('probing ...', 'warn');
+
+        // probe the index, the css, AND a dep-optimized chunk -- the reporter's
+        // 504 surfaces specifically on /node_modules/.vite/deps/react.js etc.
+        // url has no trailing slash (e.g. .../pod.../5173); resolving relatively
+        // would replace `5173` as a "filename", so we force a trailing slash.
+        const base = url.endsWith('/') ? url : url + '/';
+        const probeUrls = [
+          url,
+          new URL('src/index.css', base).toString(),
+          new URL('node_modules/.vite/deps/react.js', base).toString(),
+        ];
+
+        let allOk = false;
+        const results = {};
+        const probeStart = performance.now();
+        // Tailwind v4's first request can take 2-4 minutes the first time
+        // because @tailwindcss/oxide-wasm32-wasi has to compile + init while
+        // rolldown is still optimizing deps on the same engine-worker. After
+        // that everything is cached. Give it 5 minutes.
+        while (performance.now() - probeStart < 300000) {
+          allOk = true;
+          for (const u of probeUrls) {
+            try {
+              const res = await fetch(u, { cache: 'no-store' });
+              results[u] = `${res.status} ${res.statusText}`;
+              if (!res.ok) {
+                allOk = false;
+                log(`  ${u.replace(url, '<root>')} -> ${res.status} ${res.statusText}`,
+                    res.status >= 500 ? 'fail' : 'warn');
+              }
+            } catch (e) {
+              allOk = false;
+              results[u] = `threw: ${e.message}`;
+              log(`  ${u.replace(url, '<root>')} -> threw: ${e.message}`, 'fail');
+            }
+          }
+          if (allOk) break;
+          await new Promise((r) => setTimeout(r, 1500));
+        }
+
+        log('', 'dim');
+        for (const [u, status] of Object.entries(results)) {
+          log(`  ${u.replace(url, '<root>')} -> ${status}`, status.startsWith('200') ? 'pass' : 'fail');
+        }
+
+        if (allOk) {
+          // diagnostic: fetch the served /src/index.css and count utility
+          // class definitions. tailwind v4 oxide is a WASM scanner -- if it
+          // can't see the source files for any reason (vfs path resolution,
+          // mmap fallback, fd_readdir, etc.) the served CSS contains only
+          // base/preflight rules and no utilities. that's the symptom users
+          // see as "no styling".
+          try {
+            const cssRes = await fetch(new URL('src/index.css', base).toString(), { cache: 'no-store' });
+            const cssText = await cssRes.text();
+            const utilityCount = (cssText.match(/\n\.[a-zA-Z][a-zA-Z0-9_\\:\-]*\s*\{/g) || []).length;
+            const hasMinHScreen = cssText.includes('.min-h-screen');
+            const hasBgSlate = cssText.includes('.bg-slate-900');
+            const hasCyan = cssText.includes('.text-cyan-300');
+            log(`served /src/index.css: ${cssText.length} bytes, ~${utilityCount} utility classes`, 'info');
+            log(`  has .min-h-screen=${hasMinHScreen}  has .bg-slate-900=${hasBgSlate}  has .text-cyan-300=${hasCyan}`, 'info');
+            if (utilityCount === 0) {
+              log(`  CSS preview (first 400 chars):`, 'dim');
+              log(cssText.slice(0, 400), 'dim');
+            }
+          } catch (e) {
+            log(`css introspection failed: ${e.message}`, 'stderr');
+          }
+          log(`\nPASS: dev server reachable, including dep chunks. pointing iframe at ${url}`, 'pass');
+          setStatus('ready', 'pass');
+          frame.src = url;
+        } else {
+          log(
+            `\nFAIL: dev server is up but at least one URL never returned 200. ` +
+            `this reproduces issue #54 (504 on dep-optimized chunks under tailwind v4).`,
+            'fail'
+          );
+          setStatus('FAIL (see log)', 'fail');
+          frame.src = url;
+        }
+      } catch (e) {
+        log(`\nuncaught: ${e?.stack || e}`, 'fail');
+        setStatus('uncaught', 'fail');
+      } finally {
+        disableButtons(false);
+      }
+    }
+
+    runTw4Btn.addEventListener('click',
+      () => runVariant('tw4-v7', 'tailwind v4.1 + vite 7.3.1 + react-ts'));
+    runTw4V8Btn.addEventListener('click',
+      () => runVariant('tw4-v8', 'tailwind v4.1 + vite 8.0.10 + react-ts'));
+    runPlainBtn.addEventListener('click',
+      () => runVariant('plain',  'plain css + vite 7.3.1 + react-ts (reporter says works)'));
+  </script>
+</body>
+</html>

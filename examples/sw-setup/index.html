@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>nodepod - service worker setup DX</title>
+    <style>
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      body { font-family: monospace; background: #1a1a2e; color: #e0e0e0; padding: 24px; line-height: 1.6; }
+      h1 { font-size: 18px; margin-bottom: 4px; color: #fff; }
+      h2 { font-size: 14px; margin: 20px 0 8px; color: #8ac4e6; }
+      p { font-size: 13px; color: #888; margin-bottom: 12px; }
+      code { background: #0d0d1a; padding: 2px 6px; border-radius: 3px; color: #a8e6a3; }
+      .demo { background: #0d0d1a; border: 1px solid #333; border-radius: 6px; padding: 16px; margin-bottom: 16px; }
+      button { background: #2a2a4a; color: #e0e0e0; border: 1px solid #444; border-radius: 4px; padding: 8px 14px; font-family: monospace; cursor: pointer; margin-right: 8px; margin-top: 8px; }
+      button:hover { background: #3a3a5a; }
+      button:disabled { opacity: 0.5; cursor: not-allowed; }
+      pre { background: #000; padding: 10px; border-radius: 3px; font-size: 12px; overflow-x: auto; margin-top: 8px; white-space: pre-wrap; color: #ccc; }
+      .ok { color: #a8e6a3; }
+      .err { color: #e68a8a; }
+      .dim { color: #555; }
+      iframe { width: 100%; height: 180px; border: 1px solid #333; border-radius: 4px; background: #fff; margin-top: 8px; }
+    </style>
+  </head>
+  <body>
+    <h1>nodepod · service worker setup DX</h1>
+    <p>
+      Three demos: default-on SW, a <code>NodepodSWSetupError</code>, and
+      the <code>serviceWorker: false</code> opt-out. Each card runs on its
+      own, click any button.
+    </p>
+
+    <div class="demo">
+      <h2>1 · Happy path: Nodepod.boot() with default-on SW</h2>
+      <p>
+        No <code>swUrl</code> needed. The SW at <code>/__sw__.js</code> is
+        served by <code>examples/serve.js</code>, or by
+        <code>serveSWNode()</code> from <code>@scelar/nodepod/server</code>
+        (see the sibling <code>server.js</code>).
+      </p>
+      <button id="happy-boot">Boot & start a virtual HTTP server</button>
+      <pre id="happy-out" class="dim">(click to run)</pre>
+      <iframe id="happy-frame" style="display: none;"></iframe>
+    </div>
+
+    <div class="demo">
+      <h2>2 · Loud errors: bad swUrl &rarr; NodepodSWSetupError</h2>
+      <p>
+        Point <code>swUrl</code> at something the server doesn't know about
+        (<code>/does-not-exist.js</code>). The preflight HEAD fails and
+        boot() throws a typed error with a framework-aware hint.
+      </p>
+      <button id="bad-boot">Boot with swUrl: "/does-not-exist.js"</button>
+      <pre id="bad-out" class="dim">(click to run)</pre>
+    </div>
+
+    <div class="demo">
+      <h2>3 · Opt-out: <code>{ serviceWorker: false }</code></h2>
+      <p>
+        Skip SW entirely (SSR, Node tests, host apps that don't need
+        preview iframes). VFS and <code>spawn()</code> still work, you
+        just can't use <code>nodepod.port(n)</code>.
+      </p>
+      <button id="skip-boot">Boot with serviceWorker: false</button>
+      <pre id="skip-out" class="dim">(click to run)</pre>
+    </div>
+
+    <script type="module">
+      import { Nodepod, NodepodSWSetupError } from "/dist/index.mjs";
+
+      function writeLine(el, text, cls = "") {
+        const line = document.createElement("div");
+        if (cls) line.className = cls;
+        line.textContent = text;
+        el.appendChild(line);
+      }
+      function resetOut(id) {
+        const el = document.getElementById(id);
+        el.textContent = "";
+        el.className = "";
+        return el;
+      }
+
+      // Happy path
+      document.getElementById("happy-boot").addEventListener("click", async (ev) => {
+        ev.target.disabled = true;
+        const out = resetOut("happy-out");
+        const frame = document.getElementById("happy-frame");
+        frame.style.display = "none";
+
+        try {
+          writeLine(out, "→ Nodepod.boot()  (SW default-on, no swUrl)", "dim");
+          const nodepod = await Nodepod.boot({
+            files: {
+              "/server.js": `
+const http = require('http');
+http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/html' });
+  res.end(\`
+    <!doctype html><html><body style="font-family: system-ui; padding: 20px;">
+      <h2 style="margin: 0;">Served from inside nodepod</h2>
+      <p>Path: <code>\${req.url}</code></p>
+      <p>PID: <code>\${process.pid}</code>, Node: <code>\${process.version}</code></p>
+    </body></html>
+  \`);
+}).listen(3000, () => console.log('listening on 3000'));
+              `.trim(),
+            },
+          });
+          writeLine(out, "✓ booted", "ok");
+          writeLine(out, "→ spawn node server.js", "dim");
+          const proc = await nodepod.spawn("node", ["server.js"]);
+          proc.on("output", (t) => writeLine(out, t.trimEnd()));
+          proc.on("error", (t) => writeLine(out, t.trimEnd(), "err"));
+
+          // Wait a tick for listen() to settle, then point an iframe at it.
+          await new Promise((r) => setTimeout(r, 200));
+          const url = nodepod.port(3000);
+          writeLine(out, `✓ virtual server URL: ${url}`, "ok");
+          frame.src = url;
+          frame.style.display = "block";
+        } catch (e) {
+          writeLine(out, `✗ ${e.message}`, "err");
+          console.error(e);
+        } finally {
+          ev.target.disabled = false;
+        }
+      });
+
+      // Bad swUrl
+      document.getElementById("bad-boot").addEventListener("click", async (ev) => {
+        ev.target.disabled = true;
+        const out = resetOut("bad-out");
+        try {
+          writeLine(out, "→ Nodepod.boot({ swUrl: '/does-not-exist.js' })", "dim");
+          await Nodepod.boot({ swUrl: "/does-not-exist.js" });
+          writeLine(out, "✗ expected boot() to throw, but it didn't", "err");
+        } catch (e) {
+          if (e instanceof NodepodSWSetupError) {
+            writeLine(out, "✓ caught NodepodSWSetupError", "ok");
+            writeLine(out, "");
+            writeLine(out, e.toString());
+          } else {
+            writeLine(out, `✗ wrong error class: ${e.name}: ${e.message}`, "err");
+            console.error(e);
+          }
+        } finally {
+          ev.target.disabled = false;
+        }
+      });
+
+      // Opt-out
+      document.getElementById("skip-boot").addEventListener("click", async (ev) => {
+        ev.target.disabled = true;
+        const out = resetOut("skip-out");
+        try {
+          writeLine(out, "→ Nodepod.boot({ serviceWorker: false })", "dim");
+          const nodepod = await Nodepod.boot({
+            serviceWorker: false,
+            files: { "/hello.js": "console.log('hi from non-SW nodepod!')" },
+          });
+          writeLine(out, "✓ booted without a SW", "ok");
+          writeLine(out, "→ spawn node hello.js (still works, no SW needed)", "dim");
+          const proc = await nodepod.spawn("node", ["hello.js"]);
+          proc.on("output", (t) => writeLine(out, t.trimEnd()));
+          await proc.completion;
+          writeLine(out, "", "");
+          writeLine(out, "(preview iframes / nodepod.port(n) wouldn't work here)", "dim");
+        } catch (e) {
+          writeLine(out, `✗ ${e.message}`, "err");
+          console.error(e);
+        } finally {
+          ev.target.disabled = false;
+        }
+      });
+    </script>
+  </body>
+</html>

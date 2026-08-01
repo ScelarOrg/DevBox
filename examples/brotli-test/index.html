@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>nodepod - brotli test</title>
+        <style>
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }
+            body {
+                font-family: monospace;
+                background: #1a1a2e;
+                color: #e0e0e0;
+                padding: 24px;
+            }
+            h1 {
+                font-size: 18px;
+                margin-bottom: 8px;
+                color: #fff;
+            }
+            p {
+                font-size: 13px;
+                color: #888;
+                margin-bottom: 20px;
+            }
+            #output {
+                background: #0d0d1a;
+                border: 1px solid #333;
+                border-radius: 6px;
+                padding: 16px;
+                min-height: 400px;
+                white-space: pre-wrap;
+                font-size: 14px;
+                line-height: 1.6;
+                overflow-y: auto;
+            }
+            .stdout {
+                color: #a8e6a3;
+            }
+            .stderr {
+                color: #e68a8a;
+            }
+            .info {
+                color: #8ac4e6;
+            }
+            .dim {
+                color: #555;
+            }
+            .pass {
+                color: #a8e6a3;
+            }
+            .fail {
+                color: #e68a8a;
+                font-weight: bold;
+            }
+        </style>
+    </head>
+    <body>
+        <h1>nodepod - brotli test (issue #17)</h1>
+        <p>Tests sync/async brotli compression in different orderings.</p>
+        <div id="output"></div>
+
+        <script type="module">
+            import { Nodepod } from "/dist/index.mjs"; // use 'https://esm.sh/@scelar/nodepod' in production
+
+            const out = document.getElementById("output");
+            function log(text, cls = "stdout") {
+                const span = document.createElement("span");
+                span.className = cls;
+                span.textContent = text + "\n";
+                out.appendChild(span);
+                out.scrollTop = out.scrollHeight;
+            }
+
+            log("Booting nodepod...", "info");
+
+            const nodepod = await Nodepod.boot({
+                files: {
+                    "/test-sync-decompress.js": `
+const { brotliCompress, brotliDecompressSync } = require('zlib');
+const original = 'hello brotli sync decompress';
+// compress async first to get valid brotli data, then decompress sync
+brotliCompress(original, (err, compressed) => {
+  if (err) { console.error('FAIL compress: ' + err.message); return; }
+  try {
+    const result = brotliDecompressSync(compressed);
+    if (result.toString() === original) {
+      console.log('PASS: sync decompress returned ' + result.length + ' bytes');
+    } else {
+      console.error('FAIL: data mismatch');
+    }
+  } catch (e) {
+    console.error('FAIL: ' + e.message);
+  }
+});
+        `.trim(),
+
+                    "/test-async-only.js": `
+const { brotliCompress } = require('zlib');
+brotliCompress('hello brotli async', (err, result) => {
+  if (err) {
+    console.error('FAIL: ' + err.message);
+  } else {
+    console.log('PASS: async compress returned ' + result.length + ' bytes');
+  }
+});
+        `.trim(),
+
+                    "/test-async-then-sync.js": `
+const { brotliCompress, brotliCompressSync } = require('zlib');
+brotliCompress('step one', (err, result) => {
+  if (err) {
+    console.error('FAIL async step: ' + err.message);
+    return;
+  }
+  console.log('PASS: async compress returned ' + result.length + ' bytes');
+  try {
+    const syncResult = brotliCompressSync('step two');
+    console.log('PASS: sync after async returned ' + syncResult.length + ' bytes');
+  } catch (e) {
+    console.error('FAIL sync after async: ' + e.message);
+  }
+});
+        `.trim(),
+
+                    "/test-roundtrip.js": `
+const { brotliCompress, brotliDecompress } = require('zlib');
+const original = 'roundtrip test string 1234567890';
+brotliCompress(original, (err, compressed) => {
+  if (err) { console.error('FAIL compress: ' + err.message); return; }
+  console.log('Compressed: ' + original.length + ' -> ' + compressed.length + ' bytes');
+  brotliDecompress(compressed, (err2, decompressed) => {
+    if (err2) { console.error('FAIL decompress: ' + err2.message); return; }
+    const result = decompressed.toString();
+    if (result === original) {
+      console.log('PASS: roundtrip matches');
+    } else {
+      console.error('FAIL: expected "' + original + '" got "' + result + '"');
+    }
+  });
+});
+        `.trim(),
+                },
+            });
+
+            log("Booted!\n", "info");
+
+            const tests = [
+                { name: "Test 1: async only", file: "test-async-only.js" },
+                { name: "Test 2: sync decompress", file: "test-sync-decompress.js" },
+                {
+                    name: "Test 3: async then sync",
+                    file: "test-async-then-sync.js",
+                },
+                { name: "Test 4: async roundtrip", file: "test-roundtrip.js" },
+            ];
+
+            for (const test of tests) {
+                log(`--- ${test.name} ---`, "dim");
+                const proc = await nodepod.spawn("node", [test.file]);
+                proc.on("output", (text) => {
+                    const line = text.trimEnd();
+                    const cls = line.startsWith("PASS") ? "pass" : "stdout";
+                    log(line, cls);
+                });
+                proc.on("error", (text) => log(text.trimEnd(), "fail"));
+                await proc.completion;
+                log("", "dim");
+            }
+
+            log("All tests complete.", "info");
+        </script>
+    </body>
+</html>

@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>nodepod terminal resize</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; background: #0d1117; color: #c9d1d9; height: 100vh; display: flex; flex-direction: column; }
+    header { padding: 12px 16px; background: #161b22; border-bottom: 1px solid #30363d; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+    header h1 { font-size: 14px; font-weight: 600; }
+    header .muted { font-size: 12px; color: #8b949e; }
+    header .size { font-size: 12px; color: #58a6ff; font-family: monospace; margin-left: auto; background: #0d1117; border: 1px solid #30363d; border-radius: 4px; padding: 3px 8px; }
+    header .size strong { color: #c9d1d9; }
+    .container { flex: 1; display: flex; min-height: 0; }
+    #terminal-panel { flex: 1; display: flex; flex-direction: column; }
+    #terminal-box { flex: 1; padding: 6px; }
+    #resize-panel { width: 340px; border-left: 1px solid #30363d; background: #0d1117; padding: 14px 16px; overflow-y: auto; font-size: 12px; line-height: 1.5; }
+    #resize-panel h2 { font-size: 12px; font-weight: 600; margin-bottom: 8px; color: #c9d1d9; }
+    #resize-panel p { color: #8b949e; margin-bottom: 10px; }
+    #resize-panel code { background: #161b22; border: 1px solid #30363d; border-radius: 3px; padding: 1px 5px; font-family: monospace; color: #79c0ff; font-size: 11px; }
+    #resize-panel .log { background: #161b22; border: 1px solid #30363d; border-radius: 4px; padding: 8px; font-family: monospace; font-size: 11px; color: #8b949e; max-height: 220px; overflow-y: auto; white-space: pre-wrap; }
+    #resize-panel .log .row { color: #c9d1d9; }
+    #resize-panel .log .ts { color: #484f58; }
+    #resize-panel details { margin-top: 12px; border: 1px solid #30363d; border-radius: 4px; padding: 8px 10px; background: #161b22; }
+    #resize-panel summary { cursor: pointer; font-weight: 600; color: #c9d1d9; font-size: 11px; }
+    #resize-panel pre { margin-top: 8px; font-family: monospace; font-size: 10.5px; color: #8b949e; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>nodepod</h1>
+    <span class="muted">terminal resize demo</span>
+    <span class="size">terminal: <strong id="size-cols">?</strong>x<strong id="size-rows">?</strong></span>
+  </header>
+  <div class="container">
+    <div id="terminal-panel">
+      <div id="terminal-box"></div>
+    </div>
+    <aside id="resize-panel">
+      <h2>what this shows</h2>
+      <p>
+        xterm reflows on window resize via FitAddon, the new size is forwarded
+        to the worker, and the running script's <code>process.stdout.columns</code>
+        and <code>process.stdout.rows</code> update with a <code>'resize'</code>
+        event so TUI libraries can react.
+      </p>
+      <p>
+        run <code>node tui.js</code> then drag the window edge to resize.
+      </p>
+      <h2 style="margin-top:14px">resize events</h2>
+      <div class="log" id="log"></div>
+      <details>
+        <summary>tui.js source</summary>
+        <pre id="src"></pre>
+      </details>
+    </aside>
+  </div>
+
+  <script type="module">
+    import { Nodepod } from "/dist/index.mjs";
+    import { Terminal } from "https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/+esm";
+    import { FitAddon } from "https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/+esm";
+
+    // a tiny TUI that redraws when process.stdout fires 'resize'. it also
+    // prints the size once at startup so you can see it react live.
+    const tuiSource = `
+const draw = () => {
+  const cols = process.stdout.columns;
+  const rows = process.stdout.rows;
+  const title = " nodepod terminal resize demo ";
+  const pad = Math.max(0, cols - title.length - 2);
+  const line = "+" + "-".repeat(Math.max(0, cols - 2)) + "+";
+  // clear and move to 0,0
+  process.stdout.write("\\x1b[2J\\x1b[H");
+  process.stdout.write(line + "\\n");
+  process.stdout.write("|" + title + " ".repeat(pad) + "|\\n");
+  process.stdout.write(line + "\\n");
+  process.stdout.write("cols: " + cols + "   rows: " + rows + "\\n");
+  process.stdout.write("isTTY: " + process.stdout.isTTY + "\\n");
+  process.stdout.write("drag the window edge to resize, ctrl+c to quit\\n");
+};
+
+draw();
+process.stdout.on("resize", draw);
+
+// keep the process alive until ctrl+c
+process.stdin.setRawMode?.(true);
+process.stdin.resume?.();
+process.stdin.on("data", (chunk) => {
+  const s = chunk.toString();
+  if (s === "\\x03") {
+    process.stdout.write("\\nbye\\n");
+    process.exit(0);
+  }
+});
+`;
+
+    document.getElementById("src").textContent = tuiSource.trim();
+
+    const sizeCols = document.getElementById("size-cols");
+    const sizeRows = document.getElementById("size-rows");
+    const logEl = document.getElementById("log");
+    const appendLog = (msg) => {
+      const ts = new Date().toLocaleTimeString();
+      logEl.insertAdjacentHTML("afterbegin",
+        `<div class="row"><span class="ts">${ts}</span>  ${msg}</div>`);
+    };
+
+    const nodepod = await Nodepod.boot({
+      swUrl: "/__sw__.js",
+      workdir: "/home",
+      files: {
+        "/home/tui.js": tuiSource,
+      },
+    });
+
+    const terminal = nodepod.createTerminal({
+      Terminal,
+      FitAddon,
+      fontSize: 13,
+      fontFamily: "'JetBrains Mono', 'Fira Code', monospace",
+    });
+
+    terminal.attach(document.getElementById("terminal-box"));
+
+    // xterm fires onResize after every reflow. we mirror that into the UI
+    // so you can see nodepod's bridge and xterm agree on the size.
+    const xterm = terminal.xterm;
+    const updateBadge = () => {
+      if (!xterm) return;
+      sizeCols.textContent = xterm.cols;
+      sizeRows.textContent = xterm.rows;
+    };
+    updateBadge();
+    xterm?.onResize?.((dim) => {
+      updateBadge();
+      appendLog(`xterm onResize -> ${dim.cols}x${dim.rows}`);
+    });
+
+    // quality of life: drop a ready message in the terminal so you don't
+    // have to read the side panel to know what to type
+    setTimeout(() => {
+      terminal.writeln("");
+      terminal.writeln("\x1b[36mtry: \x1b[0m\x1b[32mnode tui.js\x1b[0m");
+      terminal.writeln("\x1b[90mthen resize the window and watch the TUI redraw\x1b[0m");
+      terminal.showPrompt();
+    }, 250);
+  </script>
+</body>
+</html>

@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>nodepod custom commands</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; background: #0d1117; color: #c9d1d9; height: 100vh; display: flex; flex-direction: column; }
+    header { padding: 12px 16px; background: #161b22; border-bottom: 1px solid #30363d; display: flex; align-items: center; gap: 12px; }
+    header h1 { font-size: 14px; font-weight: 600; }
+    header span { font-size: 12px; color: #8b949e; }
+    #terminal-box { flex: 1; min-height: 0; padding: 4px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>nodepod</h1>
+    <span>custom terminal commands</span>
+  </header>
+  <div id="terminal-box"></div>
+
+  <script type="module">
+    import { Nodepod } from "/dist/index.mjs";
+    import { Terminal } from "https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/+esm";
+    import { FitAddon } from "https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/+esm";
+
+    const nodepod = await Nodepod.boot({
+      swUrl: "/__sw__.js",
+      workdir: "/home",
+      files: {
+        "/home/readme.txt": "custom commands run in the terminal host\n",
+      },
+    });
+
+    const terminal = nodepod.createTerminal({
+      Terminal,
+      FitAddon,
+      fontSize: 13,
+      fontFamily: "'JetBrains Mono', 'Fira Code', monospace",
+      customCommands: {
+        help: () =>
+          [
+            "custom commands:",
+            "  help               show this message",
+            "  whereami           print the current terminal cwd",
+            "  greet <name...>    print parsed arguments",
+            "  fail               show thrown errors in the terminal",
+            "",
+            "built-ins still work: try pwd, ls, cat readme.txt, cd /",
+          ].join("\n") + "\n",
+        whereami: (cwd) => `${cwd}\n`,
+        greet: (cwd, args) => {
+          const name = args.join(" ") || "friend";
+          return `hello ${name} from ${cwd}\n`;
+        },
+        fail: () => {
+          throw new Error("custom command failures are printed as terminal errors");
+        },
+      },
+    });
+
+    terminal.attach(document.getElementById("terminal-box"));
+    terminal.writeln("Run help to see all commands.");
+    terminal.showPrompt();
+  </script>
+</body>
+</html>

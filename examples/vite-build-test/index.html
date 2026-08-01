@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>nodepod - vite build test</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: monospace; background: #1a1a2e; color: #e0e0e0; padding: 24px; }
+    h1 { font-size: 18px; margin-bottom: 8px; color: #fff; }
+    p { font-size: 13px; color: #888; margin-bottom: 20px; }
+    #output {
+      background: #0d0d1a;
+      border: 1px solid #333;
+      border-radius: 6px;
+      padding: 16px;
+      min-height: 500px;
+      white-space: pre-wrap;
+      font-size: 14px;
+      line-height: 1.6;
+      overflow-y: auto;
+    }
+    .stdout { color: #a8e6a3; }
+    .stderr { color: #e68a8a; }
+    .info { color: #8ac4e6; }
+    .dim { color: #555; }
+    .pass { color: #a8e6a3; }
+    .fail { color: #e68a8a; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <h1>nodepod - vite build test</h1>
+  <p>Tests building a simple Vite + React project inside nodepod. Reproduces the "Failed to parse JSON file" issue.</p>
+  <div id="output"></div>
+
+  <script id="vite-config" type="text/plain">import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+
+export default defineConfig({
+  plugins: [react()],
+});</script>
+
+  <script id="project-html" type="text/plain"><!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>React App</title>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="module" src="/src/main.jsx"></script>
+</body>
+</html></script>
+
+  <script id="main-jsx" type="text/plain">import React from 'react';
+import ReactDOM from 'react-dom/client';
+import App from './App.jsx';
+
+ReactDOM.createRoot(document.getElementById('root')).render(
+  React.createElement(React.StrictMode, null,
+    React.createElement(App, null)
+  )
+);</script>
+
+  <script id="app-jsx" type="text/plain">import React, { useState } from 'react';
+
+export default function App() {
+  const [count, setCount] = useState(0);
+  return React.createElement('div', null,
+    React.createElement('h1', null, 'Hello from Vite + React'),
+    React.createElement('button', { onClick: function() { setCount(function(c) { return c + 1; }); } },
+      'Count: ' + count
+    )
+  );
+}</script>
+
+  <script type="module">
+    import { Nodepod } from "/dist/index.mjs";
+
+    var out = document.getElementById('output');
+    function log(text, cls) {
+      cls = cls || 'stdout';
+      var span = document.createElement('span');
+      span.className = cls;
+      span.textContent = text + '\n';
+      out.appendChild(span);
+      out.scrollTop = out.scrollHeight;
+    }
+
+    var viteConfig = document.getElementById('vite-config').textContent;
+    var projectHtml = document.getElementById('project-html').textContent;
+    var mainJsx = document.getElementById('main-jsx').textContent;
+    var appJsx = document.getElementById('app-jsx').textContent;
+
+    log('Booting nodepod...', 'info');
+
+    var nodepod = await Nodepod.boot({
+      workdir: '/project',
+      files: {
+        '/project/package.json': JSON.stringify({
+          name: "react-app",
+          version: "1.0.0",
+          type: "module",
+          scripts: {
+            dev: "vite",
+            build: "vite build",
+            preview: "vite preview"
+          },
+          dependencies: {
+            react: "^19.1.0",
+            "react-dom": "^19.1.0"
+          },
+          devDependencies: {
+            vite: "7.3.1",
+            "@vitejs/plugin-react": "^4.5.2"
+          }
+        }, null, 2),
+        '/project/vite.config.js': viteConfig,
+        '/project/index.html': projectHtml,
+        '/project/src/main.jsx': mainJsx,
+        '/project/src/App.jsx': appJsx,
+      },
+    });
+
+    log('Booted!\n', 'info');
+
+    log('--- Installing dependencies ---', 'dim');
+    log('This may take a moment...', 'dim');
+
+    var installProc = await nodepod.spawn('npm', ['install']);
+    installProc.on('output', function(text) { log(text.trimEnd()); });
+    installProc.on('error', function(text) { log(text.trimEnd(), 'stderr'); });
+    await installProc.completion;
+
+    log('\n--- Running vite build ---', 'dim');
+
+    var buildProc = await nodepod.spawn('npm', ['run', 'build']);
+    buildProc.on('output', function(text) {
+      var line = text.trimEnd();
+      if (line.includes('error') || line.includes('Error') || line.includes('failed') || line.includes('Failed')) {
+        log(line, 'fail');
+      } else if (line.includes('built') || line.includes('modules transformed')) {
+        log(line, 'pass');
+      } else {
+        log(line);
+      }
+    });
+    buildProc.on('error', function(text) { log(text.trimEnd(), 'fail'); });
+    await buildProc.completion;
+
+    log('\n--- Checking build output ---', 'dim');
+
+    var checkProc = await nodepod.spawn('ls', ['-la', '/project/dist']);
+    checkProc.on('output', function(text) { log(text.trimEnd()); });
+    checkProc.on('error', function(text) { log(text.trimEnd(), 'stderr'); });
+    await checkProc.completion;
+
+    log('\nTest complete.', 'info');
+  </script>
+</body>
+</html>
