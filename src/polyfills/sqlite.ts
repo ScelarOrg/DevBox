@@ -14,6 +14,19 @@ import { Factory, SQLiteError } from "wa-sqlite/src/sqlite-api.js";
 import * as SQLite from "wa-sqlite/src/sqlite-constants.js";
 import waSqliteFactory from "wa-sqlite/dist/wa-sqlite.mjs";
 
+type WaSqliteFactoryOptions = {
+  wasmBinary: Uint8Array;
+  wasmModule?: WebAssembly.Module;
+  noInitialRun?: boolean;
+  locateFile?: (path: string, prefix: string) => string;
+};
+
+// The Emscripten wrapper eagerly resolves `wa-sqlite.wasm` even when callers
+// provide wasmBinary. Bundled workers do not necessarily retain a valid
+// import.meta.url, so give it an absolute synthetic location. The location is
+// never fetched because the bytes are already supplied.
+const locateBundledWaSqlite = () => "https://nodepod.invalid/wa-sqlite.wasm";
+
 export const constants = {
   SQLITE_CHANGESET_DATA: 1,
   SQLITE_CHANGESET_NOTFOUND: 2,
@@ -736,14 +749,17 @@ async function loadEngine(): Promise<SqliteEngine | null> {
   try {
     const wasmBinary = await loadWasmBinary();
     precompileWasm(wasmBinary);
-    let factory: (opts: { wasmBinary: Uint8Array }) => Promise<WaModule>;
+    let factory: (opts: WaSqliteFactoryOptions) => Promise<WaModule>;
     try {
       factory = (await cdnImport(CDN_WA_SQLITE)).default as typeof factory;
     } catch {
       factory = (await import(/* @vite-ignore */ "wa-sqlite/dist/wa-sqlite.mjs"))
         .default as typeof factory;
     }
-    const module = (await factory({ wasmBinary })) as WaModule;
+    const module = (await factory({
+      wasmBinary,
+      locateFile: locateBundledWaSqlite,
+    })) as WaModule;
     return buildEngineFromWaModule(module);
   } catch (err) {
     if (typeof console !== "undefined") console.warn("[node:sqlite] load failed:", err);
@@ -772,10 +788,14 @@ function loadEngineSync(): SqliteEngine | null {
       compiled = new WebAssembly.Module(wasmBinary);
     }
 
-    const ready = waSqliteFactory({
+    const factory = waSqliteFactory as unknown as (
+      options: WaSqliteFactoryOptions,
+    ) => Promise<WaModule>;
+    const ready = factory({
       wasmBinary,
       wasmModule: compiled,
       noInitialRun: true,
+      locateFile: locateBundledWaSqlite,
     });
 
     const waModule = syncAwait(ready);

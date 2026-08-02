@@ -76,6 +76,7 @@ describe("ScriptEngine", () => {
       const { engine } = createEngine();
       expect(() => engine.runFile("/nonexistent.js")).toThrow();
     });
+
   });
 
   describe("require()", () => {
