@@ -7,6 +7,7 @@ vi.mock("virtual:process-worker-bundle", () => ({
 }));
 
 import { Nodepod } from "../sdk/nodepod";
+import { createBrowserHost, resetRuntimeHost, setRuntimeHost } from "../host";
 
 // Worker is not global in node, stub so boot can get past the worker check.
 // SW is opted out via serviceWorker: false so no navigator bits are touched.
@@ -17,6 +18,8 @@ describe("Nodepod SAB opt-out", () => {
   let sabBackup: typeof SharedArrayBuffer | undefined;
 
   beforeEach(() => {
+    resetRuntimeHost();
+    setRuntimeHost(createBrowserHost());
     warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     if (typeof (globalThis as any).Worker === "undefined") {
       (globalThis as any).Worker = function MockWorker() {} as any;
@@ -26,6 +29,7 @@ describe("Nodepod SAB opt-out", () => {
   });
 
   afterEach(() => {
+    resetRuntimeHost();
     warnSpy.mockRestore();
     if (workerWasSet) {
       delete (globalThis as any).Worker;

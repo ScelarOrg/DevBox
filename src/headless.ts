@@ -30,6 +30,9 @@ export { NodepodFS } from "./sdk/nodepod-fs";
 export { NodepodFSClient, NodepodFSClientError } from "./sdk/nodepod-fs-client";
 export { MemoryVolume } from "./memory-volume";
 export { DependencyInstaller, install } from "./packages/installer";
+export type { InstallFlags, InstallOutcome, WorkspaceInstallOutcome } from "./packages/installer";
+export { discoverWorkspaces, readWorkspacePatterns } from "./packages/workspace";
+export type { WorkspaceGraph, WorkspacePackage } from "./packages/workspace";
 export { RequestProxy, getProxyInstance, resetProxy, NodepodSWSetupError } from "./request-proxy";
 export type {
   NodepodOptions,

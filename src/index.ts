@@ -53,6 +53,9 @@ export * as querystring from "./polyfills/querystring";
 export * as util from "./polyfills/util";
 export * as npm from "./packages/installer";
 export { DependencyInstaller, install } from "./packages/installer";
+export type { InstallFlags, InstallOutcome, WorkspaceInstallOutcome } from "./packages/installer";
+export { discoverWorkspaces, readWorkspacePatterns } from "./packages/workspace";
+export type { WorkspaceGraph, WorkspacePackage } from "./packages/workspace";
 export { RequestProxy, getProxyInstance, resetProxy, NodepodSWSetupError } from "./request-proxy";
 export type { ProxyOptions, ServiceWorkerConfig, NodepodSWFrameworkHint } from "./request-proxy";
 export {

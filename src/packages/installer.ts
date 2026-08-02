@@ -23,6 +23,11 @@ import { getTarballCache } from "../persistence/tarball-cache";
 import type { PerformanceTracker } from "../performance-tracker";
 import { resolveWithCache } from "./resolution-cache";
 import { writeNpmPackageLock } from "./pm-cli";
+import {
+  discoverWorkspaces,
+  workspaceDependencyNames,
+  type WorkspaceGraph,
+} from "./workspace";
 
 const RESOLVER_CACHE_VERSION = 1;
 const SNAPSHOT_CACHE_VERSION = 2;
@@ -88,6 +93,11 @@ export function isManifestSnapshotComplete(
 export interface InstallOutcome {
   resolved: Map<string, ResolvedDependency>;
   newPackages: string[];
+}
+
+export interface WorkspaceInstallOutcome {
+  graph: WorkspaceGraph;
+  installs: Array<{ root: string; outcome: InstallOutcome }>;
 }
 
 // ---------------------------------------------------------------------------
@@ -379,6 +389,86 @@ export class DependencyInstaller {
 
     stopInstall?.();
     return { resolved: tree, newPackages: newPkgs };
+  }
+
+  /**
+   * Install a root npm workspace and each child workspace. Workspace-local
+   * dependencies are linked through the VFS after external dependencies are
+   * installed in the package that consumes them.
+   */
+  async installWorkspace(
+    rootManifestPath?: string,
+    flags: InstallFlags = {},
+  ): Promise<WorkspaceInstallOutcome> {
+    const manifestPath = rootManifestPath || path.join(this.workingDir, "package.json");
+    const root = path.dirname(manifestPath);
+    const graph = discoverWorkspaces(this.vol, root);
+    const installs: Array<{ root: string; outcome: InstallOutcome }> = [];
+
+    const installExternal = async (
+      packageRoot: string,
+      sourcePath: string,
+      manifest: PackageManifest,
+    ) => {
+      const localNames = workspaceDependencyNames(manifest);
+      const filtered = { ...manifest } as Record<string, unknown>;
+      for (const section of ["dependencies", "devDependencies", "optionalDependencies"] as const) {
+        const values = { ...(manifest[section] ?? {}) } as Record<string, string>;
+        for (const name of localNames) delete values[name];
+        filtered[section] = values;
+      }
+      const temporaryPath = path.join(packageRoot, ".nodepod-install-manifest.json");
+      this.vol.writeFileSync(temporaryPath, JSON.stringify(filtered));
+      try {
+        const installer = new DependencyInstaller(this.vol, {
+          cwd: packageRoot,
+          snapshotCache: this._snapshotCache,
+          performanceTracker: this._performance,
+        });
+        const outcome = await installer.installFromManifest(temporaryPath, flags);
+        installs.push({ root: packageRoot, outcome });
+      } finally {
+        if (this.vol.existsSync(temporaryPath)) this.vol.unlinkSync(temporaryPath);
+      }
+      void sourcePath;
+    };
+
+    const rootManifest = JSON.parse(this.vol.readFileSync(manifestPath, "utf8")) as PackageManifest;
+    await installExternal(root, manifestPath, rootManifest);
+    for (const workspace of graph.packages) {
+      await installExternal(workspace.root, path.join(workspace.root, "package.json"), workspace.manifest);
+    }
+
+    const linkPackage = (consumerRoot: string, dependencyName: string, targetRoot: string) => {
+      const destination = path.join(consumerRoot, "node_modules", dependencyName);
+      const parent = path.dirname(destination);
+      this.vol.mkdirSync(parent, { recursive: true });
+      if (this.vol.existsSync(destination)) {
+        try {
+          this.vol.removeTreeSync(destination);
+        } catch {
+          this.vol.unlinkSync(destination);
+        }
+      }
+      this.vol.symlinkSync(targetRoot, destination, "dir");
+    };
+
+    const consumers = [
+      { root, manifest: rootManifest },
+      ...graph.packages.map((workspace) => ({ root: workspace.root, manifest: workspace.manifest })),
+    ];
+    for (const consumer of consumers) {
+      const dependencies = new Set<string>();
+      for (const section of ["dependencies", "devDependencies", "optionalDependencies"] as const) {
+        for (const name of Object.keys(consumer.manifest[section] ?? {})) dependencies.add(name);
+      }
+      for (const name of dependencies) {
+        const target = graph.byName.get(name);
+        if (target) linkPackage(consumer.root, name, target.root);
+      }
+    }
+
+    return { graph, installs };
   }
 
   listInstalled(): Record<string, string> {

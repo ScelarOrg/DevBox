@@ -13,5 +13,6 @@ export interface PackageManifest {
   optionalDependencies?: Record<string, string>;
   scripts?: Record<string, string>;
   bin?: string | Record<string, string>;
+  workspaces?: string[] | { packages?: string[] };
   [key: string]: unknown;
 }
