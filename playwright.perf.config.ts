@@ -14,7 +14,7 @@ export default defineConfig({
   },
   webServer: {
     command: "pnpm exec vite --config vite.perf.config.ts",
-    url: "http://127.0.0.1:3333/examples/scelar-auth-template/",
+    url: "http://127.0.0.1:3333/tests/performance/nodepod-perf.html",
     reuseExistingServer: true,
     timeout: 30_000,
   },

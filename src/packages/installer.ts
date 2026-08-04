@@ -20,7 +20,9 @@ import {
   restoreBinarySnapshot,
 } from "../persistence/binary-snapshot";
 import { getTarballCache } from "../persistence/tarball-cache";
+import { PINNED_ESBUILD_WASM } from "../constants/cdn-urls";
 import type { PerformanceTracker } from "../performance-tracker";
+import type { NodepodProfilerImpl, ProfileSpanToken } from "../profiling/profiler";
 import { resolveWithCache } from "./resolution-cache";
 import { writeNpmPackageLock } from "./pm-cli";
 import {
@@ -30,7 +32,8 @@ import {
 } from "./workspace";
 
 const RESOLVER_CACHE_VERSION = 1;
-const SNAPSHOT_CACHE_VERSION = 2;
+const SNAPSHOT_CACHE_VERSION = 3;
+const TRANSFORMER_CACHE_VERSION = `esbuild-wasm@${PINNED_ESBUILD_WASM}:cjs-esnext-neutral-v1`;
 
 function stableRecord(record: Record<string, string> | undefined): string {
   return JSON.stringify(Object.entries(record ?? {}).sort(([a], [b]) => a.localeCompare(b)));
@@ -39,6 +42,7 @@ function stableRecord(record: Record<string, string> | undefined): string {
 export function manifestSnapshotKey(raw: string, flags: InstallFlags = {}): string {
   return quickDigest(JSON.stringify({
     version: SNAPSHOT_CACHE_VERSION,
+    transformer: TRANSFORMER_CACHE_VERSION,
     manifest: raw,
     registry: flags.registry ?? "default",
     dev: !!flags.withDevDeps,
@@ -168,6 +172,7 @@ export class DependencyInstaller {
   private workingDir: string;
   private _snapshotCache: IDBSnapshotCache | null;
   private _performance: PerformanceTracker | null;
+  private _profiler: NodepodProfilerImpl | null;
 
   constructor(
     vol: MemoryVolume,
@@ -175,6 +180,7 @@ export class DependencyInstaller {
       cwd?: string;
       snapshotCache?: IDBSnapshotCache | null;
       performanceTracker?: PerformanceTracker | null;
+      profiler?: NodepodProfilerImpl | null;
     } & RegistryConfig = {},
   ) {
     this.vol = vol;
@@ -182,6 +188,19 @@ export class DependencyInstaller {
     this.workingDir = opts.cwd || "/";
     this._snapshotCache = opts.snapshotCache ?? null;
     this._performance = opts.performanceTracker ?? null;
+    this._profiler = opts.profiler ?? null;
+  }
+
+  private profileSpan(
+    name: string,
+    category: "packages" | "snapshots" | "modules" | "workers" = "packages",
+    metadata?: Record<string, string | number | boolean>,
+  ): ProfileSpanToken | null {
+    return this._profiler?.begin(name, { category, metadata }) ?? null;
+  }
+
+  private endProfileSpan(token: ProfileSpanToken | null): void {
+    this._profiler?.end(token);
   }
 
   // -----------------------------------------------------------------------
@@ -194,6 +213,7 @@ export class DependencyInstaller {
     flags: InstallFlags = {},
   ): Promise<InstallOutcome> {
     const stopInstall = this._performance?.start("install.total");
+    const installSpan = this.profileSpan("packages.install");
     const { onProgress } = flags;
 
     const spec = splitSpecifier(packageName);
@@ -204,7 +224,7 @@ export class DependencyInstaller {
 
     const resolutionOpts: ResolutionConfig = {
       registry: flags.registry
-        ? new RegistryClient({ endpoint: flags.registry })
+        ? new RegistryClient({ endpoint: flags.registry, profiler: this._profiler })
         : this.registryClient,
       devDependencies: flags.withDevDeps,
       optionalDependencies: flags.withOptionalDeps,
@@ -212,6 +232,7 @@ export class DependencyInstaller {
     };
 
     const stopResolution = this._performance?.start("install.resolve");
+    const resolutionSpan = this.profileSpan("packages.resolve");
     const resolutionKey = quickDigest(JSON.stringify({
       version: RESOLVER_CACHE_VERSION,
       package: targetName,
@@ -223,8 +244,12 @@ export class DependencyInstaller {
     const resolved = await resolveWithCache(resolutionKey, () =>
       resolveDependencyTree(targetName, targetRange, resolutionOpts));
     const tree = resolved.tree;
-    if (resolved.hit) this._performance?.increment("install.resolutionCacheHits");
+    if (resolved.hit) {
+      this._performance?.increment("install.resolutionCacheHits");
+      this._profiler?.count("packages.resolutionCacheHits");
+    }
     stopResolution?.();
+    this.endProfileSpan(resolutionSpan);
 
     // Prefer package-lock resolved URL + SRI for the root package (npm ci)
     if (flags.lockEntry) {
@@ -238,10 +263,14 @@ export class DependencyInstaller {
     // snapshot cache keyed by the resolved package set — skips download,
     // extract, and transform on warm runs (resolution still hit the registry).
     // TODO(follow-up): upgrade quickDigest to SHA-256 via sync-digest.ts
+    const transformMode = isEagerTransform(flags.transformModules) ? "eager" : "lazy";
     const treeKey = this._snapshotCache
       ? "tree:" + quickDigest(
           [...tree].map(([n, d]) => `${n}@${d.version}`).sort().join(",") +
-            "|" + this.workingDir,
+            "|" + this.workingDir +
+            "|" + SNAPSHOT_CACHE_VERSION +
+            "|" + TRANSFORMER_CACHE_VERSION +
+            "|" + transformMode,
         )
       : null;
 
@@ -251,8 +280,10 @@ export class DependencyInstaller {
         if (cached) {
           onProgress?.("Restoring cached packages...");
           const stopRestore = this._performance?.start("install.restore");
+          const restoreSpan = this.profileSpan("snapshots.restore", "snapshots");
           const restored = restoreBinarySnapshot(this.vol, cached);
           stopRestore?.();
+          this.endProfileSpan(restoreSpan);
           // bin stubs + lock file are deterministic — recreate from the tree
           const nmRoot = path.join(this.workingDir, "node_modules");
           for (const [depName] of tree) {
@@ -267,7 +298,9 @@ export class DependencyInstaller {
           }
           onProgress?.(`Restored ${restored} cached entries`);
           this._performance?.increment("install.cacheHits");
+          this._profiler?.count("packages.snapshotCacheHits");
           stopInstall?.();
+          this.endProfileSpan(installSpan);
           return { resolved: tree, newPackages: [] };
         }
       } catch {
@@ -276,8 +309,10 @@ export class DependencyInstaller {
     }
 
     const stopMaterialize = this._performance?.start("install.materialize");
+    const materializeSpan = this.profileSpan("packages.materialize");
     const newPkgs = await this.materializePackages(tree, flags);
     stopMaterialize?.();
+    this.endProfileSpan(materializeSpan);
 
     // cache just this tree's package dirs so unrelated node_modules content
     // from the session doesn't leak into the entry
@@ -306,6 +341,7 @@ export class DependencyInstaller {
     onProgress?.(`Installed ${tree.size} package(s)`);
 
     stopInstall?.();
+    this.endProfileSpan(installSpan);
     return { resolved: tree, newPackages: newPkgs };
   }
 
@@ -314,6 +350,7 @@ export class DependencyInstaller {
     flags: InstallFlags = {},
   ): Promise<InstallOutcome> {
     const stopInstall = this._performance?.start("install.total");
+    const installSpan = this.profileSpan("packages.install");
     const { onProgress } = flags;
 
     const jsonPath = manifestPath || path.join(this.workingDir, "package.json");
@@ -333,11 +370,15 @@ export class DependencyInstaller {
         if (cached && isManifestSnapshotComplete(cached, this.workingDir, manifest, flags)) {
           onProgress?.("Restoring cached node_modules...");
           const stopRestore = this._performance?.start("install.restore");
+          const restoreSpan = this.profileSpan("snapshots.restore", "snapshots");
           const restored = restoreBinarySnapshot(this.vol, cached);
           stopRestore?.();
+          this.endProfileSpan(restoreSpan);
           onProgress?.(`Restored ${restored} cached entries`);
           this._performance?.increment("install.cacheHits");
+          this._profiler?.count("packages.snapshotCacheHits");
           stopInstall?.();
+          this.endProfileSpan(installSpan);
           return { resolved: new Map(), newPackages: [] };
         }
       } catch {
@@ -357,6 +398,7 @@ export class DependencyInstaller {
     };
 
     const stopResolution = this._performance?.start("install.resolve");
+    const resolutionSpan = this.profileSpan("packages.resolve");
     const resolutionKey = quickDigest(JSON.stringify({
       version: RESOLVER_CACHE_VERSION,
       registry: flags.registry ?? "default",
@@ -367,12 +409,18 @@ export class DependencyInstaller {
     const resolved = await resolveWithCache(resolutionKey, () =>
       resolveFromManifest(manifest, resolutionOpts));
     const tree = resolved.tree;
-    if (resolved.hit) this._performance?.increment("install.resolutionCacheHits");
+    if (resolved.hit) {
+      this._performance?.increment("install.resolutionCacheHits");
+      this._profiler?.count("packages.resolutionCacheHits");
+    }
     stopResolution?.();
+    this.endProfileSpan(resolutionSpan);
 
     const stopMaterialize = this._performance?.start("install.materialize");
+    const materializeSpan = this.profileSpan("packages.materialize");
     const newPkgs = await this.materializePackages(tree, flags);
     stopMaterialize?.();
+    this.endProfileSpan(materializeSpan);
 
     // Cache the installed node_modules snapshot for future reuse (raw bytes,
     // no base64 — restores go through the bulk binary path)
@@ -388,6 +436,7 @@ export class DependencyInstaller {
     onProgress?.(`Installed ${tree.size} package(s)`);
 
     stopInstall?.();
+    this.endProfileSpan(installSpan);
     return { resolved: tree, newPackages: newPkgs };
   }
 
@@ -587,6 +636,7 @@ export class DependencyInstaller {
                 stripComponents: 1,
                 expectedShasum: dep.shasum,
                 expectedIntegrity: dep.integrity,
+                profiler: this._profiler,
               });
               const manifestPath = path.join(targetDir, "package.json");
               if (!this.vol.existsSync(manifestPath)) {
@@ -604,6 +654,7 @@ export class DependencyInstaller {
                 this.vol,
                 targetDir,
                 onProgress,
+                this._profiler,
               );
               if (transformed > 0) {
                 onProgress?.(

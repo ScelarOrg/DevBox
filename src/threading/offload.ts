@@ -9,16 +9,22 @@ import type {
   PoolConfig,
   TransformTask,
   TransformResult,
+  TransformBatchTask,
+  TransformBatchResult,
   ExtractTask,
   ExtractResult,
   BuildTask,
   BuildResult,
 } from "./offload-types";
+import type { NodepodProfilerImpl } from "../profiling/profiler";
+import { profileTimestamp } from "../profiling/profiler";
 
 export { TaskPriority } from "./offload-types";
 export type {
   TransformTask,
   TransformResult,
+  TransformBatchTask,
+  TransformBatchResult,
   ExtractTask,
   ExtractResult,
   BuildTask,
@@ -34,6 +40,7 @@ let pool: WorkerPool | null = null;
 let queue: TaskQueue | null = null;
 let fallbackMode = false;
 let storedConfig: PoolConfig | undefined;
+let nextTaskIdValue = 1;
 
 // --- Environment detection ---
 
@@ -68,13 +75,35 @@ async function mainThreadTransform(
   task: TransformTask,
 ): Promise<TransformResult> {
   // convertFileDirect, not convertFile — avoids circular: convertFile → offload → fallback → loop
-  const { convertFileDirect, prepareTransformer } = await import(
+  const { convertFileDirect, patchBuiltinImports, prepareTransformer } = await import(
     "../module-transformer"
   );
   await prepareTransformer();
 
-  const code = await convertFileDirect(task.source, task.filePath);
+  const code = patchBuiltinImports(await convertFileDirect(task.source, task.filePath));
   return { type: "transform", id: task.id, code, warnings: [] };
+}
+
+async function mainThreadTransformBatch(
+  task: TransformBatchTask,
+): Promise<TransformBatchResult> {
+  const { convertFileDirect, patchBuiltinImports, prepareTransformer } = await import(
+    "../module-transformer"
+  );
+  await prepareTransformer();
+  const results = await Promise.all(task.files.map(async (file) => {
+    try {
+      const code = patchBuiltinImports(await convertFileDirect(file.source, file.filePath));
+      return { filePath: file.filePath, code, warnings: [] };
+    } catch (err) {
+      return {
+        filePath: file.filePath,
+        code: file.source,
+        warnings: [err instanceof Error ? err.message : String(err)],
+      };
+    }
+  }));
+  return { type: "transformBatch", id: task.id, results };
 }
 
 async function mainThreadExtract(
@@ -166,11 +195,10 @@ async function mainThreadBuild(task: BuildTask): Promise<BuildResult> {
 
 // --- Public API ---
 
-export function taskId(): string {
-  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
-    return crypto.randomUUID();
-  }
-  return `task-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+export function taskId(): number {
+  const id = nextTaskIdValue;
+  nextTaskIdValue = nextTaskIdValue >= Number.MAX_SAFE_INTEGER ? 1 : nextTaskIdValue + 1;
+  return id;
 }
 
 export async function offload<T extends OffloadTask>(
@@ -178,8 +206,10 @@ export async function offload<T extends OffloadTask>(
 ): Promise<
   T extends TransformTask
     ? TransformResult
-    : T extends ExtractTask
-      ? ExtractResult
+    : T extends TransformBatchTask
+      ? TransformBatchResult
+      : T extends ExtractTask
+        ? ExtractResult
       : T extends BuildTask
         ? BuildResult
         : OffloadResult
@@ -202,6 +232,66 @@ export async function offload<T extends OffloadTask>(
     }
     switchToFallback();
     return runFallback(task) as any;
+  }
+}
+
+/**
+ * Opt-in timing wrapper for worker-backed tasks. Kept separate from offload()
+ * so the default task path does not allocate profiling tokens or metadata.
+ */
+export async function profiledOffload<T extends OffloadTask>(
+  task: T,
+  profiler: NodepodProfilerImpl,
+): Promise<
+  T extends TransformTask
+    ? TransformResult
+    : T extends TransformBatchTask
+      ? TransformBatchResult
+      : T extends ExtractTask
+        ? ExtractResult
+      : T extends BuildTask
+        ? BuildResult
+        : OffloadResult
+> {
+  const span = profiler.begin(`workers.${task.type}`, {
+    category: "workers",
+    metadata: { taskId: task.id },
+  });
+  const profiledTask = {
+    ...task,
+    profiling: { createdAt: profileTimestamp() },
+  } as T;
+  try {
+    const result = await offload(profiledTask);
+    profiler.count("workers.tasks");
+    const timing = result.profiling;
+    if (timing?.dispatchedAt !== undefined) {
+      profiler.recordSpan("workers.queue", timing.createdAt, timing.dispatchedAt, {
+        category: "workers",
+        thread: `worker-${timing.workerId ?? "unknown"}`,
+      });
+    }
+    if (timing?.startedAt !== undefined && timing.completedAt !== undefined) {
+      profiler.recordSpan("workers.execution", timing.startedAt, timing.completedAt, {
+        category: "workers",
+        thread: `worker-${timing.workerId ?? "unknown"}`,
+      });
+    }
+    if (timing?.dispatchedAt !== undefined && timing.startedAt !== undefined) {
+      profiler.recordSpan("workers.transfer.to", timing.dispatchedAt, timing.startedAt, {
+        category: "workers",
+        thread: `worker-${timing.workerId ?? "unknown"}`,
+      });
+    }
+    if (timing?.completedAt !== undefined && timing.receivedAt !== undefined) {
+      profiler.recordSpan("workers.transfer.from", timing.completedAt, timing.receivedAt, {
+        category: "workers",
+        thread: `worker-${timing.workerId ?? "unknown"}`,
+      });
+    }
+    return result as any;
+  } finally {
+    profiler.end(span);
   }
 }
 
@@ -234,6 +324,8 @@ async function runFallback(task: OffloadTask): Promise<OffloadResult> {
   switch (task.type) {
     case "transform":
       return mainThreadTransform(task);
+    case "transformBatch":
+      return mainThreadTransformBatch(task);
     case "extract":
       return mainThreadExtract(task);
     case "build":
@@ -243,7 +335,7 @@ async function runFallback(task: OffloadTask): Promise<OffloadResult> {
   }
 }
 
-export function cancelTask(id: string): boolean {
+export function cancelTask(id: number): boolean {
   return queue?.cancel(id) ?? false;
 }
 

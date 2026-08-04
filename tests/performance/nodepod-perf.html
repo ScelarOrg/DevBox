@@ -1,0 +1,409 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Nodepod synthetic performance fixture</title>
+<style>
+  body { background: #111; color: #eee; font: 14px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace; margin: 24px; }
+  button { background: #2f81f7; border: 0; border-radius: 4px; color: white; cursor: pointer; padding: 8px 12px; }
+  pre { white-space: pre-wrap; }
+  #results { color: #b6f2b6; }
+</style>
+<body>
+<pre id="status">Starting fixture…</pre>
+<button id="run" type="button" hidden>Run scenario</button>
+<pre id="results"></pre>
+<script type="module">
+const status = document.getElementById("status");
+const results = document.getElementById("results");
+const runButton = document.getElementById("run");
+
+if (location.protocol === "file:") {
+  status.textContent = "This fixture must be served through Vite; file:// cannot load the Nodepod modules.";
+  results.textContent = [
+    "Start the performance server from the Nodepod repository:",
+    "  pnpm build:publish",
+    "  pnpm exec vite --config vite.perf.config.ts",
+    "",
+    "Then open:",
+    "  http://127.0.0.1:3333/tests/performance/nodepod-perf.html?scenario=vfs-lookups&mode=warm&autorun=1",
+  ].join("\\n");
+  throw new Error("The Nodepod performance fixture cannot run from file://");
+}
+
+const params = new URLSearchParams(location.search);
+const scenario = params.get("scenario") || "vfs-lookups";
+const workers = Math.max(1, Number(params.get("workers") || 1));
+const mode = params.get("mode") || "warm";
+const diagnostic = params.get("diagnostic") === "1" || mode === "diagnostic";
+
+const nodepod = await import("/dist/index.mjs");
+const { Nodepod, MemoryVolume, VFSBridge } = nodepod;
+const { ScriptEngine } = await import("/src/script-engine.ts");
+const { convertPackage, prepareTransformer } = await import("/src/module-transformer.ts");
+const { configurePool, disposePool, offload, poolStats, taskId, TaskPriority } =
+  await import("/src/threading/offload.ts");
+const { createFilteredBinarySnapshot } = await import("/src/persistence/binary-snapshot.ts");
+
+const setStatus = (value) => { if (status) status.textContent = value; };
+const now = () => performance.now();
+
+runButton.hidden = false;
+setStatus(`READY — ${scenario} / ${mode}${scenario === "transform-throughput" ? ` / ${workers} workers` : ""}`);
+
+function checksumBytes(bytes) {
+  let hash = 2166136261;
+  for (let i = 0; i < bytes.length; i++) hash = Math.imul(hash ^ bytes[i], 16777619);
+  return (hash >>> 0).toString(16);
+}
+
+function checksumStrings(values) {
+  let hash = 2166136261;
+  for (const value of values) {
+    for (let i = 0; i < value.length; i++) hash = Math.imul(hash ^ value.charCodeAt(i), 16777619);
+  }
+  return (hash >>> 0).toString(16);
+}
+
+function makeVolumeHandler(source) {
+  return {
+    readFile(path) {
+      try { return source.readFileSync(path); } catch { return null; }
+    },
+    readdir(path) {
+      try {
+        return source.readdirSync(path).map((name) => {
+          const full = path === "/" ? `/${name}` : `${path}/${name}`;
+          const st = source.statSync(full);
+          return { name, isDirectory: st.isDirectory(), size: st.size };
+        });
+      } catch { return null; }
+    },
+    stat(path) {
+      try {
+        const st = source.statSync(path);
+        return { isFile: st.isFile(), isDirectory: st.isDirectory(), size: st.size };
+      } catch { return null; }
+    },
+  };
+}
+
+function shuffle(values) {
+  const result = values.slice();
+  let seed = 0x9e3779b9;
+  for (let i = result.length - 1; i > 0; i--) {
+    seed = Math.imul(seed ^ (seed >>> 16), 2246822519);
+    seed = Math.imul(seed ^ (seed >>> 13), 3266489917);
+    const j = (seed >>> 0) % (i + 1);
+    [result[i], result[j]] = [result[j], result[i]];
+  }
+  return result;
+}
+
+function writeOctal(buffer, offset, length, value) {
+  const text = value.toString(8).padStart(length - 1, "0") + "\0";
+  for (let i = 0; i < length; i++) buffer[offset + i] = text.charCodeAt(i) || 0;
+}
+
+function writeAscii(buffer, offset, length, value) {
+  for (let i = 0; i < length && i < value.length; i++) buffer[offset + i] = value.charCodeAt(i);
+}
+
+function makeTar() {
+  const entries = [
+    ["nodepod-perf/a.txt", "alpha"],
+    ["nodepod-perf/b.txt", "beta"],
+    ["nodepod-perf/c.txt", "gamma"],
+  ];
+  const blocks = [];
+  for (const [name, text] of entries) {
+    const payload = new TextEncoder().encode(text);
+    const header = new Uint8Array(512);
+    writeAscii(header, 0, 100, name);
+    writeOctal(header, 100, 8, 0o644);
+    writeOctal(header, 108, 8, 0);
+    writeOctal(header, 116, 8, 0);
+    writeOctal(header, 124, 12, payload.length);
+    writeOctal(header, 136, 12, 0);
+    header[156] = 48;
+    writeAscii(header, 257, 6, "ustar\0");
+    for (let i = 148; i < 156; i++) header[i] = 32;
+    let sum = 0;
+    for (const byte of header) sum += byte;
+    writeOctal(header, 148, 8, sum);
+    blocks.push(header, payload);
+    const padding = (512 - (payload.length % 512)) % 512;
+    if (padding) blocks.push(new Uint8Array(padding));
+  }
+  blocks.push(new Uint8Array(1024));
+  const total = blocks.reduce((size, part) => size + part.length, 0);
+  const tar = new Uint8Array(total);
+  let offset = 0;
+  for (const block of blocks) { tar.set(block, offset); offset += block.length; }
+  return tar;
+}
+
+async function gzip(bytes) {
+  if (typeof CompressionStream === "undefined") throw new Error("CompressionStream is unavailable");
+  const stream = new Blob([bytes]).stream().pipeThrough(new CompressionStream("gzip"));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+function makePod() {
+  return Nodepod.boot({
+    headless: true,
+    serviceWorker: false,
+    enableSnapshotCache: false,
+    packageStore: "memory",
+    profiler: {
+      enabled: true,
+      level: "timings",
+      captureMemory: diagnostic,
+      captureLongTasks: diagnostic,
+      memorySampleIntervalMs: 250,
+      pathDetail: "none",
+      includeUrls: false,
+    },
+  });
+}
+
+async function prepareVfsLookups(volume) {
+  volume.mkdirSync("/project/node_modules", { recursive: true });
+  for (let i = 0; i < 25000; i++) {
+    const packageName = `pkg-${i % 500}`;
+    const path = `/project/node_modules/${packageName}/file-${i}.js`;
+    volume.writeFileSync(path, `export const value = ${i};`);
+  }
+  volume.mkdirSync("/project/resolve", { recursive: true });
+  for (let i = 0; i < 1000; i++) {
+    volume.writeFileSync(`/project/resolve/dep-${i}.js`, `module.exports = ${i};`);
+    volume.writeFileSync(`/project/resolve/entry-${i}.js`, `module.exports = require('./dep-${i}');`);
+  }
+}
+
+async function runVfsLookups(pod) {
+  const volume = pod.volume;
+  await prepareVfsLookups(volume);
+  const statStart = now();
+  let statFiles = 0;
+  for (let i = 0; i < 100000; i++) {
+    const index = (i * 97) % 25000;
+    if (volume.statSync(`/project/node_modules/pkg-${index % 500}/file-${index}.js`).isFile()) statFiles++;
+  }
+  const statMs = now() - statStart;
+  const existsStart = now();
+  let existsFiles = 0;
+  for (let i = 0; i < 100000; i++) {
+    const index = (i * 193) % 25000;
+    if (volume.existsSync(`/project/node_modules/pkg-${index % 500}/file-${index}.js`)) existsFiles++;
+  }
+  const existsMs = now() - existsStart;
+  const resolverStart = now();
+  const engine = new ScriptEngine(volume);
+  for (let i = 0; i < 1000; i++) engine.runFile(`/project/resolve/entry-${i}.js`);
+  return {
+    statMs,
+    existsMs,
+    resolverMs: now() - resolverStart,
+    statFiles,
+    existsFiles,
+    resolverFiles: 1000,
+  };
+}
+
+async function runLazyHardlinkEviction() {
+  const source = new MemoryVolume();
+  source.mkdirSync("/node_modules/pkg", { recursive: true });
+  const bytes = new Uint8Array(4096);
+  for (let i = 0; i < 5000; i++) {
+    bytes.fill(i & 255);
+    source.writeFileSync(`/node_modules/pkg/file-${i}.bin`, bytes);
+    if (i > 0 && i % 100 === 0) source.linkSync(`/node_modules/pkg/file-${i}.bin`, `/node_modules/pkg/source-link-${i}.bin`);
+  }
+  const snapshot = new VFSBridge(source).createSnapshot({ excludeDirNames: ["node_modules"] });
+  const volume = MemoryVolume.fromBinarySnapshot(snapshot);
+  volume.setMissHandler(makeVolumeHandler(source), snapshot.lazyDirNames || ["node_modules"]);
+  volume.readdirSync("/node_modules/pkg");
+  for (let i = 0; i < 100; i++) volume.linkSync(`/node_modules/pkg/file-${i}.bin`, `/node_modules/pkg/local-link-${i}.bin`);
+  const checksum = [];
+  const start = now();
+  for (let pass = 0; pass < 3; pass++) {
+    for (let i = 0; i < 5000; i += 7) checksum.push(String(volume.readFileSync(`/node_modules/pkg/file-${i}.bin`)[0]));
+    for (let i = 0; i < 100; i++) checksum.push(String(volume.readFileSync(`/node_modules/pkg/local-link-${i}.bin`)[0]));
+  }
+  return {
+    wallMs: now() - start,
+    reads: checksum.length,
+    checksum: checksumStrings(checksum),
+    stats: volume.getStats(),
+  };
+}
+
+async function runBinaryWriteNotifications(pod) {
+  const volume = pod.volume;
+  const bytes = new Uint8Array(64 * 1024).fill(171);
+  const start = now();
+  for (let i = 0; i < 1000; i++) volume.writeFileSync(`/binary-${i}.bin`, bytes);
+  const noSubscriberMs = now() - start;
+  const events = [];
+  const listener = (path, content) => events.push([path, typeof content, content.length]);
+  volume.on("change", listener);
+  const compatStart = now();
+  for (let i = 0; i < 1000; i++) volume.writeFileSync(`/compat-${i}.bin`, bytes);
+  const compatibilityMs = now() - compatStart;
+  volume.off("change", listener);
+  return { noSubscriberMs, compatibilityMs, noSubscriberWrites: 1000, compatibilityWrites: events.length, contentType: events[0]?.[1] || null };
+}
+
+async function runSnapshotMount() {
+  const source = new MemoryVolume();
+  source.mkdirSync("/snapshot/data", { recursive: true });
+  const payload = new Uint8Array(3277).fill(23);
+  for (let i = 0; i < 20000; i++) source.writeFileSync(`/snapshot/data/file-${i}.bin`, payload);
+  const bridge = new VFSBridge(source);
+  const createStart = now();
+  const created = bridge.createSnapshot();
+  const createMs = now() - createStart;
+  const randomized = { ...created, manifest: shuffle(created.manifest) };
+  const restoreStart = now();
+  const restored = MemoryVolume.fromBinarySnapshot(randomized);
+  const restoreMs = now() - restoreStart;
+  const target = new MemoryVolume();
+  const mountStart = now();
+  const mounted = target.mountBinarySnapshot(randomized);
+  const mountMs = now() - mountStart;
+  return {
+    createMs,
+    restoreMs,
+    mountMs,
+    mounted,
+    manifestEntries: created.manifest.length,
+    dataBytes: created.data.byteLength,
+    checksum: checksumBytes(restored.readFileSync("/snapshot/data/file-19999.bin")),
+  };
+}
+
+function makeTransformSources(volume) {
+  volume.mkdirSync("/transform", { recursive: true });
+  const body = `export const component = <main data-value=\"VALUE\">VALUE</main>;\n` +
+    `export const answer = VALUE;\n` + "// padding ".repeat(500);
+  for (let i = 0; i < 512; i++) volume.writeFileSync(`/transform/file-${i}.jsx`, body.replaceAll("VALUE", String(i)));
+}
+
+async function runTransformThroughput(pod) {
+  const volume = pod.volume;
+  makeTransformSources(volume);
+  configurePool({ minWorkers: workers, maxWorkers: workers, warmUpOnCreate: true });
+  if (mode === "warm") {
+    await prepareTransformer();
+    await Promise.all(Array.from({ length: workers }, () => offload({
+      type: "transform",
+      id: taskId(),
+      source: "export const warmed = 1;",
+      filePath: "/warm.js",
+      options: { loader: "js", format: "cjs", target: "esnext", platform: "neutral" },
+      priority: TaskPriority.HIGH,
+    })));
+  }
+  const start = now();
+  const converted = await convertPackage(volume, "/transform", undefined, pod.profiler);
+  const wallMs = now() - start;
+  const stats = poolStats();
+  const output = volume.readFileSync("/transform/file-511.jsx", "utf8");
+  disposePool();
+  return {
+    wallMs,
+    converted,
+    filesPerSecond: converted / Math.max(wallMs / 1000, 0.001),
+    outputChecksum: checksumStrings([output]),
+    outputLength: output.length,
+    workerCount: workers,
+    pool: stats,
+    sourceBytes: 512 * ("// padding ".repeat(500).length + 100),
+  };
+}
+
+async function runArchiveExtraction() {
+  const compressed = await gzip(makeTar());
+  const start = now();
+  const result = await offload({
+    type: "extract",
+    id: taskId(),
+    tarballUrl: location.href,
+    tarballBytes: compressed.buffer.slice(compressed.byteOffset, compressed.byteOffset + compressed.byteLength),
+    stripComponents: 1,
+    priority: TaskPriority.NORMAL,
+  });
+  return {
+    wallMs: now() - start,
+    compressedBytes: compressed.byteLength,
+    files: result.files.length,
+    checksum: checksumStrings(result.files.map((file) => file.path + ":" + (file.data instanceof Uint8Array ? checksumBytes(file.data) : file.data))),
+  };
+}
+
+async function runScenario(pod) {
+  switch (scenario) {
+    case "vfs-lookups": return runVfsLookups(pod);
+    case "lazy-hardlink-eviction": return runLazyHardlinkEviction();
+    case "binary-write-notifications": return runBinaryWriteNotifications(pod);
+    case "snapshot-mount": return runSnapshotMount();
+    case "transform-throughput": return runTransformThroughput(pod);
+    case "archive-extraction": return runArchiveExtraction();
+    default: throw new Error(`Unknown scenario: ${scenario}`);
+  }
+}
+
+window.__nodepodPerfReady = true;
+window.__nodepodPerfStart = async () => {
+  const bootStart = now();
+  let pod;
+  try {
+    pod = await makePod();
+    const bootMs = now() - bootStart;
+    const session = pod.profiler.start(`synthetic.${scenario}`);
+    const measuredStart = now();
+    const scenarioResult = await runScenario(pod);
+    const wallMs = now() - measuredStart;
+    const report = await session.stop();
+    const memory = pod.memoryStats();
+    const result = {
+      scenario,
+      mode,
+      diagnostic,
+      workers: scenario === "transform-throughput" ? workers : null,
+      bootMs,
+      wallMs,
+      scenarioResult,
+      memory,
+      reportJson: report.export("json"),
+      traceJson: report.export("chrome-trace"),
+    };
+    window.__nodepodPerfResult = result;
+    let reportSummary = {};
+    try { reportSummary = JSON.parse(result.reportJson).summary || {}; } catch {}
+    results.textContent = JSON.stringify({
+      scenario: result.scenario,
+      mode: result.mode,
+      workers: result.workers,
+      bootMs: Number(result.bootMs.toFixed(2)),
+      wallMs: Number(result.wallMs.toFixed(2)),
+      scenarioResult: result.scenarioResult,
+      memory: result.memory,
+      profilerSummary: reportSummary,
+    }, null, 2);
+    setStatus("PASS");
+    pod.teardown();
+  } catch (error) {
+    window.__nodepodPerfResult = { scenario, mode, diagnostic, error: String(error), stack: error?.stack || "" };
+    setStatus("FAIL");
+    results.textContent = `${String(error)}\\n\\n${error?.stack || ""}`;
+    try { pod?.teardown(); } catch {}
+  }
+};
+
+runButton.addEventListener("click", () => {
+  runButton.disabled = true;
+  void window.__nodepodPerfStart();
+});
+
+if (params.get("autorun") === "1") void window.__nodepodPerfStart();
+</script>

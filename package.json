@@ -1,6 +1,6 @@
 {
   "name": "@scelar/nodepod",
-  "version": "1.9.18",
+  "version": "1.9.19",
   "description": "Browser-native Node.js runtime environment",
   "type": "module",
   "license": "MIT WITH Commons-Clause",
@@ -106,7 +106,7 @@
     "type-check": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:browser:perf": "playwright test --config playwright.perf.config.ts",
+    "test:browser:perf": "pnpm run build:publish && playwright test --config playwright.perf.config.ts",
     "bench": "vitest bench",
     "bench:run": "vitest bench --run",
     "prepublishOnly": "pnpm run build:publish"

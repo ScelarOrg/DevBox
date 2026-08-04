@@ -6,12 +6,15 @@ import type {
   OffloadResult,
   TransformTask,
   TransformResult,
+  TransformBatchTask,
+  TransformBatchResult,
   ExtractTask,
   ExtractResult,
   BuildTask,
   BuildResult,
 } from "./offload-types";
 import { transfer } from "comlink";
+import { profileTimestamp } from "../profiling/profiler";
 
 // --- Internal types ---
 
@@ -40,11 +43,13 @@ export class TaskQueue {
   ): Promise<
     T extends TransformTask
       ? TransformResult
-      : T extends ExtractTask
-        ? ExtractResult
-        : T extends BuildTask
-          ? BuildResult
-          : OffloadResult
+      : T extends TransformBatchTask
+        ? TransformBatchResult
+        : T extends ExtractTask
+          ? ExtractResult
+          : T extends BuildTask
+            ? BuildResult
+            : OffloadResult
   > {
     return new Promise((resolve, reject) => {
       const queued: QueuedTask = {
@@ -72,7 +77,7 @@ export class TaskQueue {
     return Promise.all(tasks.map((t) => this.submit(t)));
   }
 
-  cancel(taskId: string): boolean {
+  cancel(taskId: number): boolean {
     const idx = this.queue.findIndex(
       (q) => q.task.id === taskId && !q.cancelled,
     );
@@ -117,7 +122,7 @@ export class TaskQueue {
         }
 
         // Don't block the dispatch loop — fire and re-trigger on completion
-        this.executeTask(worker.endpoint, queued).finally(() => {
+        this.executeTask(worker.endpoint, queued, worker.id).finally(() => {
           release!();
           // More tasks may have arrived while we were busy
           if (this.queue.length > 0) {
@@ -143,14 +148,26 @@ export class TaskQueue {
   private async executeTask(
     endpoint: any,
     queued: QueuedTask,
+    workerId: number,
   ): Promise<void> {
     if (queued.cancelled) return;
 
     try {
+      const taskProfiling = queued.task.profiling;
+      const dispatchedAt = taskProfiling ? profileTimestamp() : undefined;
+      if (taskProfiling && dispatchedAt !== undefined) taskProfiling.dispatchedAt = dispatchedAt;
+      const startedAt = taskProfiling ? profileTimestamp() : undefined;
+      if (taskProfiling && startedAt !== undefined) {
+        taskProfiling.startedAt = startedAt;
+        taskProfiling.workerId = workerId;
+      }
       let result: OffloadResult;
       switch (queued.task.type) {
         case "transform":
           result = await endpoint.transform(queued.task);
+          break;
+        case "transformBatch":
+          result = await endpoint.transformBatch(queued.task);
           break;
         case "extract":
           result = await endpoint.extract(
@@ -166,6 +183,13 @@ export class TaskQueue {
           throw new Error(
             `Unknown task type: ${(queued.task as any).type}`,
           );
+      }
+
+      if (taskProfiling) {
+        const completedAt = profileTimestamp();
+        taskProfiling.completedAt = completedAt;
+        taskProfiling.receivedAt = completedAt;
+        result.profiling = { ...taskProfiling };
       }
 
       if (!queued.cancelled) {

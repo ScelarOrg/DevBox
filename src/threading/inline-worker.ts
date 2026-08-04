@@ -338,6 +338,21 @@ const endpoint = {
     }
   },
 
+  async transformBatch(task) {
+    var results = await Promise.all(task.files.map(async function(file) {
+      var result = await endpoint.transform({
+        type: "transform",
+        id: task.id,
+        source: file.source,
+        filePath: file.filePath,
+        options: Object.assign({}, task.options || {}, { loader: file.loader }),
+        priority: task.priority,
+      });
+      return { filePath: file.filePath, code: result.code, warnings: result.warnings };
+    }));
+    return { type: "transformBatch", id: task.id, results: results };
+  },
+
   async extract(task) {
     if (!_initialized) throw new Error("Worker not initialized");
 

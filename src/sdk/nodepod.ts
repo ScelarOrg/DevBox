@@ -10,6 +10,7 @@ import type { VolumeSnapshot } from "../engine-types";
 import { Buffer } from "../polyfills/buffer";
 import type {
   NodepodOptions,
+  NodepodProfiler,
   NodepodRequestOptions,
   TerminalOptions,
   Snapshot,
@@ -53,6 +54,7 @@ import {
   PerformanceTracker,
   type PerformanceStats,
 } from "../performance-tracker";
+import { NodepodProfilerImpl } from "../profiling/profiler";
 import { PreviewInspector } from "./preview-inspector";
 
 let activeNodepodCount = 0;
@@ -101,6 +103,7 @@ function parseSimpleCommand(
 
 export class Nodepod {
   readonly fs: NodepodFS;
+  readonly profiler: NodepodProfiler;
   /** Opt-in inspection of a host-owned preview iframe. */
   readonly inspect: PreviewInspector;
 
@@ -125,6 +128,7 @@ export class Nodepod {
   private _disposed = false;
   private _unsubscribePressure: (() => void) | null = null;
   private _performance: PerformanceTracker;
+  private _instrumentationProfiler: NodepodProfilerImpl | null;
   private _httpIngress: HttpIngress | null = null;
   private _headless = false;
 
@@ -141,6 +145,7 @@ export class Nodepod {
     sharedVFSBufferSize: number | undefined,
     instanceId: string,
     performanceTracker: PerformanceTracker,
+    profiler: NodepodProfilerImpl,
   ) {
     this._volume = volume;
     this._packages = packages;
@@ -161,9 +166,11 @@ export class Nodepod {
     this.instanceId = instanceId;
     this.inspect = new PreviewInspector(proxy, instanceId, () => this._assertActive());
     this._performance = performanceTracker;
-    this.fs = new NodepodFS(volume);
+    this.profiler = profiler;
+    this._instrumentationProfiler = profiler.enabled ? profiler : null;
+    this.fs = new NodepodFS(volume, this._instrumentationProfiler);
     activeNodepodCount++;
-    this._processManager = new ProcessManager(volume, performanceTracker);
+    this._processManager = new ProcessManager(volume, performanceTracker, this._instrumentationProfiler);
     this._vfsBridge = new VFSBridge(volume);
 
     this._vfsBridge.setBroadcaster((path, content, isDirectory, excludePid) => {
@@ -246,6 +253,7 @@ export class Nodepod {
 
   static async boot(opts: NodepodOptions = {}): Promise<Nodepod> {
     const performanceTracker = new PerformanceTracker();
+    const profiler = new NodepodProfilerImpl(opts.profiler);
     const stopBoot = performanceTracker.start("boot.total");
     // Wait for browser-host factory side effects when vite-plugin-top-level-await
     // defers chunk init; headless already has a host from setRuntimeHost().
@@ -305,6 +313,7 @@ export class Nodepod {
     const packages = new DependencyInstaller(volume, {
       snapshotCache,
       performanceTracker,
+      profiler: profiler.enabled ? profiler : null,
     });
     const proxy = getProxyInstance({
       onServerReady: opts.onServerReady,
@@ -328,8 +337,10 @@ export class Nodepod {
       opts.sharedVFSBufferSize,
       makeInstanceId(),
       performanceTracker,
+      profiler,
     );
     nodepod._headless = headless;
+    profiler.setMemoryProvider(() => nodepod.memoryStats() as unknown as Record<string, unknown>);
 
     if (opts.spawnSnapshot) {
       // ProcessManager double-checks SAB availability per spawn and falls
@@ -464,14 +475,23 @@ export class Nodepod {
         ) as ArrayBuffer;
       }
     }
-    return this._proxy.handleRequest(
-      this.instanceId,
-      port,
-      method,
-      path,
-      headers,
-      body,
-    );
+    const requestSpan = this._instrumentationProfiler?.begin("http.request", {
+      category: "http",
+      metadata: { method, path },
+    }) ?? null;
+    try {
+      return await this._proxy.handleRequest(
+        this.instanceId,
+        port,
+        method,
+        path,
+        headers,
+        body,
+      );
+    } finally {
+      this._instrumentationProfiler?.end(requestSpan);
+      this._instrumentationProfiler?.count("http.requests");
+    }
   }
 
   /* ---- spawn() ---- */
@@ -880,6 +900,7 @@ export class Nodepod {
     // Swap the internal tree
     const fresh = MemoryVolume.fromSnapshot(snapshot);
     (this._volume as any).tree = (fresh as any).tree;
+    this._volume.rebuildIndexes();
 
     // Auto-install deps from package.json if requested and manifest exists
     if (autoInstall && this._volume.existsSync("/package.json")) {
@@ -940,7 +961,11 @@ export class Nodepod {
       watcherCount: number;
       lazyResidentBytes: number;
     };
-    engine: { moduleCacheSize: number; transformCacheSize: number };
+    engine: {
+      moduleCacheSize: number;
+      transformCacheSize: number;
+      transformCacheApproxBytes: number;
+    };
     runtime: {
       processes: number;
       workers: number;
@@ -959,6 +984,7 @@ export class Nodepod {
     const engine = {
       moduleCacheSize: 0,
       transformCacheSize: this._handler.transformCache.size,
+      transformCacheApproxBytes: this._handler.transformCache.approxBytes,
     };
     const resources = this._processManager.resourceStats();
     const pool = poolStats();

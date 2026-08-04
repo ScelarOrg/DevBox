@@ -5,12 +5,13 @@ import pako from "pako";
 import { MemoryVolume } from "../memory-volume";
 import { proxiedFetch } from "../cross-origin";
 import * as path from "../polyfills/path";
-import { offload, taskId, TaskPriority } from "../threading/offload";
+import { offload, profiledOffload, taskId, TaskPriority } from "../threading/offload";
 import type { ExtractResult } from "../threading/offload-types";
 import { base64ToBytes } from "../helpers/byte-encoding";
 import { precompileWasm } from "../helpers/wasm-cache";
 import { getTarballCache } from "../persistence/tarball-cache";
 import { digestSync } from "../polyfills/sync-digest";
+import type { NodepodProfilerImpl } from "../profiling/profiler";
 
 // skip round-tripping very large tarballs back from the worker just to cache
 const TARBALL_CACHE_MAX_BYTES = 20 * 1024 * 1024;
@@ -62,6 +63,8 @@ export interface ExtractionOptions {
   expectedShasum?: string;
   /** npm lockfile SRI, e.g. `sha512-<base64>` — verified on main after download */
   expectedIntegrity?: string;
+  /** Internal opt-in profiler hook. Omitted on the default path. */
+  profiler?: NodepodProfilerImpl | null;
 }
 
 function verifySri(bytes: ArrayBuffer, integrity: string, url: string): void {
@@ -254,6 +257,26 @@ export async function downloadAndExtract(
   destDir: string,
   opts: ExtractionOptions = {},
 ): Promise<string[]> {
+  if (!opts.profiler) {
+    return downloadAndExtractInternal(url, vol, destDir, opts);
+  }
+  const profileSpan = opts.profiler?.begin("packages.extract", {
+    category: "packages",
+    metadata: { url: url },
+  }) ?? null;
+  try {
+    return await downloadAndExtractInternal(url, vol, destDir, opts);
+  } finally {
+    opts.profiler?.end(profileSpan);
+  }
+}
+
+async function downloadAndExtractInternal(
+  url: string,
+  vol: MemoryVolume,
+  destDir: string,
+  opts: ExtractionOptions,
+): Promise<string[]> {
   opts.onProgress?.(`Fetching ${url}...`);
 
   // fetch outside the extraction slot so downloads can overlap while archive
@@ -314,8 +337,11 @@ export async function downloadAndExtract(
   };
 
   let result: ExtractResult;
+  const workerSpan = opts.profiler?.begin("workers.extract", {
+    category: "workers",
+  }) ?? null;
   try {
-    result = await withExtractionSlot(() => offload({
+    const extractionTask = {
       type: "extract",
       id: extractionId,
       tarballUrl: url,
@@ -325,7 +351,10 @@ export async function downloadAndExtract(
       tarballBytes: cachedBytes,
       wantTarball: false,
       streamPort: channel.port2,
-    }));
+    } as const;
+    result = await withExtractionSlot(() => opts.profiler
+      ? profiledOffload(extractionTask, opts.profiler)
+      : offload(extractionTask));
     if (result.streamed) await streamDone;
     else for (const file of result.files) writeExtractedFile(file);
   } catch (error) {
@@ -333,6 +362,7 @@ export async function downloadAndExtract(
     throw error;
   } finally {
     channel.port1.close();
+    opts.profiler?.end(workerSpan);
   }
 
   if (
@@ -347,6 +377,7 @@ export async function downloadAndExtract(
   vol.renameSync(stageRoot, destDir);
 
   opts.onProgress?.(`Extracted ${writtenPaths.length} files`);
+  opts.profiler?.count("packages.extractedFiles", writtenPaths.length);
   return writtenPaths;
 }
 

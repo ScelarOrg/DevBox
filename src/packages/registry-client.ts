@@ -32,10 +32,12 @@ export interface PackageMetadata {
 export interface RegistryConfig {
   endpoint?: string;
   metadataCache?: Map<string, PackageMetadata>;
+  profiler?: NodepodProfilerImpl | null;
 }
 
 import { NPM_REGISTRY_URL } from "../constants/config";
 import { proxiedFetch } from "../cross-origin";
+import type { NodepodProfilerImpl } from "../profiling/profiler";
 
 const NPM_REGISTRY_BASE = NPM_REGISTRY_URL;
 const REGISTRY_CACHE_NAME = "nodepod-registry-v1";
@@ -71,10 +73,12 @@ function encodeForUrl(pkgName: string): string {
 export class RegistryClient {
   private baseUrl: string;
   private metadataStore: Map<string, PackageMetadata>;
+  private profiler: NodepodProfilerImpl | null;
 
   constructor(config: RegistryConfig = {}) {
     this.baseUrl = (config.endpoint || NPM_REGISTRY_BASE).replace(/\/+$/, '');
     this.metadataStore = config.metadataCache || new Map();
+    this.profiler = config.profiler ?? null;
   }
 
   // Cached per client instance
@@ -104,6 +108,22 @@ export class RegistryClient {
   }
 
   private async fetchAndCacheManifest(
+    name: string,
+    requestUrl: string,
+    sharedKey: string,
+  ): Promise<PackageMetadata> {
+    const profileSpan = this.profiler?.begin("packages.registry.fetchManifest", {
+      category: "packages",
+      metadata: { packageName: name },
+    }) ?? null;
+    try {
+      return await this.fetchAndCacheManifestInternal(name, requestUrl, sharedKey);
+    } finally {
+      this.profiler?.end(profileSpan);
+    }
+  }
+
+  private async fetchAndCacheManifestInternal(
     name: string,
     requestUrl: string,
     sharedKey: string,
@@ -199,19 +219,29 @@ export class RegistryClient {
   }
 
   async downloadArchive(tarballUrl: string): Promise<ArrayBuffer> {
+    const profileSpan = this.profiler?.begin("packages.registry.download", {
+      category: "packages",
+      metadata: { url: tarballUrl },
+    }) ?? null;
     let resp: Response;
     try {
       resp = await proxiedFetch(tarballUrl);
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
+      this.profiler?.end(profileSpan);
       throw new Error(
         `Tarball download failed (${detail}): ${tarballUrl}`,
       );
     }
     if (!resp.ok) {
+      this.profiler?.end(profileSpan);
       throw new Error(`Tarball download failed (HTTP ${resp.status}): ${tarballUrl}`);
     }
-    return resp.arrayBuffer();
+    try {
+      return await resp.arrayBuffer();
+    } finally {
+      this.profiler?.end(profileSpan);
+    }
   }
 
   flushCache(): void {

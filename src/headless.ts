@@ -43,3 +43,22 @@ export type {
   PerformanceStats,
   PerformanceTiming,
 } from "./sdk/types";
+export type {
+  NodepodProfileReport,
+  NodepodProfiler,
+  ProfileAggregate,
+  ProfileCategory,
+  ProfileEnvironment,
+  ProfileExportFormat,
+  ProfileLongTaskSample,
+  ProfileMemorySample,
+  ProfileSample,
+  ProfileSession,
+  ProfileSpan,
+  ProfileSpanOptions,
+  ProfileSummary,
+  ProfileWarning,
+  ProfilerLevel,
+  ProfilerOptions,
+  ProfilePathDetail,
+} from "./profiling/types";

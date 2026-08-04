@@ -8,9 +8,20 @@ import type { FileStat } from './memory-volume';
 export class LRUCache<K, V> {
   private _map = new Map<K, V>();
   private _capacity: number;
+  private _bytes = 0;
+  private readonly _maxBytes: number;
+  private readonly _sizeOf: (value: V) => number;
 
-  constructor(capacity: number) {
+  constructor(
+    capacity: number,
+    maxBytes = Number.POSITIVE_INFINITY,
+    sizeOf: (value: V) => number = () => 0,
+  ) {
     this._capacity = Math.max(1, capacity);
+    this._maxBytes = Number.isFinite(maxBytes)
+      ? Math.max(1, maxBytes)
+      : Number.POSITIVE_INFINITY;
+    this._sizeOf = sizeOf;
   }
 
   get(key: K): V | undefined {
@@ -23,14 +34,19 @@ export class LRUCache<K, V> {
   }
 
   set(key: K, value: V): void {
+    const valueBytes = Math.max(0, this._sizeOf(value));
     if (this._map.has(key)) {
+      this._bytes -= this._sizeOf(this._map.get(key)!);
       this._map.delete(key);
-    } else if (this._map.size >= this._capacity) {
-      // Evict least-recently-used (first entry in Map)
-      const oldest = this._map.keys().next().value;
-      if (oldest !== undefined) this._map.delete(oldest);
     }
     this._map.set(key, value);
+    this._bytes += valueBytes;
+    while (
+      (this._map.size > this._capacity || this._bytes > this._maxBytes) &&
+      this._map.size > 1
+    ) {
+      this._evictOldest();
+    }
   }
 
   has(key: K): boolean {
@@ -38,15 +54,31 @@ export class LRUCache<K, V> {
   }
 
   delete(key: K): boolean {
+    const value = this._map.get(key);
+    if (value === undefined) return false;
+    this._bytes -= this._sizeOf(value);
     return this._map.delete(key);
   }
 
   clear(): void {
     this._map.clear();
+    this._bytes = 0;
   }
 
   get size(): number {
     return this._map.size;
+  }
+
+  get approxBytes(): number {
+    return this._bytes;
+  }
+
+  private _evictOldest(): void {
+    const oldest = this._map.keys().next().value;
+    if (oldest === undefined) return;
+    const value = this._map.get(oldest)!;
+    this._bytes -= this._sizeOf(value);
+    this._map.delete(oldest);
   }
 
   keys(): IterableIterator<K> {
@@ -73,6 +105,8 @@ export interface MemoryHandlerOptions {
   manifestCacheSize?: number;
   /** LRU capacity for source transform cache. Default: 512 */
   transformCacheSize?: number;
+  /** Approximate UTF-16 byte budget for transformed source. Default: 24 MiB */
+  transformCacheMaxBytes?: number;
   /** Max modules before trimming node_modules entries. Default: 512 */
   moduleSoftCacheSize?: number;
   /** Heap usage threshold in MB to trigger pressure callbacks. Default: 350 */
@@ -90,6 +124,7 @@ const DEFAULTS: Required<MemoryHandlerOptions> = {
   resolveCacheSize: 4096,
   manifestCacheSize: 256,
   transformCacheSize: 512,
+  transformCacheMaxBytes: 24 * 1024 * 1024,
   moduleSoftCacheSize: 512,
   heapWarnThresholdMB: 350,
   monitorIntervalMs: 30_000,
@@ -115,7 +150,11 @@ export class MemoryHandler {
     }
     this.pathNormCache = new LRUCache(this.options.pathNormCacheSize);
     this.statCache = new LRUCache(this.options.statCacheSize);
-    this.transformCache = new LRUCache(this.options.transformCacheSize);
+    this.transformCache = new LRUCache(
+      this.options.transformCacheSize,
+      this.options.transformCacheMaxBytes,
+      (value) => value.length * 2,
+    );
   }
 
   /** Invalidate a cached stat entry (call on file write/delete). */

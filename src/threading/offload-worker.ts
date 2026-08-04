@@ -6,6 +6,8 @@ import type {
   OffloadWorkerEndpoint,
   TransformTask,
   TransformResult,
+  TransformBatchTask,
+  TransformBatchResult,
   ExtractTask,
   ExtractResult,
   ExtractedFile,
@@ -20,6 +22,7 @@ let initialized = false;
 
 import { CDN_ESBUILD_ESM, CDN_ESBUILD_BINARY, cdnImport } from "../constants/cdn-urls";
 import { CDN_PAKO } from "../constants/config";
+import { containsJsx } from "./jsx-detection";
 
 const ESBUILD_ESM_URL = CDN_ESBUILD_ESM;
 const ESBUILD_WASM_URL = CDN_ESBUILD_BINARY;
@@ -244,17 +247,6 @@ function* parseTar(raw: Uint8Array): Generator<TarEntry> {
   }
 }
 
-// JSX detection duplicated from module-transformer.ts
-function detectJsx(source: string): boolean {
-  if (/<[A-Z][a-zA-Z0-9.]*[\s/>]/.test(source)) return true;
-  if (/<\/[a-zA-Z]/.test(source)) return true;
-  if (/\/>/.test(source)) return true;
-  if (/<>|<\/>/.test(source)) return true;
-  if (/React\.createElement\b/.test(source)) return true;
-  if (/jsx\(|jsxs\(|jsxDEV\(/.test(source)) return true;
-  return false;
-}
-
 const DEFAULT_DEFINE: Record<string, string> = {
   "import.meta.url": "import_meta.url",
   "import.meta.dirname": "import_meta.dirname",
@@ -307,7 +299,7 @@ const workerEndpoint: OffloadWorkerEndpoint = {
     const format = opts.format || "cjs";
     const define = opts.define || DEFAULT_DEFINE;
 
-    if (loader === "js" && detectJsx(task.source)) loader = "jsx";
+    if (loader === "js" && containsJsx(task.source)) loader = "jsx";
 
     const transformOpts = {
       loader,
@@ -379,6 +371,27 @@ const workerEndpoint: OffloadWorkerEndpoint = {
         warnings: [err?.message || "transform failed"],
       };
     }
+  },
+
+  async transformBatch(task: TransformBatchTask): Promise<TransformBatchResult> {
+    // One wire task keeps queue/transfer overhead proportional to the batch,
+    // while the per-file transform path retains its existing fallbacks.
+    const results = await Promise.all(task.files.map(async (file) => {
+      const result = await workerEndpoint.transform({
+        type: "transform",
+        id: task.id,
+        source: file.source,
+        filePath: file.filePath,
+        options: { ...task.options, loader: file.loader },
+        priority: task.priority,
+      });
+      return {
+        filePath: file.filePath,
+        code: result.code,
+        warnings: result.warnings,
+      };
+    }));
+    return { type: "transformBatch", id: task.id, results };
   },
 
   async extract(task: ExtractTask): Promise<ExtractResult> {

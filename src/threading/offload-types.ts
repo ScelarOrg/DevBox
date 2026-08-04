@@ -8,7 +8,7 @@ export enum TaskPriority {
 
 export interface TransformTask {
   type: "transform";
-  id: string;
+  id: number;
   source: string;
   filePath: string;
   options?: {
@@ -19,18 +19,48 @@ export interface TransformTask {
     define?: Record<string, string>;
   };
   priority: TaskPriority;
+  profiling?: OffloadProfileTiming;
 }
 
 export interface TransformResult {
   type: "transform";
-  id: string;
+  id: number;
+  code: string;
+  warnings: string[];
+  profiling?: OffloadProfileTiming;
+}
+
+export interface TransformBatchFile {
+  filePath: string;
+  source: string;
+  loader?: "js" | "jsx" | "ts" | "tsx";
+}
+
+export interface TransformBatchTask {
+  type: "transformBatch";
+  id: number;
+  files: TransformBatchFile[];
+  options?: Omit<NonNullable<TransformTask["options"]>, "loader">;
+  priority: TaskPriority;
+  profiling?: OffloadProfileTiming;
+}
+
+export interface TransformBatchFileResult {
+  filePath: string;
   code: string;
   warnings: string[];
 }
 
+export interface TransformBatchResult {
+  type: "transformBatch";
+  id: number;
+  results: TransformBatchFileResult[];
+  profiling?: OffloadProfileTiming;
+}
+
 export interface ExtractTask {
   type: "extract";
-  id: string;
+  id: number;
   tarballUrl: string;
   stripComponents: number;
   priority: TaskPriority;
@@ -40,6 +70,7 @@ export interface ExtractTask {
   // ask the worker to return the compressed bytes so main can cache them
   wantTarball?: boolean;
   streamPort?: MessagePort;
+  profiling?: OffloadProfileTiming;
 }
 
 export interface ExtractedFile {
@@ -51,16 +82,26 @@ export interface ExtractedFile {
 
 export interface ExtractResult {
   type: "extract";
-  id: string;
+  id: number;
   files: ExtractedFile[];
   // compressed tarball bytes, present when the task set wantTarball
   tarballBytes?: ArrayBuffer;
   streamed?: boolean;
+  profiling?: OffloadProfileTiming;
+}
+
+export interface OffloadProfileTiming {
+  createdAt: number;
+  dispatchedAt?: number;
+  startedAt?: number;
+  completedAt?: number;
+  receivedAt?: number;
+  workerId?: number;
 }
 
 export interface BuildTask {
   type: "build";
-  id: string;
+  id: number;
   files: Record<string, string>;
   entryPoints?: string[];
   stdin?: { contents: string; resolveDir?: string; loader?: string };
@@ -72,6 +113,7 @@ export interface BuildTask {
   external?: string[];
   absWorkingDir?: string;
   priority: TaskPriority;
+  profiling?: OffloadProfileTiming;
 }
 
 export interface BuildOutputFile {
@@ -81,19 +123,21 @@ export interface BuildOutputFile {
 
 export interface BuildResult {
   type: "build";
-  id: string;
+  id: number;
   outputFiles: BuildOutputFile[];
   errors: string[];
   warnings: string[];
+  profiling?: OffloadProfileTiming;
 }
 
-export type OffloadTask = TransformTask | ExtractTask | BuildTask;
-export type OffloadResult = TransformResult | ExtractResult | BuildResult;
+export type OffloadTask = TransformTask | TransformBatchTask | ExtractTask | BuildTask;
+export type OffloadResult = TransformResult | TransformBatchResult | ExtractResult | BuildResult;
 
 // exposed via Comlink
 export interface OffloadWorkerEndpoint {
   init(): Promise<void>;
   transform(task: TransformTask): Promise<TransformResult>;
+  transformBatch(task: TransformBatchTask): Promise<TransformBatchResult>;
   extract(task: ExtractTask): Promise<ExtractResult>;
   build(task: BuildTask): Promise<BuildResult>;
   ping(): boolean;

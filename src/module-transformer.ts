@@ -3,11 +3,32 @@
 // Transforms are offloaded to Web Workers when available.
 
 import type { MemoryVolume } from "./memory-volume";
-import { offload, taskId, TaskPriority } from "./threading/offload";
-import type { TransformResult } from "./threading/offload-types";
+import { offload, profiledOffload, taskId, TaskPriority } from "./threading/offload";
+import type { TransformBatchResult, TransformBatchTask, TransformResult } from "./threading/offload-types";
 import { getEsbuild, getEsbuildIfReady } from "./helpers/esbuild-engine";
+import type { NodepodProfilerImpl } from "./profiling/profiler";
+import { chunkTransformFiles } from "./threading/transform-batching";
+import { containsJsx } from "./threading/jsx-detection";
 
 const inBrowser = typeof window !== "undefined";
+
+const BUILTIN_MODULES = [
+  "assert", "buffer", "child_process", "cluster", "crypto",
+  "dgram", "dns", "events", "fs", "http", "http2", "https",
+  "net", "os", "path", "perf_hooks", "querystring", "readline",
+  "stream", "string_decoder", "timers", "tls", "url", "util",
+  "v8", "vm", "worker_threads", "zlib", "async_hooks",
+  "inspector", "module",
+] as const;
+
+const BUILTIN_MODULE_PATTERN = BUILTIN_MODULES.join("|");
+const BUILTIN_IMPORT_RE = new RegExp(
+  `\\bimport\\s*\\(\\s*["']((?:node:)?(?:${BUILTIN_MODULE_PATTERN}))["']\\s*\\)`,
+  "g",
+);
+const BUILTIN_IMPORT_PROBE = new RegExp(
+  `\\bimport\\s*\\(\\s*["'](?:node:)?(?:${BUILTIN_MODULE_PATTERN})["']`,
+);
 
 // load and init esbuild-wasm from CDN (realm-wide singleton, shared with the esbuild polyfill)
 export async function prepareTransformer(): Promise<void> {
@@ -20,16 +41,6 @@ export async function prepareTransformer(): Promise<void> {
 export function isTransformerLoaded(): boolean {
   if (!inBrowser) return true;
   return getEsbuildIfReady() !== null;
-}
-
-function containsJsx(source: string): boolean {
-  if (/<[A-Z][a-zA-Z0-9.]*[\s/>]/.test(source)) return true;
-  if (/<\/[a-zA-Z]/.test(source)) return true;
-  if (/\/>/.test(source)) return true;
-  if (/<>|<\/>/.test(source)) return true;
-  if (/React\.createElement\b/.test(source)) return true;
-  if (/jsx\(|jsxs\(|jsxDEV\(/.test(source)) return true;
-  return false;
 }
 
 function detectLoader(
@@ -48,10 +59,11 @@ function detectLoader(
 export async function convertFile(
   source: string,
   filePath: string,
+  profiler?: NodepodProfilerImpl | null,
 ): Promise<string> {
   if (!inBrowser) return source;
 
-  const result: TransformResult = await offload({
+  const task = {
     type: "transform",
     id: taskId(),
     source,
@@ -69,29 +81,12 @@ export async function convertFile(
       },
     },
     priority: TaskPriority.NORMAL,
-  });
+  } as const;
+  const result: TransformResult = await (profiler
+    ? profiledOffload(task, profiler)
+    : offload(task));
 
-  // patch dynamic imports of node builtins to synchronous require()
-  let code = result.code;
-  code = code.replace(
-    /\bimport\s*\(\s*["']node:([^"']+)["']\s*\)/g,
-    'Promise.resolve(require("node:$1"))',
-  );
-
-  const coreModules = [
-    "assert", "buffer", "child_process", "cluster", "crypto",
-    "dgram", "dns", "events", "fs", "http", "http2", "https",
-    "net", "os", "path", "perf_hooks", "querystring", "readline",
-    "stream", "string_decoder", "timers", "tls", "url", "util",
-    "v8", "vm", "worker_threads", "zlib", "async_hooks",
-    "inspector", "module",
-  ];
-  for (const mod of coreModules) {
-    const re = new RegExp(`\\bimport\\s*\\(\\s*["']${mod}["']\\s*\\)`, "g");
-    code = code.replace(re, `Promise.resolve(require("${mod}"))`);
-  }
-
-  return code;
+  return patchBuiltinImports(result.code);
 }
 
 // direct main-thread esbuild transform (no worker offloading).
@@ -120,7 +115,7 @@ export async function convertFileDirect(
         "import.meta": "import_meta",
       },
     });
-    return output.code;
+    return patchBuiltinImports(output.code);
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
 
@@ -141,7 +136,7 @@ export async function convertFileDirect(
               "import.meta": "import_meta",
             },
           });
-          return output.code;
+          return patchBuiltinImports(output.code);
         } catch {
         }
       }
@@ -161,12 +156,12 @@ export async function convertFileDirect(
             "import.meta": "import_meta",
           },
         });
-        return output.code;
+        return patchBuiltinImports(output.code);
       } catch {
-        return source;
+        return patchBuiltinImports(source);
       }
     }
-    return source;
+    return patchBuiltinImports(source);
   }
 }
 
@@ -183,60 +178,14 @@ function requiresConversion(filePath: string, source: string): boolean {
 }
 
 function needsBuiltinPatching(source: string): boolean {
-  return (
-    /\bimport\s*\(\s*["']node:/.test(source) ||
-    /\bimport\s*\(\s*["'](fs|path|http|https|net|url|util|events|stream|os|crypto)["']/.test(
-      source,
-    )
-  );
+  return BUILTIN_IMPORT_PROBE.test(source);
 }
 
-function patchBuiltinImports(source: string): string {
-  let patched = source;
-  patched = patched.replace(
-    /\bimport\s*\(\s*["']node:([^"']+)["']\s*\)/g,
-    'Promise.resolve(require("node:$1"))',
+export function patchBuiltinImports(source: string): string {
+  return source.replace(
+    BUILTIN_IMPORT_RE,
+    (_match, moduleName: string) => `Promise.resolve(require("${moduleName}"))`,
   );
-  const builtins = [
-    "assert",
-    "buffer",
-    "child_process",
-    "cluster",
-    "crypto",
-    "dgram",
-    "dns",
-    "events",
-    "fs",
-    "http",
-    "http2",
-    "https",
-    "net",
-    "os",
-    "path",
-    "perf_hooks",
-    "querystring",
-    "readline",
-    "stream",
-    "string_decoder",
-    "timers",
-    "tls",
-    "url",
-    "util",
-    "v8",
-    "vm",
-    "worker_threads",
-    "zlib",
-    "async_hooks",
-    "inspector",
-    "module",
-  ];
-  for (const b of builtins) {
-    patched = patched.replace(
-      new RegExp(`\\bimport\\s*\\(\\s*["']${b}["']\\s*\\)`, "g"),
-      `Promise.resolve(require("${b}"))`,
-    );
-  }
-  return patched;
 }
 
 function listJsFiles(vol: MemoryVolume, dir: string): string[] {
@@ -281,7 +230,12 @@ export async function convertPackage(
   vol: MemoryVolume,
   packageDir: string,
   onProgress?: (msg: string) => void,
+  profiler?: NodepodProfilerImpl | null,
 ): Promise<number> {
+  const profileSpan = profiler?.begin("modules.transform", {
+    category: "modules",
+    metadata: { path: packageDir },
+  }) ?? null;
   let converted = 0;
   const files = listJsFiles(vol, packageDir);
   onProgress?.(`  Converting ${files.length} files in ${packageDir}...`);
@@ -290,44 +244,69 @@ export async function convertPackage(
   // directly and expect ESM syntax. require() handles conversion at runtime.
   const esmPackage = isEsmPackage(vol, packageDir);
 
-  const BATCH = 50;
-  for (let i = 0; i < files.length; i += BATCH) {
-    const batch = files.slice(i, i + BATCH);
-    await Promise.all(
-      batch.map(async (fp) => {
-        try {
-          const src = vol.readFileSync(fp, "utf8");
+  const candidates: TransformBatchTask["files"] = [];
+  for (const fp of files) {
+    try {
+      const src = vol.readFileSync(fp, "utf8");
 
-          if (esmPackage) {
-            if (needsBuiltinPatching(src)) {
-              vol.writeFileSync(fp, patchBuiltinImports(src));
-              converted++;
-            }
-            return;
-          }
-
-          // .mjs stays ESM even in non-ESM packages
-          if (fp.endsWith(".mjs")) {
-            if (needsBuiltinPatching(src)) {
-              vol.writeFileSync(fp, patchBuiltinImports(src));
-              converted++;
-            }
-            return;
-          }
-
-          if (requiresConversion(fp, src)) {
-            const out = await convertFile(src, fp);
-            vol.writeFileSync(fp, out);
-            converted++;
-          } else if (needsBuiltinPatching(src)) {
-            vol.writeFileSync(fp, patchBuiltinImports(src));
-            converted++;
-          }
-        } catch {
+      // "type":"module" packages and .mjs files stay ESM in the VFS.
+      if (esmPackage || fp.endsWith(".mjs")) {
+        if (needsBuiltinPatching(src)) {
+          vol.writeFileSync(fp, patchBuiltinImports(src));
+          converted++;
         }
-      }),
-    );
+        continue;
+      }
+
+      if (requiresConversion(fp, src)) {
+        candidates.push({
+          filePath: fp,
+          source: src,
+          loader: detectLoader(fp, src),
+        });
+      } else if (needsBuiltinPatching(src)) {
+        vol.writeFileSync(fp, patchBuiltinImports(src));
+        converted++;
+      }
+    } catch {
+      // Keep the existing best-effort package conversion behavior.
+    }
   }
 
+  const batches: TransformBatchTask[] = chunkTransformFiles(candidates).map((files) => ({
+    type: "transformBatch",
+    id: taskId(),
+    files,
+    options: {
+      format: "cjs",
+      target: "esnext",
+      platform: "neutral",
+      define: {
+        "import.meta.url": "import_meta.url",
+        "import.meta.dirname": "import_meta.dirname",
+        "import.meta.filename": "import_meta.filename",
+        "import.meta": "import_meta",
+      },
+    },
+    priority: TaskPriority.NORMAL,
+  }));
+
+  const results: TransformBatchResult[] = await Promise.all(
+    batches.map((batch) => profiler
+      ? profiledOffload(batch, profiler)
+      : offload(batch)),
+  );
+  for (const batch of results) {
+    for (const result of batch.results) {
+      try {
+        vol.writeFileSync(result.filePath, result.code);
+        converted++;
+      } catch {
+      }
+    }
+  }
+
+  profiler?.count("modules.transformedFiles", converted);
+  profiler?.end(profileSpan);
   return converted;
 }

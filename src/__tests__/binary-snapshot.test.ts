@@ -147,6 +147,17 @@ describe("createFilteredBinarySnapshot / restoreBinarySnapshot", () => {
 });
 
 describe("installer snapshot cache (binary format)", () => {
+  it("separates cache keys by transform mode and schema version", async () => {
+    const { manifestSnapshotKey } = await import("../packages/installer");
+    const manifest = JSON.stringify({ dependencies: { demo: "1.0.0" } });
+    expect(manifestSnapshotKey(manifest, { transformModules: "eager" })).not.toBe(
+      manifestSnapshotKey(manifest),
+    );
+    expect(manifestSnapshotKey(manifest, { withDevDeps: true })).not.toBe(
+      manifestSnapshotKey(manifest, { withDevDeps: false }),
+    );
+  });
+
   it("installFromManifest restores from cache without hitting the network", async () => {
     const cache = memoryCache();
 

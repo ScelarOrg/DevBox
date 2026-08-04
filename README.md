@@ -183,6 +183,11 @@ await fetch(pod.port(3000)!); // http://127.0.0.1:<ingress>/__virtual__/...
 | `preloadEsbuild` | `boolean` | Warm esbuild during boot. Defaults to `false`; first use initializes it automatically |
 | `sharedVFSBufferSize` | `number` | Capacity of the optional SharedFS mirror, allocated only when `sharedFSBuffer` is first read |
 | `memory` | `MemoryHandlerOptions` | Advanced memory budget/cache overrides. The default soft budget is 400 MB |
+| `profiler` | `ProfilerOptions` | Opt-in counters, timings, worker spans, memory samples, long-task samples, and trace exports. Disabled by default |
+
+`memory.transformCacheMaxBytes` adds a byte budget to the main-thread transform
+cache (approximate UTF-16 bytes). `memoryStats().engine.transformCacheApproxBytes`
+reports the current estimate alongside the existing entry count.
 
 ### Instance methods
 
@@ -206,12 +211,41 @@ await fetch(pod.port(3000)!); // http://127.0.0.1:<ingress>/__virtual__/...
 | `clearPreviewScript()` | Remove injected script |
 | `inspect` | Opt-in live-DOM, layout, console, error, a11y, and best-effort screenshot inspection for an attached preview iframe |
 | `memoryStats()` | Current VFS, process, worker, port, cache, SharedFS, and heap counters |
+| `profiler` | Opt-in profiling sessions with typed reports and JSON / Chrome Trace exports |
 | `teardown()` | Terminal, idempotent cleanup of the pod and all owned resources |
 
 Keep one pod for each genuinely active preview and reuse it when project files
 change. Call `teardown()` when a preview is discarded; operational calls after
 teardown throw. Nodepod performs SQLite, esbuild, package extraction, and lazy
 filesystem preparation automatically, so application code needs no warm-up API.
+
+### Profiling
+
+Profiling is disabled by default and adds no detailed instrumentation to the
+normal runtime path. Enable it for a bounded benchmark session:
+
+```ts
+const pod = await Nodepod.boot({
+  profiler: {
+    enabled: true,
+    level: "timings",
+    captureMemory: true,
+  },
+});
+
+const session = pod.profiler.start("vite-startup");
+await pod.packages.install("vite");
+const report = await session.stop();
+
+console.log(report.summary.categories);
+console.log(report.export("json"));
+console.log(report.export("chrome-trace"));
+```
+
+Use `level: "counters"` for the lowest-overhead aggregate metrics and
+`level: "detailed"` for sampled filesystem/module metadata. Reports redact
+URLs and retain basenames by default; full paths require an explicit
+`pathDetail: "full"` opt-in.
 
 ### Preview inspection
 

@@ -1,10 +1,31 @@
 import type { VolumeSnapshot } from "../engine-types";
 import type { MemoryHandlerOptions } from "../memory-handler";
 export type { PerformanceStats, PerformanceTiming } from "../performance-tracker";
+export type {
+  NodepodProfileReport,
+  NodepodProfiler,
+  ProfileAggregate,
+  ProfileCategory,
+  ProfileEnvironment,
+  ProfileExportFormat,
+  ProfileLongTaskSample,
+  ProfileMemorySample,
+  ProfileSample,
+  ProfileSession,
+  ProfileSpan,
+  ProfileSpanOptions,
+  ProfileSummary,
+  ProfileWarning,
+  ProfilerLevel,
+  ProfilerOptions,
+  ProfilePathDetail,
+} from "../profiling/types";
 
 /* ---- Boot options ---- */
 
 export interface NodepodOptions {
+  /** Opt-in Nodepod subsystem profiling. Disabled by default. */
+  profiler?: import("../profiling/types").ProfilerOptions;
   files?: Record<string, string | Uint8Array>;
   env?: Record<string, string>;
   workdir?: string;

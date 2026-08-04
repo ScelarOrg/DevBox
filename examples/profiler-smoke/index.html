@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Nodepod profiler smoke test</title>
+    <style>
+      body { font: 14px/1.5 monospace; margin: 2rem; white-space: pre-wrap; }
+      #status { color: #555; }
+      #result { color: #075; }
+      #error { color: #900; }
+    </style>
+  </head>
+  <body>
+    <h1>Nodepod profiler smoke test</h1>
+    <div id="status">Running…</div>
+    <pre id="result"></pre>
+    <pre id="error"></pre>
+    <script type="module">
+      import { Nodepod } from "/dist/index.mjs";
+
+      const status = document.querySelector("#status");
+      const result = document.querySelector("#result");
+      const error = document.querySelector("#error");
+
+      try {
+        const pod = await Nodepod.boot({
+          files: { "/profiler-smoke.js": "console.log('profiler smoke');" },
+          profiler: {
+            enabled: true,
+            level: "detailed",
+            captureMemory: true,
+            captureLongTasks: true,
+          },
+        });
+
+        const { report } = await pod.profiler.profile("browser-profiler-smoke", async () => {
+          await pod.fs.writeFile("/profiler-smoke.txt", "hello profiler");
+          await pod.fs.readFile("/profiler-smoke.txt", "utf8");
+          const process = await pod.spawn("node", ["profiler-smoke.js"]);
+          await process.completion;
+        });
+
+        const trace = JSON.parse(report.export("chrome-trace"));
+        window.__nodepodProfilerSmoke = {
+          enabled: pod.profiler.enabled,
+          level: pod.profiler.level,
+          spanCount: report.spans.length,
+          spans: report.spans.map((span) => span.name),
+          counters: report.counters,
+          sampleCount: report.samples.length,
+          traceEventCount: trace.traceEvents.length,
+          warnings: report.warnings.map((warning) => warning.code),
+          performanceStats: pod.performanceStats(),
+        };
+        result.textContent = JSON.stringify(window.__nodepodProfilerSmoke, null, 2);
+        status.textContent = "PASS";
+        pod.teardown();
+      } catch (caught) {
+        window.__nodepodProfilerSmokeError = String(caught?.stack || caught);
+        error.textContent = window.__nodepodProfilerSmokeError;
+        status.textContent = "FAIL";
+      }
+    </script>
+  </body>
+</html>

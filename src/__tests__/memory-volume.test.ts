@@ -1,7 +1,30 @@
 import { describe, it, expect, vi } from "vitest";
 import { MemoryVolume } from "../memory-volume";
+import { VFSBridge } from "../threading/vfs-bridge";
 
 describe("MemoryVolume", () => {
+  it("does not decode binary writes when no change subscriber exists", () => {
+    const volume = new MemoryVolume();
+    const decode = vi.spyOn(volume as any, "decodeText");
+    const bytes = new Uint8Array(64 * 1024).fill(255);
+    volume.writeFileSync("/array", bytes);
+    volume.writeFileSync("/buffer", bytes.buffer.slice(0));
+    if (typeof SharedArrayBuffer !== "undefined") {
+      const shared = new SharedArrayBuffer(bytes.byteLength);
+      new Uint8Array(shared).set(bytes);
+      volume.writeFileSync("/shared", shared);
+    }
+    expect(decode).not.toHaveBeenCalled();
+  });
+
+  it("keeps string content in change notifications for binary writes", () => {
+    const volume = new MemoryVolume();
+    const changes: Array<[string, string]> = [];
+    volume.on("change", (path, content) => changes.push([path, content]));
+    volume.writeFileSync("/binary", new Uint8Array([65, 66, 67]));
+    expect(changes).toEqual([["/binary", "ABC"]]);
+  });
+
   it("keeps hard links attached to one inode across writes and truncation", () => {
     const volume = new MemoryVolume();
     volume.writeFileSync("/original", "one");
@@ -37,6 +60,32 @@ describe("MemoryVolume", () => {
     volume.linkSync("/target-link", "/tree/nested-link");
     volume.removeTreeSync("/tree");
     expect(volume.statSync("/target-link").nlink).toBe(1);
+  });
+
+  it("remaps every hardlink alias when a directory is renamed", () => {
+    const volume = new MemoryVolume();
+    volume.mkdirSync("/old/nested", { recursive: true });
+    volume.writeFileSync("/old/nested/source", "shared");
+    volume.linkSync("/old/nested/source", "/old/nested/alias");
+    volume.renameSync("/old", "/new");
+
+    expect(volume.statSync("/new/nested/source").nlink).toBe(2);
+    expect(volume.statSync("/new/nested/alias").ino).toBe(
+      volume.statSync("/new/nested/source").ino,
+    );
+    volume.writeFileSync("/new/nested/alias", "updated");
+    expect(volume.readFileSync("/new/nested/source", "utf8")).toBe("updated");
+  });
+
+  it("removes only the deleted alias from the inode reverse index", () => {
+    const volume = new MemoryVolume();
+    volume.writeFileSync("/source", "shared");
+    volume.linkSync("/source", "/alias");
+    volume.unlinkSync("/source");
+    expect(volume.readFileSync("/alias", "utf8")).toBe("shared");
+    expect(volume.statSync("/alias").nlink).toBe(1);
+    volume.unlinkSync("/alias");
+    expect(volume.existsSync("/alias")).toBe(false);
   });
 
   it("resolves relative symlinks and reports symlink loops", () => {
@@ -89,6 +138,22 @@ describe("MemoryVolume", () => {
     expect(restored.readlinkSync("/root/symlink")).toBe("original");
     restored.writeFileSync("/root/linked", "changed");
     expect(restored.readFileSync("/root/original", "utf8")).toBe("changed");
+  });
+
+  it("restores hardlinks when binary snapshot entries arrive out of order", () => {
+    const source = new MemoryVolume();
+    source.mkdirSync("/root/deep", { recursive: true });
+    source.writeFileSync("/root/deep/file", "shared");
+    source.linkSync("/root/deep/file", "/root/deep/alias");
+    const bridge = new VFSBridge(source);
+    const snapshot = bridge.createSnapshot();
+    snapshot.manifest.reverse();
+
+    const restored = MemoryVolume.fromBinarySnapshot(snapshot);
+    expect(restored.readFileSync("/root/deep/file", "utf8")).toBe("shared");
+    expect(restored.statSync("/root/deep/file").ino).toBe(
+      restored.statSync("/root/deep/alias").ino,
+    );
   });
 
   it("stores file modes and explicit timestamps", () => {

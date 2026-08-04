@@ -31,6 +31,7 @@ import { getRuntimeHost } from "../host/runtime-host";
 import type { HostWorker } from "../host/types";
 import { SLOT_SIZE, decodeSyncSlot } from "./sync-channel";
 import type { PerformanceTracker } from "../performance-tracker";
+import type { NodepodProfilerImpl } from "../profiling/profiler";
 
 const MAX_PROCESS_DEPTH = 10;
 const MAX_PROCESSES = 50;
@@ -68,6 +69,7 @@ export class ProcessManager extends EventEmitter {
   private _nextPid = 100;
   private _volume: MemoryVolume;
   private _performance: PerformanceTracker | null;
+  private _profiler: NodepodProfilerImpl | null;
   private _vfsBridge: VFSBridge | null = null;
   private _syncBuffer: SharedArrayBuffer | null = null;
   private _processPorts = new Map<number, MessagePort[]>();
@@ -91,10 +93,12 @@ export class ProcessManager extends EventEmitter {
   constructor(
     volume: MemoryVolume,
     performanceTracker: PerformanceTracker | null = null,
+    profiler: NodepodProfilerImpl | null = null,
   ) {
     super();
     this._volume = volume;
     this._performance = performanceTracker;
+    this._profiler = profiler;
   }
 
   setVFSBridge(bridge: VFSBridge): void {
@@ -123,6 +127,10 @@ export class ProcessManager extends EventEmitter {
     parentPid?: number;
   }): ProcessHandle {
     const stopSpawn = this._performance?.start("process.ready");
+    const spawnSpan = this._profiler?.begin("process.spawn", {
+      category: "processes",
+      metadata: { command: config.command },
+    }) ?? null;
     if (this._processes.size >= MAX_PROCESSES) {
       throw new Error(`Process limit exceeded (max ${MAX_PROCESSES})`);
     }
@@ -155,12 +163,17 @@ export class ProcessManager extends EventEmitter {
     }
 
     const stopSnapshot = this._performance?.start("process.snapshot");
+    const snapshotSpan = this._profiler?.begin("snapshots.create", {
+      category: "snapshots",
+      metadata: { mode: lean ? "lean" : "full" },
+    }) ?? null;
     const snapshot = this._vfsBridge
       ? this._vfsBridge.createSnapshot(
           lean ? { excludeDirNames: LEAN_EXCLUDE_DIR_NAMES } : undefined,
         )
       : this._createEmptySnapshot();
     stopSnapshot?.();
+    this._profiler?.end(snapshotSpan);
 
     const spawnConfig: SpawnConfig = {
       command: config.command,
@@ -173,8 +186,12 @@ export class ProcessManager extends EventEmitter {
     };
 
     const stopWorker = this._performance?.start("process.workerConstruct");
+    const workerSpan = this._profiler?.begin("process.workerConstruct", {
+      category: "workers",
+    }) ?? null;
     const worker = this._createWorker();
     stopWorker?.();
+    this._profiler?.end(workerSpan);
     if (worker.__nodepodDirect) {
       this._performance?.increment("process.directWorkers");
     } else {
@@ -185,9 +202,22 @@ export class ProcessManager extends EventEmitter {
       this._performance?.increment("process.workerFallbacks");
       return this._createEmbeddedWorker();
     } : undefined);
-    handle.on("ready", () => stopSpawn?.());
-    handle.on("worker-error", () => stopSpawn?.());
-    handle.on("exit", () => stopSpawn?.());
+    handle.on("ready", () => {
+      stopSpawn?.();
+      this._profiler?.end(spawnSpan);
+      this._profiler?.count("process.ready");
+    });
+    handle.on("worker-error", () => {
+      stopSpawn?.();
+      this._profiler?.end(spawnSpan);
+      this._profiler?.count("process.workerErrors");
+    });
+    handle.on("exit", () => {
+      stopSpawn?.();
+      this._profiler?.end(spawnSpan);
+      this._profiler?.count("process.exits");
+    });
+    this._profiler?.count("process.starts");
     handle._setPid(pid);
 
     this._processes.set(pid, handle);

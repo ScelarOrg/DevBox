@@ -61,6 +61,14 @@ export interface BinaryVolumeEntry {
   gid?: number;
 }
 
+function countPathSegments(path: string): number {
+  let depth = 0;
+  for (let index = 0; index < path.length; index++) {
+    if (path.charCodeAt(index) === 47) depth++;
+  }
+  return depth;
+}
+
 // lean spawn mode: synchronous fallback consulted on read misses for paths
 // under lazy directory names (e.g. node_modules excluded from the spawn
 // snapshot). Implementations block on a SAB round-trip to the main thread.
@@ -256,6 +264,10 @@ export class MemoryVolume {
   // every file as "already visited".
   private _inos = new Map<string, number>();
   private _nextIno = 1;
+  // Reverse index for hardlink-aware lazy eviction and file-handle writes.
+  // Keeping this alongside the tree avoids a full filesystem walk whenever
+  // all aliases of an inode need to be updated.
+  private _inodePaths = new Map<VolumeFileInode, Set<string>>();
 
   private _fileInode(node: VolumeNode): VolumeFileInode {
     if (node.kind !== 'file') throw makeSystemError('EISDIR', 'open', '');
@@ -281,28 +293,59 @@ export class MemoryVolume {
     return this._fileInode(node).content;
   }
 
-  private _pathsForInode(inode: VolumeFileInode): string[] {
-    const paths: string[] = [];
-    const visit = (node: VolumeNode, path: string): void => {
-      if (node.kind === 'file' && node.inode === inode) paths.push(path);
-      if (node.kind !== 'directory' || !node.children) return;
-      for (const [name, child] of node.children) {
-        visit(child, path === '/' ? `/${name}` : `${path}/${name}`);
-      }
-    };
-    visit(this.tree, '/');
-    return paths;
+  private _linkInodePath(path: string, inode: VolumeFileInode): void {
+    let paths = this._inodePaths.get(inode);
+    if (!paths) {
+      paths = new Set<string>();
+      this._inodePaths.set(inode, paths);
+    }
+    paths.add(path);
   }
 
-  private _releaseNodeLinks(node: VolumeNode): void {
+  private _unlinkInodePath(path: string, inode: VolumeFileInode): void {
+    const paths = this._inodePaths.get(inode);
+    if (!paths) return;
+    paths.delete(path);
+    if (paths.size === 0) this._inodePaths.delete(inode);
+  }
+
+  private _fileInodeAt(path: string, node: VolumeNode): VolumeFileInode {
+    const inode = this._fileInode(node);
+    this._linkInodePath(path, inode);
+    return inode;
+  }
+
+  private _pathsForInode(inode: VolumeFileInode): string[] {
+    return [...(this._inodePaths.get(inode) ?? [])];
+  }
+
+  private _releaseNodeLinks(node: VolumeNode, path: string): void {
     if (node.kind === 'file') {
-      const inode = this._fileInode(node);
+      const inode = this._fileInodeAt(path, node);
+      this._unlinkInodePath(path, inode);
       inode.nlink = Math.max(0, inode.nlink - 1);
       inode.ctime = Date.now();
       return;
     }
     if (node.kind !== 'directory' || !node.children) return;
-    for (const child of node.children.values()) this._releaseNodeLinks(child);
+    for (const [name, child] of node.children) {
+      this._releaseNodeLinks(child, path === '/' ? `/${name}` : `${path}/${name}`);
+    }
+  }
+
+  private _remapNodeInodePaths(node: VolumeNode, from: string, to: string): void {
+    if (node.kind === 'file') {
+      const inode = this._fileInodeAt(from, node);
+      this._unlinkInodePath(from, inode);
+      this._linkInodePath(to, inode);
+      return;
+    }
+    if (node.kind !== 'directory' || !node.children) return;
+    for (const [name, child] of node.children) {
+      const oldPath = from === '/' ? `/${name}` : `${from}/${name}`;
+      const newPath = to === '/' ? `/${name}` : `${to}/${name}`;
+      this._remapNodeInodePaths(child, oldPath, newPath);
+    }
   }
   private _inoFor(path: string): number {
     let n = this._inos.get(path);
@@ -409,6 +452,27 @@ export class MemoryVolume {
     this._bulkMountHandler = handler;
   }
 
+  /** Rebuild internal inode indexes after an external tree replacement. */
+  rebuildIndexes(): void {
+    this._inodePaths.clear();
+    this._inos.clear();
+    let maxIno = 0;
+    const visit = (node: VolumeNode, path: string): void => {
+      if (node.kind === 'file') {
+        const inode = this._fileInode(node);
+        maxIno = Math.max(maxIno, inode.ino);
+        this._linkInodePath(path, inode);
+        return;
+      }
+      if (node.kind !== 'directory' || !node.children) return;
+      for (const [name, child] of node.children) {
+        visit(child, path === '/' ? `/${name}` : `${path}/${name}`);
+      }
+    };
+    visit(this.tree, '/');
+    this._nextIno = Math.max(1, maxIno + 1);
+  }
+
   private broadcast(event: 'change', path: string, content: string): void;
   private broadcast(event: 'delete', path: string): void;
   private broadcast(event: string, ...args: unknown[]): void {
@@ -463,6 +527,7 @@ export class MemoryVolume {
     this._lazyResident.clear();
     this._lazyResidentBytes = 0;
     this._inos.clear();
+    this._inodePaths.clear();
     this.tree = {
       kind: 'directory',
       children: new Map(),
@@ -497,7 +562,7 @@ export class MemoryVolume {
 
     if (node.kind === 'file') {
       let data = '';
-      const inode = this._fileInode(node);
+      const inode = this._fileInodeAt(currentPath, node);
       const content = inode.content;
       if (content && content.length > 0) {
         data = bytesToBase64(content);
@@ -567,8 +632,14 @@ export class MemoryVolume {
   private _mountBinaryEntries(entries: BinaryVolumeEntry[], fullData: Uint8Array): number {
     const inodes = new Map<number, VolumeFileInode>();
     let mounted = 0;
-    const sorted = [...entries].sort((a, b) =>
-      a.path.split('/').length - b.path.split('/').length || Number(b.isDirectory) - Number(a.isDirectory));
+    const sorted = entries
+      .map((entry, index) => ({ entry, index, depth: countPathSegments(entry.path) }))
+      .sort((a, b) =>
+        a.depth - b.depth ||
+        Number(b.entry.isDirectory) - Number(a.entry.isDirectory) ||
+        a.index - b.index,
+      )
+      .map(({ entry }) => entry);
 
     for (const entry of sorted) {
       if (entry.path === '/') continue;
@@ -608,9 +679,12 @@ export class MemoryVolume {
       if (node?.kind === 'file') {
         const existing = entry.inode === undefined ? undefined : inodes.get(entry.inode);
         if (existing) {
+          const previous = this._fileInodeAt(path, node);
+          this._unlinkInodePath(path, previous);
           node.inode = existing;
+          this._linkInodePath(path, existing);
         } else {
-          const inode = this._fileInode(node);
+          const inode = this._fileInodeAt(path, node);
           if (entry.inode !== undefined) inode.ino = entry.inode;
           if (entry.mode !== undefined) inode.mode = entry.mode;
           if (entry.atimeMs !== undefined) inode.atime = entry.atimeMs;
@@ -635,7 +709,7 @@ export class MemoryVolume {
     const inodes = new Map<number, VolumeFileInode>();
 
     const sorted = snapshot.entries
-      .map((entry, idx) => ({ entry, depth: entry.path.split('/').length, idx }))
+      .map((entry, idx) => ({ entry, depth: countPathSegments(entry.path), idx }))
       .sort((a, b) => a.depth - b.depth || a.idx - b.idx)
       .map(x => x.entry);
 
@@ -678,9 +752,12 @@ export class MemoryVolume {
         if (node?.kind === 'file') {
           const existing = entry.inode === undefined ? undefined : inodes.get(entry.inode);
           if (existing) {
+            const previous = vol._fileInodeAt(vol.normalize(entry.path), node);
+            vol._unlinkInodePath(vol.normalize(entry.path), previous);
             node.inode = existing;
+            vol._linkInodePath(vol.normalize(entry.path), existing);
           } else {
-            const inode = vol._fileInode(node);
+            const inode = vol._fileInodeAt(vol.normalize(entry.path), node);
             if (entry.inode !== undefined) inode.ino = entry.inode;
             if (entry.mode !== undefined) inode.mode = entry.mode;
             if (entry.atimeMs !== undefined) inode.atime = entry.atimeMs;
@@ -860,7 +937,7 @@ export class MemoryVolume {
 
     const now = Date.now();
     if (existing?.kind === 'file') {
-      const inode = this._fileInode(existing);
+      const inode = this._fileInodeAt(norm, existing);
       inode.content = bytes;
       inode.mtime = now;
       inode.ctime = now;
@@ -876,20 +953,33 @@ export class MemoryVolume {
       this.writeInternal(targetPath, data, notify, seen);
       return;
     } else {
+      const inode: VolumeFileInode = {
+        ino: this._nextIno++,
+        content: bytes,
+        mode: 0o644,
+        atime: now,
+        mtime: now,
+        ctime: now,
+        nlink: 1,
+      };
       parent.children!.set(name, {
         kind: 'file',
         modified: now,
-        inode: { ino: this._nextIno++, content: bytes, mode: 0o644, atime: now, mtime: now, ctime: now, nlink: 1 },
+        inode,
       });
+      this._linkInodePath(norm, inode);
     }
 
     if (this._handler) this._handler.invalidateStat(norm);
 
     if (notify) {
       this.triggerWatchers(norm, existed ? 'change' : 'rename');
-      // pass the normalized Uint8Array so decodeText gets a real BufferSource —
-      // raw `data` would throw for plain arrays
-      this.broadcast('change', norm, typeof data === 'string' ? data : this.decodeText(bytes));
+      // Keep the legacy text event contract, but do not decode binary data if
+      // nobody is subscribed. The normal VFS bridge uses fs.watch instead.
+      const changeHandlers = this.subscribers.get('change');
+      if (changeHandlers && changeHandlers.size > 0) {
+        this.broadcast('change', norm, typeof data === 'string' ? data : this.decodeText(bytes));
+      }
       this.notifyGlobalListeners(norm, existed ? 'change' : 'add');
     }
   }
@@ -978,7 +1068,7 @@ export class MemoryVolume {
       this._lazyResidentBytes -= oldSize;
       const oldNode = this.locateRaw(oldest);
       if (oldNode?.kind === 'file') {
-        this._evictInodeContent(this._fileInode(oldNode), oldSize);
+        this._evictInodeContent(this._fileInodeAt(oldest, oldNode), oldSize);
       }
     }
   }
@@ -1066,10 +1156,10 @@ export class MemoryVolume {
       return;
     }
     node.lazy = false;
-    this._fileInode(node).content = bytes;
+    this._fileInodeAt(norm, node).content = bytes;
     node.lazySize = undefined;
     node.modified = Date.now();
-    this._fileInode(node).mtime = node.modified;
+    this._fileInodeAt(norm, node).mtime = node.modified;
     if (this._handler) this._handler.invalidateStat(norm);
     this._trackLazyResident(norm, node);
   }
@@ -1151,7 +1241,7 @@ export class MemoryVolume {
     if (!node) throw makeSystemError('ENOENT', 'stat', p);
     if (node.lazy) this._hydrateStubStat(norm, node);
 
-    const inode = node.kind === 'file' ? this._fileInode(node) : null;
+    const inode = node.kind === 'file' ? this._fileInodeAt(norm, node) : null;
     const fileSize = node.kind === 'file' ? (inode?.content?.length ?? node.lazySize ?? 0) : 0;
     const ts = inode?.mtime ?? node.modified;
     const uid = inode?.uid ?? node.uid ?? MOCK_IDS.UID;
@@ -1250,7 +1340,7 @@ export class MemoryVolume {
     }
     if (!node) throw makeSystemError('ENOENT', 'open', p);
     if (node.kind !== 'file') throw makeSystemError('EISDIR', 'read', p);
-    const inode = this._fileInode(node);
+    const inode = this._fileInodeAt(norm, node);
     // hydrate when lazy OR content was evicted via a hardlink sibling's LRU path
     if (node.lazy || (inode.content == null && this._missHandler)) {
       this._hydrateStub(norm, node);
@@ -1273,7 +1363,7 @@ export class MemoryVolume {
     const node = this.locate(norm);
     if (!node) throw makeSystemError('ENOENT', 'open', p);
     if (node.kind !== 'file') throw makeSystemError('EISDIR', 'open', p);
-    const inode = this._fileInode(node);
+    const inode = this._fileInodeAt(norm, node);
     if (node.lazy || (inode.content == null && this._missHandler)) {
       this._hydrateStub(norm, node);
     }
@@ -1381,7 +1471,7 @@ export class MemoryVolume {
 
     this._untrackLazyResident(norm);
     this._invalidateLazyListedFor(norm);
-    this._releaseNodeLinks(target);
+    this._releaseNodeLinks(target, norm);
     parent.children!.delete(name);
     if (this._handler) this._handler.invalidateStat(norm);
     this.triggerWatchers(norm, 'rename');
@@ -1446,7 +1536,7 @@ export class MemoryVolume {
     };
     collect(target, norm);
 
-    this._releaseNodeLinks(target);
+    this._releaseNodeLinks(target, norm);
     parent.children!.delete(name);
     this._untrackLazyTree(norm);
     this._invalidateLazyListedFor(norm);
@@ -1508,16 +1598,17 @@ export class MemoryVolume {
     // Intentionally no ENOTEMPTY for non-empty dest dirs (Vite clobber).
     const replaced = toParent.children!.get(toName);
     if (node.kind === 'file' && replaced?.kind === 'file' &&
-        this._fileInode(node) === this._fileInode(replaced)) {
+        this._fileInodeAt(normFrom, node) === this._fileInodeAt(normTo, replaced)) {
       return;
     }
     if (replaced) {
       this._untrackLazyTree(normTo);
-      this._releaseNodeLinks(replaced);
+      this._releaseNodeLinks(replaced, normTo);
       toParent.children!.delete(toName);
     }
     fromParent.children!.delete(fromName);
     toParent.children!.set(toName, node);
+    this._remapNodeInodePaths(node, normFrom, normTo);
     this._remapLazyTree(normFrom, normTo);
     this._invalidateLazyListedFor(normFrom);
     this._invalidateLazyListedFor(normTo);
@@ -1654,10 +1745,11 @@ export class MemoryVolume {
     const parent = this.ensureDir(parentPath);
 
     if (parent.children!.has(name)) throw makeSystemError('EEXIST', 'link', newPath);
-    const inode = this._fileInode(existing);
+    const inode = this._fileInodeAt(normExisting, existing);
     inode.nlink++;
     inode.ctime = Date.now();
     parent.children!.set(name, { kind: 'file', modified: inode.mtime, inode });
+    this._linkInodePath(normNew, inode);
 
     if (this._handler) this._handler.invalidateStat(normNew);
     this.triggerWatchers(normNew, 'rename');
@@ -1670,7 +1762,7 @@ export class MemoryVolume {
     if (!node) throw makeSystemError('ENOENT', 'chmod', _p);
     const mode = _mode & 0o7777;
     if (node.kind === 'file') {
-      const inode = this._fileInode(node);
+      const inode = this._fileInodeAt(norm, node);
       inode.mode = mode;
       inode.ctime = Date.now();
     } else if (node.kind === 'directory') {
@@ -1686,7 +1778,7 @@ export class MemoryVolume {
     if (!node) throw makeSystemError('ENOENT', 'lchmod', p);
     const bits = mode & 0o7777;
     if (node.kind === 'file') {
-      const inode = this._fileInode(node);
+      const inode = this._fileInodeAt(norm, node);
       inode.mode = bits;
       inode.ctime = Date.now();
     } else {
@@ -1701,7 +1793,7 @@ export class MemoryVolume {
     const node = this.locate(norm);
     if (!node) throw makeSystemError('ENOENT', 'chown', p);
     if (node.kind === 'file') {
-      const inode = this._fileInode(node);
+      const inode = this._fileInodeAt(norm, node);
       inode.uid = uid;
       inode.gid = gid;
       inode.ctime = Date.now();
@@ -1718,7 +1810,7 @@ export class MemoryVolume {
     const node = this.locateRaw(norm);
     if (!node) throw makeSystemError('ENOENT', 'lchown', p);
     if (node.kind === 'file') {
-      const inode = this._fileInode(node);
+      const inode = this._fileInodeAt(norm, node);
       inode.uid = uid;
       inode.gid = gid;
       inode.ctime = Date.now();
@@ -1755,7 +1847,7 @@ export class MemoryVolume {
     if (!node) throw makeSystemError('ENOENT', 'utimes', p);
     const { atimeMs, mtimeMs } = this._parseTimes(p, 'utimes', atime, mtime);
     if (node.kind === 'file') {
-      const inode = this._fileInode(node);
+      const inode = this._fileInodeAt(norm, node);
       inode.atime = atimeMs;
       inode.mtime = mtimeMs;
       inode.ctime = Date.now();
@@ -1772,7 +1864,7 @@ export class MemoryVolume {
     if (!node) throw makeSystemError('ENOENT', 'lutimes', p);
     const { atimeMs, mtimeMs } = this._parseTimes(p, 'lutimes', atime, mtime);
     if (node.kind === 'file') {
-      const inode = this._fileInode(node);
+      const inode = this._fileInodeAt(norm, node);
       inode.atime = atimeMs;
       inode.mtime = mtimeMs;
       inode.ctime = Date.now();
@@ -1789,7 +1881,7 @@ export class MemoryVolume {
     const node = this.locate(norm);
     if (node && node.kind === 'file') {
       if (node.lazy) this._hydrateStub(norm, node);
-      existing = this._fileContent(node) || new Uint8Array(0);
+      existing = this._fileInodeAt(norm, node).content || new Uint8Array(0);
     }
     const bytes = this.toBytes(data);
     const combined = new Uint8Array(existing.length + bytes.length);
@@ -1804,7 +1896,7 @@ export class MemoryVolume {
     if (!node) throw makeSystemError('ENOENT', 'truncate', p);
     if (node.kind !== 'file') throw makeSystemError('EISDIR', 'truncate', p);
     if (node.lazy) this._hydrateStub(norm, node);
-    const inode = this._fileInode(node);
+    const inode = this._fileInodeAt(norm, node);
     const content = inode.content || new Uint8Array(0);
     if (len < content.length) {
       inode.content = content.slice(0, len);
