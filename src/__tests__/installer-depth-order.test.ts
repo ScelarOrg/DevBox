@@ -17,7 +17,10 @@ vi.mock("../packages/archive-extractor", () => ({
   },
 }));
 
-import { DependencyInstaller } from "../packages/installer";
+import {
+  DependencyInstaller,
+  findWasiPackageReferences,
+} from "../packages/installer";
 import type { ResolvedDependency } from "../packages/version-resolver";
 
 describe("dependency extraction ordering", () => {
@@ -44,5 +47,20 @@ describe("dependency extraction ordering", () => {
     );
     expect(volume.existsSync("/node_modules/parent/package.json")).toBe(true);
     expect(volume.existsSync("/node_modules/parent/node_modules/child/package.json")).toBe(true);
+  });
+});
+
+describe("WASI companion discovery", () => {
+  it("finds scoped wasm32-wasi package references without package-specific names", () => {
+    const source = [
+      'const first = "@scope/native-wasm32-wasi";',
+      "const second = '@scope/native-wasm32-wasi/entry.cjs';",
+      'const duplicate = "@scope/native-wasm32-wasi";',
+      'const ordinary = "@scope/native";',
+    ].join("\n");
+
+    expect(findWasiPackageReferences(source)).toEqual([
+      "@scope/native-wasm32-wasi",
+    ]);
   });
 });

@@ -31,9 +31,33 @@ import {
   type WorkspaceGraph,
 } from "./workspace";
 
-const RESOLVER_CACHE_VERSION = 1;
-const SNAPSHOT_CACHE_VERSION = 3;
+const RESOLVER_CACHE_VERSION = 2;
+const SNAPSHOT_CACHE_VERSION = 4;
 const TRANSFORMER_CACHE_VERSION = `esbuild-wasm@${PINNED_ESBUILD_WASM}:cjs-esnext-neutral-v1`;
+
+// Some package managers and bundlers derive their WASI package name at
+// runtime instead of declaring it in optionalDependencies. Keep this generic:
+// discover the standard wasm32-wasi package convention from the installed
+// package code rather than naming a particular tool or binding.
+const WASI_PACKAGE_REFERENCE_RE =
+  /["'`]((?:@[a-z0-9._~-]+\/)?[a-z0-9._~-]+-wasm32-wasi)(?:\/[^"'`\\]*)?["'`]/gi;
+const WASI_SOURCE_EXTENSIONS = new Set([
+  ".cjs",
+  ".js",
+  ".json",
+  ".mjs",
+  ".mts",
+  ".ts",
+]);
+
+/** Return literal npm package references using the wasm32-wasi convention. */
+export function findWasiPackageReferences(source: string): string[] {
+  const references = new Set<string>();
+  for (const match of source.matchAll(WASI_PACKAGE_REFERENCE_RE)) {
+    references.add(match[1]);
+  }
+  return [...references];
+}
 
 function stableRecord(record: Record<string, string> | undefined): string {
   return JSON.stringify(Object.entries(record ?? {}).sort(([a], [b]) => a.localeCompare(b)));
@@ -102,6 +126,12 @@ export interface InstallOutcome {
 export interface WorkspaceInstallOutcome {
   graph: WorkspaceGraph;
   installs: Array<{ root: string; outcome: InstallOutcome }>;
+}
+
+interface WasiCompanionCandidate {
+  parentPlacement: string;
+  packageName: string;
+  versionRange: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -310,7 +340,11 @@ export class DependencyInstaller {
 
     const stopMaterialize = this._performance?.start("install.materialize");
     const materializeSpan = this.profileSpan("packages.materialize");
-    const newPkgs = await this.materializePackages(tree, flags);
+    const newPkgs = await this.materializeWithWasiCompanions(
+      tree,
+      flags,
+      resolutionOpts,
+    );
     stopMaterialize?.();
     this.endProfileSpan(materializeSpan);
 
@@ -418,7 +452,11 @@ export class DependencyInstaller {
 
     const stopMaterialize = this._performance?.start("install.materialize");
     const materializeSpan = this.profileSpan("packages.materialize");
-    const newPkgs = await this.materializePackages(tree, flags);
+    const newPkgs = await this.materializeWithWasiCompanions(
+      tree,
+      flags,
+      resolutionOpts,
+    );
     stopMaterialize?.();
     this.endProfileSpan(materializeSpan);
 
@@ -555,6 +593,179 @@ export class DependencyInstaller {
   // -----------------------------------------------------------------------
   // Private helpers
   // -----------------------------------------------------------------------
+
+  /**
+   * Materialize the resolved tree, then add any WASI companions referenced by
+   * the installed package code. This handles packages that omit the companion
+   * from optionalDependencies and only discover it in a runtime fallback.
+   */
+  private async materializeWithWasiCompanions(
+    tree: Map<string, ResolvedDependency>,
+    flags: InstallFlags,
+    resolutionOpts: ResolutionConfig,
+  ): Promise<string[]> {
+    const installed: string[] = [];
+    const seenCandidates = new Set<string>();
+
+    // A companion can itself depend on another WASI companion. Continue until
+    // a pass adds nothing; the candidate set is bounded by package contents.
+    for (let pass = 0; pass < 16; pass++) {
+      installed.push(...await this.materializePackages(tree, flags));
+
+      const candidates = this.findWasiCompanionCandidates(tree);
+      let added = false;
+
+      for (const candidate of candidates) {
+        const candidateKey = [
+          candidate.parentPlacement,
+          candidate.packageName,
+          candidate.versionRange,
+        ].join("|");
+        if (seenCandidates.has(candidateKey)) continue;
+        seenCandidates.add(candidateKey);
+
+        let companionTree: Map<string, ResolvedDependency>;
+        try {
+          const resolutionKey = quickDigest(JSON.stringify({
+            version: RESOLVER_CACHE_VERSION,
+            package: candidate.packageName,
+            range: candidate.versionRange,
+            registry: flags.registry ?? "default",
+            dev: !!flags.withDevDeps,
+            optional: !!flags.withOptionalDeps,
+          }));
+          const resolved = await resolveWithCache(resolutionKey, () =>
+            resolveDependencyTree(
+              candidate.packageName,
+              candidate.versionRange,
+              resolutionOpts,
+            ));
+          companionTree = resolved.tree;
+        } catch (error) {
+          // A package may contain a platform branch that is not published for
+          // the current parent version. Keep the existing runtime fallback in
+          // that case; an unavailable companion must not break installation.
+          flags.onProgress?.(
+            `  Skipping unavailable WASI companion ${candidate.packageName}@${candidate.versionRange}: ${error}`,
+          );
+          continue;
+        }
+
+        const companionRoot = path.join(
+          candidate.parentPlacement,
+          "node_modules",
+          candidate.packageName,
+        );
+
+        for (const [placement, dependency] of companionTree) {
+          // Keep the companion's complete dependency closure private to the
+          // companion. This avoids accidentally reusing a conflicting hoisted
+          // package from the host tree while preserving normal Node lookup.
+          const targetPlacement = placement === candidate.packageName
+            ? companionRoot
+            : path.join(companionRoot, "node_modules", placement);
+          if (tree.has(targetPlacement)) continue;
+          tree.set(targetPlacement, dependency);
+          added = true;
+        }
+      }
+
+      if (!added) break;
+    }
+
+    return [...new Set(installed)];
+  }
+
+  private findWasiCompanionCandidates(
+    tree: Map<string, ResolvedDependency>,
+  ): WasiCompanionCandidate[] {
+    const candidates: WasiCompanionCandidate[] = [];
+    const nmRoot = path.join(this.workingDir, "node_modules");
+
+    for (const [parentPlacement, dependency] of tree) {
+      const packageDir = path.join(nmRoot, parentPlacement);
+      const references = new Set<string>();
+      const files = [packageDir];
+
+      while (files.length > 0) {
+        const current = files.pop()!;
+        let entries: string[];
+        try {
+          entries = this.vol.readdirSync(current);
+        } catch {
+          continue;
+        }
+
+        for (const entry of entries) {
+          if (entry === "node_modules" || entry === ".git") continue;
+          const filePath = path.join(current, entry);
+          let stat;
+          try {
+            stat = this.vol.statSync(filePath);
+          } catch {
+            continue;
+          }
+          if (stat.isDirectory()) {
+            files.push(filePath);
+            continue;
+          }
+
+          const extension = path.extname(entry).toLowerCase();
+          if (!WASI_SOURCE_EXTENSIONS.has(extension) || stat.size > 16 * 1024 * 1024) {
+            continue;
+          }
+          try {
+            for (const reference of findWasiPackageReferences(
+              this.vol.readFileSync(filePath, "utf8"),
+            )) {
+              references.add(reference);
+            }
+          } catch {
+            // Binary or otherwise unreadable source is irrelevant here.
+          }
+        }
+      }
+
+      let packageJson: {
+        name?: string;
+        dependencies?: Record<string, string>;
+        optionalDependencies?: Record<string, string>;
+      } = {};
+      try {
+        packageJson = JSON.parse(
+          this.vol.readFileSync(path.join(packageDir, "package.json"), "utf8"),
+        );
+      } catch {
+        // The resolved dependency still provides a safe version fallback.
+      }
+
+      for (const packageName of references) {
+        // A companion's loader may mention its own package name while
+        // constructing a diagnostic or resolving its runtime entry point.
+        // That is not a request to install an infinite nested copy.
+        if (packageName === (packageJson.name || dependency.name)) continue;
+        const nestedPlacement = path.join(
+          parentPlacement,
+          "node_modules",
+          packageName,
+        );
+        // A root-level companion is already visible to Node's lookup from any
+        // package, so do not install a duplicate nested copy.
+        if (tree.has(nestedPlacement) || tree.has(packageName)) continue;
+
+        candidates.push({
+          parentPlacement,
+          packageName,
+          versionRange:
+            packageJson.optionalDependencies?.[packageName] ??
+            packageJson.dependencies?.[packageName] ??
+            dependency.version,
+        });
+      }
+    }
+
+    return candidates;
+  }
 
   // Download, extract, transform, and wire up packages not already in node_modules
   private async materializePackages(
