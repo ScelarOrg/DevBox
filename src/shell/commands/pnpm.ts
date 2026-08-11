@@ -83,11 +83,8 @@ export function createPnpmCommand(deps: PmDeps): ShellCommand {
             exitCode: 1,
           };
         default:
-          return {
-            stdout: "",
-            stderr: deps.formatErr(`Unknown command "${sub}"`, "pnpm"),
-            exitCode: 1,
-          };
+          // pnpm accepts `pnpm <script>` as shorthand for `pnpm run <script>`.
+          return deps.runScript(params, ctx);
       }
     },
   };

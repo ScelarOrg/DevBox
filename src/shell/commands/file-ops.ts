@@ -5,6 +5,7 @@ import {
   resolvePath,
   parseArgs,
   pathModule,
+  yieldToEventLoop,
 } from "../shell-helpers";
 
 /* ------------------------------------------------------------------ */
@@ -18,6 +19,7 @@ function formatCat(
   squeeze: boolean,
   showEnds: boolean,
   showTabs: boolean,
+  showNonprinting: boolean,
 ): string {
   let lines = content.split("\n");
   if (squeeze) {
@@ -34,7 +36,17 @@ function formatCat(
   let lineNum = 1;
   const result = lines.map((line, idx) => {
     let l = line;
-    if (showTabs) l = l.replace(/\t/g, "^I");
+    if (showNonprinting) {
+      let visible = "";
+      for (const char of l) {
+        const code = char.charCodeAt(0);
+        if (code === 9) visible += showTabs ? "^I" : char;
+        else if (code < 32) visible += `^${String.fromCharCode(code + 64)}`;
+        else if (code === 127) visible += "^?";
+        else visible += char;
+      }
+      l = visible;
+    } else if (showTabs) l = l.replace(/\t/g, "^I");
     if (showEnds && idx < lines.length - 1) l += "$";
     if (numberNonBlank) {
       if (line.length > 0) l = `${String(lineNum++).padStart(6)}\t${l}`;
@@ -46,26 +58,57 @@ function formatCat(
   return result.join("\n");
 }
 
-function copyTree(ctx: ShellContext, src: string, dst: string): void {
-  ctx.volume.mkdirSync(dst, { recursive: true });
-  for (const name of ctx.volume.readdirSync(src)) {
-    const s = `${src}/${name}`;
-    const d = `${dst}/${name}`;
-    const st = ctx.volume.statSync(s);
-    if (st.isDirectory()) {
-      copyTree(ctx, s, d);
-    } else {
-      ctx.volume.writeFileSync(d, ctx.volume.readFileSync(s));
-    }
+interface TreeWalkState {
+  entries: number;
+}
+
+function visitTreeEntry(ctx: ShellContext, state: TreeWalkState): void {
+  if (ctx.signal?.aborted) throw new Error("shell: command cancelled");
+  state.entries++;
+  const limit = ctx.limits?.maxFilesystemEntries ?? 100_000;
+  if (state.entries > limit) {
+    throw new Error(`shell: filesystem entry limit ${limit} exceeded`);
   }
 }
 
-function removeTree(ctx: ShellContext, dir: string): void {
+async function yieldTreeWork(ctx: ShellContext, state: TreeWalkState): Promise<void> {
+  if ((state.entries & 127) === 0) await yieldToEventLoop(ctx.signal);
+}
+
+async function copyTree(ctx: ShellContext, src: string, dst: string, state: TreeWalkState): Promise<void> {
+  visitTreeEntry(ctx, state);
+  await yieldTreeWork(ctx, state);
+  const stat = ctx.volume.lstatSync(src);
+  if (stat.isSymbolicLink()) {
+    const parent = pathModule.dirname(dst);
+    ctx.volume.mkdirSync(parent, { recursive: true });
+    if (ctx.volume.existsSync(dst)) ctx.volume.unlinkSync(dst);
+    ctx.volume.symlinkSync(ctx.volume.readlinkSync(src), dst);
+    return;
+  }
+  if (!stat.isDirectory()) {
+    const parent = pathModule.dirname(dst);
+    ctx.volume.mkdirSync(parent, { recursive: true });
+    ctx.volume.writeFileSync(dst, ctx.volume.readFileSync(src));
+    return;
+  }
+
+  ctx.volume.mkdirSync(dst, { recursive: true });
+  for (const name of ctx.volume.readdirSync(src)) {
+    await copyTree(ctx, `${src}/${name}`, `${dst}/${name}`, state);
+  }
+}
+
+async function removeTree(ctx: ShellContext, dir: string, state: TreeWalkState): Promise<void> {
+  visitTreeEntry(ctx, state);
+  await yieldTreeWork(ctx, state);
+  const stat = ctx.volume.lstatSync(dir);
+  if (!stat.isDirectory()) {
+    ctx.volume.unlinkSync(dir);
+    return;
+  }
   for (const name of ctx.volume.readdirSync(dir)) {
-    const full = `${dir}/${name}`;
-    const st = ctx.volume.statSync(full);
-    if (st.isDirectory()) removeTree(ctx, full);
-    else ctx.volume.unlinkSync(full);
+    await removeTree(ctx, `${dir}/${name}`, state);
   }
   ctx.volume.rmdirSync(dir);
 }
@@ -86,44 +129,39 @@ const cat: BuiltinFn = (args, ctx, stdin) => {
     "t",
     "v",
   ]);
-  const numberAll = flags.has("n") || flags.has("A");
+  const numberAll = flags.has("n");
   const numberNonBlank = flags.has("b");
   const squeeze = flags.has("s");
   const showEnds = flags.has("E") || flags.has("A") || flags.has("e");
   const showTabs = flags.has("T") || flags.has("A") || flags.has("t");
+  const showNonprinting = flags.has("v") || flags.has("A") || flags.has("e") || flags.has("t");
+  const outputLimit = ctx.limits?.maxOutputBytes ?? 4 * 1024 * 1024;
+  const appendFormatted = (current: string, content: string): string => {
+    if (content.length > outputLimit) throw new Error(`output limit ${outputLimit} exceeded`);
+    const formatted = formatCat(content, numberAll, numberNonBlank, squeeze, showEnds, showTabs, showNonprinting);
+    if (current.length + formatted.length > outputLimit) throw new Error(`output limit ${outputLimit} exceeded`);
+    return current + formatted;
+  };
 
   if (positional.length === 0 && stdin !== undefined) {
-    return ok(
-      formatCat(stdin, numberAll, numberNonBlank, squeeze, showEnds, showTabs),
-    );
+    try { return ok(appendFormatted("", stdin)); }
+    catch (error) { return fail(`cat: ${error instanceof Error ? error.message : String(error)}\n`); }
   }
   if (positional.length === 0) return fail("cat: missing operand\n");
 
   let out = "";
   for (const file of positional) {
     if (file === "-" && stdin !== undefined) {
-      out += formatCat(
-        stdin,
-        numberAll,
-        numberNonBlank,
-        squeeze,
-        showEnds,
-        showTabs,
-      );
+      try { out = appendFormatted(out, stdin); }
+      catch (error) { return fail(`cat: ${error instanceof Error ? error.message : String(error)}\n`); }
       continue;
     }
     const p = resolvePath(file, ctx.cwd);
     try {
       const content = ctx.volume.readFileSync(p, "utf8");
-      out += formatCat(
-        content,
-        numberAll,
-        numberNonBlank,
-        squeeze,
-        showEnds,
-        showTabs,
-      );
-    } catch {
+      out = appendFormatted(out, content);
+    } catch (error) {
+      if (error instanceof Error && error.message.includes("limit")) return fail(`cat: ${error.message}\n`);
       return fail(`cat: ${file}: No such file or directory\n`);
     }
   }
@@ -137,7 +175,8 @@ const head: BuiltinFn = (args, ctx, stdin) => {
   const files: string[] = [];
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "-n" && i + 1 < args.length) {
-      n = parseInt(args[++i], 10) || 10;
+      const parsed = parseInt(args[++i], 10);
+      if (Number.isFinite(parsed)) n = parsed;
     } else if (args[i] === "-c" && i + 1 < args.length) {
       bytes = parseInt(args[++i], 10) || 0;
       byteMode = true;
@@ -150,8 +189,19 @@ const head: BuiltinFn = (args, ctx, stdin) => {
 
   const doHead = (content: string) => {
     if (byteMode) return content.slice(0, bytes);
-    return content.split("\n").slice(0, n).join("\n") + "\n";
+    if (n <= 0) return "";
+    let end = 0;
+    for (let count = 0; count < n; count++) {
+      const newline = content.indexOf("\n", end);
+      if (newline < 0) return content;
+      end = newline + 1;
+    }
+    return content.slice(0, end);
   };
+
+  const operationLimit = ctx.limits?.maxLoopIterations ?? 100_000;
+  if (!byteMode && n > operationLimit) return fail(`head: line limit ${operationLimit} exceeded\n`);
+  const outputLimit = ctx.limits?.maxOutputBytes ?? 4 * 1024 * 1024;
 
   if (files.length === 0 && stdin !== undefined) return ok(doHead(stdin));
   if (files.length === 0) return fail("head: missing operand\n");
@@ -163,6 +213,7 @@ const head: BuiltinFn = (args, ctx, stdin) => {
       const content = ctx.volume.readFileSync(p, "utf8");
       if (files.length > 1) out += `==> ${file} <==\n`;
       out += doHead(content);
+      if (out.length > outputLimit) return fail(`head: output limit ${outputLimit} exceeded\n`);
     } catch {
       return fail(`head: ${file}: No such file or directory\n`);
     }
@@ -177,7 +228,8 @@ const tail: BuiltinFn = (args, ctx, stdin) => {
   const files: string[] = [];
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "-n" && i + 1 < args.length) {
-      n = parseInt(args[++i], 10) || 10;
+      const parsed = parseInt(args[++i], 10);
+      if (Number.isFinite(parsed)) n = parsed;
     } else if (args[i] === "-c" && i + 1 < args.length) {
       bytes = parseInt(args[++i], 10) || 0;
       byteMode = true;
@@ -192,13 +244,19 @@ const tail: BuiltinFn = (args, ctx, stdin) => {
 
   const doTail = (content: string) => {
     if (byteMode) return content.slice(-bytes);
-    const lines = content.split("\n");
-    const start = Math.max(
-      0,
-      lines.length - n - (content.endsWith("\n") ? 1 : 0),
-    );
-    return lines.slice(start).join("\n");
+    if (n <= 0) return "";
+    let cursor = content.endsWith("\n") ? content.length - 1 : content.length;
+    for (let count = 0; count < n; count++) {
+      const newline = content.lastIndexOf("\n", cursor - 1);
+      if (newline < 0) return content;
+      cursor = newline;
+    }
+    return content.slice(cursor + 1);
   };
+
+  const operationLimit = ctx.limits?.maxLoopIterations ?? 100_000;
+  if (!byteMode && n > operationLimit) return fail(`tail: line limit ${operationLimit} exceeded\n`);
+  const outputLimit = ctx.limits?.maxOutputBytes ?? 4 * 1024 * 1024;
 
   if (files.length === 0 && stdin !== undefined) return ok(doTail(stdin));
   if (files.length === 0) return fail("tail: missing operand\n");
@@ -210,6 +268,7 @@ const tail: BuiltinFn = (args, ctx, stdin) => {
       const content = ctx.volume.readFileSync(p, "utf8");
       if (files.length > 1) out += `==> ${file} <==\n`;
       out += doTail(content);
+      if (out.length > outputLimit) return fail(`tail: output limit ${outputLimit} exceeded\n`);
     } catch {
       return fail(`tail: ${file}: No such file or directory\n`);
     }
@@ -229,7 +288,7 @@ const touch: BuiltinFn = (args, ctx) => {
   return ok();
 };
 
-const cpCmd: BuiltinFn = (args, ctx) => {
+const cpCmd: BuiltinFn = async (args, ctx) => {
   const { flags, positional } = parseArgs(args, ["r", "R", "f", "n", "v"]);
   const recursive = flags.has("r") || flags.has("R") || flags.has("recursive");
   const verbose = flags.has("v");
@@ -239,16 +298,28 @@ const cpCmd: BuiltinFn = (args, ctx) => {
   const dest = positional[positional.length - 1];
   const sources = positional.slice(0, -1);
   const dstPath = resolvePath(dest, ctx.cwd);
+  const walkState: TreeWalkState = { entries: 0 };
   let out = "";
 
   for (const src of sources) {
     const srcPath = resolvePath(src, ctx.cwd);
     try {
-      const st = ctx.volume.statSync(srcPath);
+      const st = ctx.volume.lstatSync(srcPath);
       if (st.isDirectory()) {
         if (!recursive)
           return fail(`cp: -r not specified; omitting directory '${src}'\n`);
-        copyTree(ctx, srcPath, dstPath);
+        let destFinal = dstPath;
+        if (ctx.volume.existsSync(dstPath) && ctx.volume.lstatSync(dstPath).isDirectory()) {
+          destFinal = `${dstPath}/${pathModule.basename(srcPath)}`;
+        }
+        await copyTree(ctx, srcPath, destFinal, walkState);
+        if (verbose) out += `'${src}' -> '${dest}'\n`;
+      } else if (st.isSymbolicLink()) {
+        let destFinal = dstPath;
+        if (ctx.volume.existsSync(dstPath) && ctx.volume.lstatSync(dstPath).isDirectory()) {
+          destFinal = `${dstPath}/${pathModule.basename(srcPath)}`;
+        }
+        await copyTree(ctx, srcPath, destFinal, walkState);
         if (verbose) out += `'${src}' -> '${dest}'\n`;
       } else {
         let destFinal = dstPath;
@@ -264,7 +335,9 @@ const cpCmd: BuiltinFn = (args, ctx) => {
         ctx.volume.writeFileSync(destFinal, ctx.volume.readFileSync(srcPath));
         if (verbose) out += `'${src}' -> '${dest}'\n`;
       }
-    } catch {
+    } catch (error) {
+      if (ctx.signal?.aborted) return fail("cp: command cancelled\n", 130);
+      if (error instanceof Error && error.message.startsWith("shell: ")) return fail(`${error.message}\n`);
       return fail(`cp: cannot stat '${src}': No such file or directory\n`);
     }
   }
@@ -305,7 +378,7 @@ const mv: BuiltinFn = (args, ctx) => {
   return ok(out);
 };
 
-const rm: BuiltinFn = (args, ctx) => {
+const rm: BuiltinFn = async (args, ctx) => {
   const { flags, positional } = parseArgs(args, ["r", "R", "f", "v"]);
   const recursive = flags.has("r") || flags.has("R") || flags.has("recursive");
   const force = flags.has("f") || flags.has("force");
@@ -313,6 +386,7 @@ const rm: BuiltinFn = (args, ctx) => {
 
   if (positional.length === 0 && !force) return fail("rm: missing operand\n");
 
+  const walkState: TreeWalkState = { entries: 0 };
   let out = "";
   for (const target of positional) {
     const p = resolvePath(target, ctx.cwd);
@@ -320,11 +394,11 @@ const rm: BuiltinFn = (args, ctx) => {
       if (force) continue;
       return fail(`rm: cannot remove '${target}': No such file or directory\n`);
     }
-    const st = ctx.volume.statSync(p);
+    const st = ctx.volume.lstatSync(p);
     if (st.isDirectory()) {
       if (!recursive)
         return fail(`rm: cannot remove '${target}': Is a directory\n`);
-      removeTree(ctx, p);
+      await removeTree(ctx, p, walkState);
       if (verbose) out += `removed directory '${target}'\n`;
     } else {
       ctx.volume.unlinkSync(p);
@@ -418,9 +492,12 @@ const wc: BuiltinFn = (args, ctx, stdin) => {
   const showMaxLine = flags.has("L");
   const showAll =
     !showLines && !showWords && !showBytes && !showChars && !showMaxLine;
+  const inputLimit = ctx.limits?.maxOutputBytes ?? 4 * 1024 * 1024;
 
   const doWc = (content: string, label?: string) => {
-    const lines = content.split("\n").length - (content.endsWith("\n") ? 1 : 0);
+    const lines = content.length === 0
+      ? 0
+      : content.split("\n").length - (content.endsWith("\n") ? 1 : 0);
     const words = content.split(/\s+/).filter(Boolean).length;
     const bytes = new TextEncoder().encode(content).length;
     const chars = [...content].length;
@@ -439,7 +516,9 @@ const wc: BuiltinFn = (args, ctx, stdin) => {
     return parts.join("") + suffix + "\n";
   };
 
-  if (positional.length === 0 && stdin !== undefined) return ok(doWc(stdin));
+  if (positional.length === 0 && stdin !== undefined) {
+    return stdin.length > inputLimit ? fail(`wc: input limit ${inputLimit} exceeded\n`) : ok(doWc(stdin));
+  }
   if (positional.length === 0) return fail("wc: missing operand\n");
 
   let out = "";
@@ -450,9 +529,11 @@ const wc: BuiltinFn = (args, ctx, stdin) => {
     const p = resolvePath(file, ctx.cwd);
     try {
       const content = ctx.volume.readFileSync(p, "utf8");
+      if (content.length > inputLimit) return fail(`wc: ${file}: input limit ${inputLimit} exceeded\n`);
       out += doWc(content, file);
-      totalLines +=
-        content.split("\n").length - (content.endsWith("\n") ? 1 : 0);
+      totalLines += content.length === 0
+        ? 0
+        : content.split("\n").length - (content.endsWith("\n") ? 1 : 0);
       totalWords += content.split(/\s+/).filter(Boolean).length;
       totalBytes += new TextEncoder().encode(content).length;
     } catch {
@@ -473,11 +554,14 @@ const tee: BuiltinFn = (args, ctx, stdin) => {
   const { flags, positional } = parseArgs(args, ["a"]);
   const append = flags.has("a");
   const content = stdin ?? "";
+  const fileLimit = (ctx.limits?.maxOutputBytes ?? 4 * 1024 * 1024) * 32;
+  if (content.length > fileLimit) return fail(`tee: input limit ${fileLimit} exceeded\n`);
 
   for (const file of positional) {
     const p = resolvePath(file, ctx.cwd);
     if (append && ctx.volume.existsSync(p)) {
       const existing = ctx.volume.readFileSync(p, "utf8");
+      if (existing.length + content.length > fileLimit) return fail(`tee: file size limit ${fileLimit} exceeded\n`);
       ctx.volume.writeFileSync(p, existing + content);
     } else {
       ctx.volume.writeFileSync(p, content);

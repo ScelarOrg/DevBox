@@ -1,5 +1,7 @@
 import type { VolumeSnapshot } from "../engine-types";
 import type { MemoryHandlerOptions } from "../memory-handler";
+import type { ShellOptions } from "../shell/shell-options";
+export type { ShellLimits, ShellOptions } from "../shell/shell-options";
 export type { PerformanceStats, PerformanceTiming } from "../performance-tracker";
 export type {
   NodepodProfileReport,
@@ -24,6 +26,8 @@ export type {
 /* ---- Boot options ---- */
 
 export interface NodepodOptions {
+  /** Shell policy shared by the pod's terminal and spawned processes. */
+  shell?: ShellOptions;
   /** Opt-in Nodepod subsystem profiling. Disabled by default. */
   profiler?: import("../profiling/types").ProfilerOptions;
   files?: Record<string, string | Uint8Array>;
@@ -145,7 +149,11 @@ export interface TerminalOptions {
   fontSize?: number;
   fontFamily?: string;
   prompt?: (cwd: string) => string;
+  /** Show the first prompt when the terminal is attached. Defaults to true. */
+  autoPrompt?: boolean;
   customCommands?: Record<string, (cwd: string, args: string[]) => string>;
+  /** Per-terminal shell policy overrides. */
+  shell?: ShellOptions;
 }
 
 /* ---- Filesystem ---- */
@@ -174,4 +182,6 @@ export interface SpawnOptions {
   cwd?: string;
   env?: Record<string, string>;
   signal?: AbortSignal;
+  /** Per-process shell policy overrides. */
+  shell?: ShellOptions;
 }

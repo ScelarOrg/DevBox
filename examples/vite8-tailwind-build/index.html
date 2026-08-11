@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Nodepod Vite 8 + Tailwind CSS 4 regression</title>
+    <style>
+      body { margin: 0; background: #111827; color: #e5e7eb; font: 14px monospace; }
+      main { max-width: 960px; margin: 32px auto; padding: 0 20px; }
+      pre { min-height: 360px; padding: 16px; overflow: auto; white-space: pre-wrap; background: #030712; border: 1px solid #374151; border-radius: 8px; }
+      .info { color: #93c5fd; }
+      .pass { color: #86efac; }
+      .fail { color: #fca5a5; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Vite 8.2 + Tailwind CSS 4</h1>
+      <p>Browser regression for Nodepod's asynchronous Lightning CSS WASM fallback.</p>
+      <pre id="output"></pre>
+    </main>
+
+    <script type="module">
+      import { Nodepod } from "/dist/index.mjs";
+
+      const output = document.getElementById("output");
+      const log = (text, className = "") => {
+        const line = document.createElement("div");
+        line.className = className;
+        line.textContent = text;
+        output.appendChild(line);
+      };
+
+      const files = {
+        "/project/package.json": JSON.stringify({
+          name: "nodepod-vite8-tailwind4-regression",
+          private: true,
+          type: "module",
+          scripts: { build: "vite build" },
+          dependencies: {
+            react: "^19.2.0",
+            "react-dom": "^19.2.0",
+          },
+          devDependencies: {
+            vite: "8.2.0",
+            "@vitejs/plugin-react": "^5.2.0",
+            "@tailwindcss/vite": "^4.1.0",
+            tailwindcss: "^4.1.0",
+          },
+        }, null, 2),
+        "/project/vite.config.js": `
+          import { defineConfig } from "vite";
+          import react from "@vitejs/plugin-react";
+          import tailwindcss from "@tailwindcss/vite";
+          export default defineConfig({ plugins: [react(), tailwindcss()] });
+        `,
+        "/project/index.html": `
+          <!doctype html>
+          <html><body><div id="root"></div><script type="module" src="/src/main.jsx"><\/script></body></html>
+        `,
+        "/project/src/main.jsx": `
+          import React from "react";
+          import { createRoot } from "react-dom/client";
+          import "./style.css";
+          createRoot(document.getElementById("root")).render(
+            React.createElement("main", { className: "mx-auto max-w-2xl p-8" },
+              React.createElement("h1", { className: "text-4xl font-bold text-cyan-400" }, "Tailwind CSS 4 is running"),
+              React.createElement("p", { className: "mt-4 text-slate-300" }, "Vite 8 reached Lightning CSS through Nodepod."),
+            ),
+          );
+        `,
+        "/project/src/style.css": `@import "tailwindcss";\n`,
+      };
+
+      try {
+        log("Booting Nodepod ...", "info");
+        const pod = await Nodepod.boot({ workdir: "/project", allowedFetchDomains: null });
+        await Promise.all(Object.entries(files).map(([path, content]) => pod.fs.writeFile(path, content)));
+
+        log("Installing Vite 8.2 + Tailwind CSS 4 ...", "info");
+        const install = await pod.spawn("npm", ["install"]);
+        install.on("output", (text) => log(text.trimEnd()));
+        install.on("error", (text) => log(text.trimEnd(), "fail"));
+        const installResult = await install.completion;
+        if (installResult.exitCode !== 0) throw new Error(`npm install failed (${installResult.exitCode})`);
+
+        log("Running vite build ...", "info");
+        const build = await pod.spawn("npm", ["run", "build"]);
+        build.on("output", (text) => log(text.trimEnd()));
+        build.on("error", (text) => log(text.trimEnd(), "fail"));
+        const buildResult = await build.completion;
+        if (buildResult.exitCode !== 0) throw new Error(`vite build failed (${buildResult.exitCode})`);
+
+        log("PASS: Vite 8.2 + Tailwind CSS 4 completed without an unready Lightning CSS WASM error.", "pass");
+      } catch (error) {
+        log(error?.stack || String(error), "fail");
+      }
+    </script>
+  </body>
+</html>

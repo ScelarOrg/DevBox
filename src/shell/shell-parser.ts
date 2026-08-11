@@ -133,6 +133,7 @@ export function expandGlob(
   pattern: string,
   cwd: string,
   volume: MemoryVolume,
+  options?: { dotglob?: boolean; maxEntries?: number; maxOperations?: number; maxPatternLength?: number },
 ): string[] {
   if (!pattern.includes("*") && !pattern.includes("?")) return [pattern];
 
@@ -149,10 +150,27 @@ export function expandGlob(
     filePattern = pattern.slice(lastSlash + 1);
   }
 
+  let entries: string[];
   try {
-    const entries = volume.readdirSync(dir);
+    entries = volume.readdirSync(dir);
+  } catch {
+    return [pattern];
+  }
+  if (filePattern.length > (options?.maxPatternLength ?? Infinity)) {
+    throw new Error("shell: glob pattern limit exceeded");
+  }
+  if (entries.length > (options?.maxEntries ?? Infinity)) {
+    throw new Error("shell: glob entry limit exceeded");
+  }
+  if (entries.length * Math.max(1, filePattern.length) > (options?.maxOperations ?? Infinity)) {
+    throw new Error("shell: glob operation limit exceeded");
+  }
+  try {
     const regex = globToRegex(filePattern);
-    const matches = entries.filter((e) => regex.test(e));
+    const matches = entries.filter((e) => {
+      if (!options?.dotglob && e.startsWith(".") && !filePattern.startsWith(".")) return false;
+      return regex.test(e);
+    });
 
     if (matches.length === 0) return [pattern];
 
@@ -166,10 +184,23 @@ export function expandGlob(
 
 function globToRegex(pattern: string): RegExp {
   let regex = "^";
-  for (const ch of pattern) {
-    if (ch === "*") regex += ".*";
+  for (let i = 0; i < pattern.length; i++) {
+    const ch = pattern[i];
+    if (ch === "*") {
+      regex += ".*";
+      while (pattern[i + 1] === "*") i++;
+    }
     else if (ch === "?") regex += ".";
-    else if (".+^${}()|[]\\".includes(ch)) regex += "\\" + ch;
+    else if (ch === "[") {
+      const end = pattern.indexOf("]", i + 1);
+      if (end < 0) regex += "\\[";
+      else {
+        let cls = pattern.slice(i + 1, end);
+        if (cls.startsWith("!")) cls = "^" + cls.slice(1);
+        regex += `[${cls}]`;
+        i = end;
+      }
+    } else if (".+^${}()|\\".includes(ch)) regex += "\\" + ch;
     else regex += ch;
   }
   regex += "$";

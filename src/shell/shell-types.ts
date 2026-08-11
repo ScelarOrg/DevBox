@@ -1,4 +1,5 @@
 import type { MemoryVolume } from "../memory-volume";
+import type { ShellLimits } from "./shell-options";
 
 /* ------------------------------------------------------------------ */
 /*  Result & context                                                   */
@@ -14,8 +15,13 @@ export interface ShellContext {
   cwd: string;
   env: Record<string, string>;
   volume: MemoryVolume;
+  signal?: AbortSignal;
+  limits?: ShellLimits;
   // run a sub-command through the shell (used by npm run, etc.)
-  exec: (cmd: string, opts?: { cwd?: string; env?: Record<string, string> }) => Promise<ShellResult>;
+  exec: (
+    cmd: string,
+    opts?: { cwd?: string; env?: Record<string, string>; signal?: AbortSignal },
+  ) => Promise<ShellResult>;
 }
 
 export interface ShellCommand {
@@ -33,6 +39,7 @@ export interface RedirectNode {
     | "append"
     | "read"
     | "stderr-to-stdout"
+    | "stdout-to-stderr"
     | "stderr-write"
     | "stderr-append";
   target: string; // file path (empty for 2>&1)

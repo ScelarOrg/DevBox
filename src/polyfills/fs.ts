@@ -10,7 +10,10 @@ import type {
 } from "../memory-volume";
 import { makeSystemError } from "../memory-volume";
 import { precompileWasm } from "../helpers/wasm-cache";
-import { prefetchWasmFromCdn } from "../helpers/wasm-cdn";
+import {
+  prefetchWasmFromCdn,
+  resolveWasmAssetPath,
+} from "../helpers/wasm-cdn";
 import { Readable, Writable } from "./stream";
 import { Buffer } from "./buffer";
 import type { FsReadStreamInstance, FsWriteStreamInstance, FsReadableState, FsWritableState } from "../types/fs-streams";
@@ -1695,10 +1698,14 @@ export function buildFileSystemBridge(
       let enc: string | undefined;
       if (typeof encOrOpts === "string") enc = encOrOpts;
       else if (encOrOpts?.encoding) enc = encOrOpts.encoding ?? undefined;
+      const wasmPath =
+        p.endsWith(".wasm") && p.includes("/node_modules/")
+          ? resolveWasmAssetPath(volume, p)
+          : p;
 
       try {
-        const raw = volume.readFileSync(p);
-        if (p.endsWith(".wasm")) precompileWasm(raw);
+        const raw = volume.readFileSync(wasmPath);
+        if (wasmPath.endsWith(".wasm")) precompileWasm(raw);
         return decodeBytes(raw, enc);
       } catch (err: any) {
         // .wasm under node_modules missing from the VFS (e.g. >15MB binary
@@ -1712,7 +1719,7 @@ export function buildFileSystemBridge(
           console.warn(
             `[nodepod] ${p} not in VFS — fetching from CDN in the background; the next read will succeed once it lands`,
           );
-          prefetchWasmFromCdn(volume, p).catch(() => {});
+          prefetchWasmFromCdn(volume, wasmPath).catch(() => {});
         }
         throw err;
       }

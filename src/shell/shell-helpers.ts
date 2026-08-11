@@ -34,6 +34,60 @@ export const fail = (stderr: string, code = 1): ShellResult => ({
 export const EXIT_OK: ShellResult = { stdout: "", stderr: "", exitCode: 0 };
 export const EXIT_FAIL: ShellResult = { stdout: "", stderr: "", exitCode: 1 };
 
+/**
+ * Yield to the browser task queue so timers, input, and AbortSignal handlers
+ * can run during large virtual-shell operations. A resolved Promise only
+ * yields to the microtask queue and can still starve the page indefinitely.
+ */
+export async function yieldToEventLoop(signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) throw new Error("shell: command cancelled");
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  if (signal?.aborted) throw new Error("shell: command cancelled");
+}
+
+const MAX_TIMER_DELAY_MS = 0x7fffffff;
+
+/** Schedule delays longer than the browser's 32-bit setTimeout range safely. */
+export function scheduleLongTimeout(callback: () => void, delayMs: number): () => void {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let cancelled = false;
+  const deadline = Date.now() + delayMs;
+  const schedule = () => {
+    if (cancelled) return;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      callback();
+      return;
+    }
+    timer = setTimeout(schedule, Math.min(remaining, MAX_TIMER_DELAY_MS));
+  };
+  schedule();
+  return () => {
+    cancelled = true;
+    if (timer) clearTimeout(timer);
+  };
+}
+
+export function waitForShellDelay(delayMs: number, signal?: AbortSignal): Promise<boolean> {
+  return new Promise((resolve) => {
+    if (signal?.aborted) {
+      resolve(false);
+      return;
+    }
+    let cancelTimer = () => {};
+    const onAbort = () => {
+      cancelTimer();
+      signal?.removeEventListener("abort", onAbort);
+      resolve(false);
+    };
+    cancelTimer = scheduleLongTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve(true);
+    }, delayMs);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 /* ------------------------------------------------------------------ */
 /*  Date / time constants                                              */
 /* ------------------------------------------------------------------ */
@@ -244,7 +298,60 @@ export function humanSize(bytes: number): string {
 
 export function globToRegex(pattern: string): string {
   return pattern
+    .replace(/\*+/g, "*")
     .replace(/[.+^${}()|[\]\\]/g, "\\$&")
     .replace(/\*/g, ".*")
     .replace(/\?/g, ".");
+}
+
+/** Reject the most common catastrophic-backtracking shape before using JS RegExp. */
+export function regexSafetyError(pattern: string, maxLength = 64 * 1024): string | null {
+  if (pattern.length > maxLength) return "regular expression exceeds " + maxLength + " characters";
+
+  const groups: Array<{ containsQuantifier: boolean }> = [];
+  let inClass = false;
+  let escaped = false;
+  let closedGroup: { containsQuantifier: boolean } | null = null;
+  for (let i = 0; i < pattern.length; i++) {
+    const char = pattern[i];
+    if (escaped) {
+      escaped = false;
+      closedGroup = null;
+      continue;
+    }
+    if (char === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (char === "[") {
+      inClass = true;
+      closedGroup = null;
+      continue;
+    }
+    if (char === "]" && inClass) {
+      inClass = false;
+      closedGroup = null;
+      continue;
+    }
+    if (inClass) continue;
+    if (char === "(") {
+      groups.push({ containsQuantifier: false });
+      closedGroup = null;
+      continue;
+    }
+    if (char === ")") {
+      closedGroup = groups.pop() ?? null;
+      continue;
+    }
+
+    const brace = char === "{" ? pattern.slice(i).match(/^\{\d+(?:,\d*)?\}/)?.[0] : undefined;
+    const quantified = char === "*" || char === "+" || (char === "?" && pattern[i - 1] !== "(") || brace !== undefined;
+    if (quantified) {
+      if (closedGroup?.containsQuantifier) return "regular expression has unsafe nested repetition";
+      if (groups.length > 0) groups[groups.length - 1].containsQuantifier = true;
+      if (brace) i += brace.length - 1;
+    }
+    closedGroup = null;
+  }
+  return null;
 }

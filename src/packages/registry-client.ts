@@ -36,7 +36,7 @@ export interface RegistryConfig {
 }
 
 import { NPM_REGISTRY_URL } from "../constants/config";
-import { proxiedFetch } from "../cross-origin";
+import { getProxy, proxiedFetch } from "../cross-origin";
 import type { NodepodProfilerImpl } from "../profiling/profiler";
 
 const NPM_REGISTRY_BASE = NPM_REGISTRY_URL;
@@ -143,14 +143,27 @@ export class RegistryClient {
     // Avoid If-None-Match: it triggers a CORS preflight, and npm's OPTIONS /
     // scoped-404 responses often omit Access-Control-Allow-Origin. Local TTL
     // above is enough for browser caching.
+    const requestInit: RequestInit = {
+      headers: {
+        Accept:
+          "application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8",
+      },
+    };
     let resp: Response;
+    let proxyFallbackFailed: string | null = null;
     try {
-      resp = await proxiedFetch(requestUrl, {
-        headers: {
-          Accept:
-            "application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8",
-        },
-      });
+      resp = await proxiedFetch(requestUrl, requestInit);
+      // Some configured CORS proxies return a synthetic 404 when they are
+      // unavailable. Retry the registry directly so a real package (React is
+      // the common example) is not reported as missing.
+      if (resp.status === 404 && getProxy()) {
+        try {
+          resp = await fetch(requestUrl, requestInit);
+        } catch (error) {
+          proxyFallbackFailed =
+            error instanceof Error ? error.message : String(error);
+        }
+      }
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       throw new Error(
@@ -160,6 +173,12 @@ export class RegistryClient {
     }
 
     if (resp.status === 404) {
+      if (proxyFallbackFailed) {
+        throw new Error(
+          `Configured CORS proxy returned HTTP 404 for package "${name}"; ` +
+            `the direct registry request also failed (${proxyFallbackFailed}).`,
+        );
+      }
       throw new Error(`Package "${name}" does not exist in the registry`);
     }
     if (!resp.ok) {

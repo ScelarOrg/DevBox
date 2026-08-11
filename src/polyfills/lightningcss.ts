@@ -35,6 +35,10 @@ export const Features = {
 let wasmMod: any = null;
 let initPromise: Promise<void> | null = null;
 
+export function isReady(): boolean {
+  return wasmMod !== null;
+}
+
 async function ensureInit(): Promise<void> {
   if (wasmMod) return;
   if (initPromise) return initPromise;
@@ -58,9 +62,9 @@ async function ensureInit(): Promise<void> {
 }
 
 // No eager init at bundle import: the ~16MB WASM only loads when something
-// actually uses lightningcss. The script engine's native-package fallback
-// syncAwaits init() before handing this polyfill to the requiring module,
-// so the sync APIs (transform, bundle, ...) are ready by then.
+// actually uses lightningcss. The script engine's async module loader awaits
+// init() before retrying a module that requires this polyfill, so the sync APIs
+// (transform, bundle, ...) are ready by the time the requiring module runs.
 
 function requireInit(): void {
   if (!wasmMod) throw new Error("lightningcss: WASM not ready yet — call await init() first");
@@ -106,5 +110,6 @@ export default {
   composeVisitors,
   Features,
   browserslistToTargets,
+  isReady,
   init: ensureInit,
 };

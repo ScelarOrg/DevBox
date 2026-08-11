@@ -1,6 +1,8 @@
 // Worker Protocol — typed messages for main<->worker communication.
 // Flows via postMessage. Binary data (VFS snapshots) transferred zero-copy.
 
+import type { ShellOptions } from "../shell/shell-options";
+
 // --- VFS snapshot (binary transfer) ---
 
 export interface VFSBinarySnapshot {
@@ -32,6 +34,7 @@ export interface MainToWorker_Init {
   pid: number;
   cwd: string;
   env: Record<string, string>;
+  shell?: ShellOptions;
   snapshot: VFSBinarySnapshot;
   syncBuffer?: SharedArrayBuffer;
   // tab-side fs proxy ports, one per WASI worker the spawned process will
@@ -254,9 +257,16 @@ export interface WorkerToMain_SpawnRequest {
   args: string[];
   cwd: string;
   env: Record<string, string>;
+  shell?: ShellOptions;
   // legacy single-string form or node's [stdin, stdout, stderr] array.
   // main normalizes either shape via stdioInheritsStdin().
   stdio: "pipe" | "inherit" | Array<"pipe" | "inherit" | "ignore">;
+}
+
+export interface WorkerToMain_ChildSignal {
+  type: "child-signal";
+  requestId: number;
+  signal: string;
 }
 
 export interface WorkerToMain_ForkRequest {
@@ -407,6 +417,7 @@ export type WorkerToMainMessage =
   | WorkerToMain_VFSDelete
   | WorkerToMain_VFSSnapshot
   | WorkerToMain_SpawnRequest
+  | WorkerToMain_ChildSignal
   | WorkerToMain_ForkRequest
   | WorkerToMain_WorkerThreadRequest
   | WorkerToMain_WasiWorkerRequest
@@ -432,6 +443,7 @@ export interface SpawnConfig {
   args: string[];
   cwd: string;
   env: Record<string, string>;
+  shell?: ShellOptions;
   snapshot: VFSBinarySnapshot;
   syncBuffer?: SharedArrayBuffer;
   parentPid?: number;

@@ -103,4 +103,39 @@ describe("node headless host", () => {
 
     pod.teardown();
   }, 60_000);
+
+  it("propagates cwd through nested pnpm run scripts", async () => {
+    setRuntimeHost(
+      createNodeHost({
+        workerPath,
+        httpHost: "127.0.0.1",
+        httpPort: 0,
+      }),
+    );
+
+    const pod = await Nodepod.boot({
+      workdir: "/workspace",
+      packageStore: "memory",
+      enableSnapshotCache: false,
+      files: {
+        "/workspace/package.json": JSON.stringify({
+          name: "cwd-probe",
+          version: "1.0.0",
+          scripts: {
+            "print-cwd": 'node -e "console.log(process.cwd())"',
+          },
+        }),
+      },
+    });
+
+    const child = await pod.spawn(
+      "sh",
+      ["-c", "pnpm run print-cwd"],
+      { cwd: "/workspace" },
+    );
+    const result = await child.completion;
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toBe("/workspace");
+    pod.teardown();
+  }, 60_000);
 });

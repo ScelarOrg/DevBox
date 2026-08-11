@@ -33,6 +33,7 @@ import type {
 let _pid = 0;
 let _cwd = "/";
 let _env: Record<string, string> = {};
+let _shellOptions: import("../shell/shell-options").ShellOptions | undefined;
 let _volume: MemoryVolume | null = null;
 let _initialized = false;
 let _abortController: AbortController | null = null;
@@ -262,6 +263,7 @@ async function handleInit(msg: MainToWorker_Init): Promise<void> {
   _pid = msg.pid;
   _cwd = msg.cwd || "/";
   _env = msg.env || {};
+  _shellOptions = msg.shell;
 
   _volume = MemoryVolume.fromBinarySnapshot(msg.snapshot);
   _volume.setBulkMountHandler((snapshot) => {
@@ -343,7 +345,7 @@ async function ensureShell(): Promise<typeof import("../polyfills/child_process"
     setChildProcessPolyfill(_shellMod);
   }
   if (!_shellInitialized && _volume) {
-    _shellMod.initShellExec(_volume, { cwd: _cwd, env: _env });
+    _shellMod.initShellExec(_volume, { cwd: _cwd, env: _env, shell: _shellOptions });
     if (_syncChannelWorker) {
       _shellMod.setSyncChannel(_syncChannelWorker);
     }
@@ -526,7 +528,7 @@ async function handleFileExec(msg: MainToWorker_Exec): Promise<void> {
       cwd: _cwd,
       env: _env,
       volume: _volume!,
-      exec: async (cmd: string, opts?: { cwd?: string; env?: Record<string, string> }) => {
+      exec: async (cmd: string, opts?: { cwd?: string; env?: Record<string, string>; signal?: AbortSignal }) => {
         // needed for ShellContext type compat
         return new Promise<{ stdout: string; stderr: string; exitCode: number }>((resolve) => {
           shell.exec(cmd, opts ?? {}, (error: any, stdout: any, stderr: any) => {
@@ -865,7 +867,7 @@ export function forkChild(
     onIPC?: (data: unknown) => void;
     onExit?: (exitCode: number) => void;
   },
-): { sendIPC: (data: unknown) => void; disconnect: () => void; requestId: number } {
+): { sendIPC: (data: unknown) => void; disconnect: () => void; kill: (signal?: string) => boolean; requestId: number } {
   const requestId = _nextRequestId++;
 
   if (opts.onIPC) {
@@ -914,8 +916,10 @@ export function forkChild(
     },
     disconnect: () => {
       _ipcCallbacks.delete(requestId);
-      _childOutputCallbacks.delete(requestId);
-      _childExitCallbacks.delete(requestId);
+    },
+    kill: (signal = "SIGTERM") => {
+      post({ type: "child-signal", requestId, signal });
+      return true;
     },
   };
 }
@@ -1024,9 +1028,9 @@ export function spawnChild(
     onStdout?: (data: string) => void;
     onStderr?: (data: string) => void;
   },
-): Promise<{ pid: number; exitCode: number; stdout: string; stderr: string }> {
-  return new Promise((resolve, reject) => {
-    const requestId = _nextRequestId++;
+): import("../polyfills/child_process").SpawnChildOperation {
+  const requestId = _nextRequestId++;
+  const operation = new Promise<{ pid: number; exitCode: number; stdout: string; stderr: string }>((resolve, reject) => {
     let stdout = "";
     let stderr = "";
 
@@ -1063,7 +1067,14 @@ export function spawnChild(
       args,
       cwd: opts?.cwd || _cwd,
       env: opts?.env || _env,
+      shell: _shellOptions,
       stdio: opts?.stdio || "pipe",
     });
+  });
+  return Object.assign(operation, {
+    kill(signal = "SIGTERM"): boolean {
+      post({ type: "child-signal", requestId, signal });
+      return true;
+    },
   });
 }

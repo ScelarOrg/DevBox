@@ -83,6 +83,14 @@ export function createNodeCommand(deps: PmDeps): ShellCommand {
             exitCode: 1,
           };
         }
+        const sourceLimit = ctx.limits?.maxExpansionBytes ?? 1024 * 1024;
+        if (source.length > sourceLimit) {
+          return {
+            stdout: "",
+            stderr: `node: source exceeds ${sourceLimit} characters\n`,
+            exitCode: 1,
+          };
+        }
         if (isTypeScriptFile(fullPath)) {
           source = stripTypeScript(source, fullPath);
         }

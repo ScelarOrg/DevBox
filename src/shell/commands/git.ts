@@ -3,7 +3,7 @@
 
 import type { ShellCommand, ShellContext, ShellResult } from "../shell-types";
 import type { MemoryVolume } from "../../memory-volume";
-import { ok, fail, RESET, DIM, GREEN, BOLD_RED, CYAN } from "../shell-helpers";
+import { ok, fail, RESET, DIM, GREEN, BOLD_RED, CYAN, yieldToEventLoop } from "../shell-helpers";
 import { VERSIONS } from "../../constants/config";
 import { proxiedFetch } from "../../cross-origin";
 import * as pathModule from "../../polyfills/path";
@@ -72,7 +72,7 @@ interface DiffHunk {
 /* ------------------------------------------------------------------ */
 
 // Myers O(ND) diff with backtracking
-function myersDiff(oldLines: string[], newLines: string[]): EditOp[] {
+function myersDiff(oldLines: string[], newLines: string[], workLimit = 100_000): EditOp[] {
   const N = oldLines.length;
   const M = newLines.length;
   const MAX = N + M;
@@ -84,12 +84,19 @@ function myersDiff(oldLines: string[], newLines: string[]): EditOp[] {
   v.set(1, 0);
 
   let foundD = -1;
+  let work = 0;
+  const account = (amount = 1) => {
+    work += amount;
+    if (work > workLimit) throw new Error(`diff work limit ${workLimit} exceeded`);
+  };
 
   outer:
   for (let d = 0; d <= MAX; d++) {
+    account(v.size);
     vHistory.push(new Map(v));
 
     for (let k = -d; k <= d; k += 2) {
+      account();
       let x: number;
       if (k === -d || (k !== d && (v.get(k - 1) ?? 0) < (v.get(k + 1) ?? 0))) {
         x = v.get(k + 1) ?? 0;
@@ -99,6 +106,7 @@ function myersDiff(oldLines: string[], newLines: string[]): EditOp[] {
       let y = x - k;
 
       while (x < N && y < M && oldLines[x] === newLines[y]) {
+        account();
         x++;
         y++;
       }
@@ -247,7 +255,12 @@ class GitRepo {
   readonly gitDir: string;
   readonly workDir: string;
 
-  constructor(vol: MemoryVolume, workDir: string, gitDir: string) {
+  constructor(
+    vol: MemoryVolume,
+    workDir: string,
+    gitDir: string,
+    private readonly maxFilesystemEntries = 10_000,
+  ) {
     this.vol = vol;
     this.workDir = workDir;
     this.gitDir = gitDir;
@@ -807,26 +820,36 @@ class GitRepo {
 
   /* -- file tree walker -- */
 
-  walkWorkTree(dir: string, prefix: string, cb: (relPath: string, content: string) => void): void {
-    let entries: string[];
-    try {
-      entries = this.vol.readdirSync(dir) as string[];
-    } catch {
-      return;
-    }
-    for (const name of entries) {
-      if (name === ".git" || name === "node_modules") continue;
-      const fullPath = dir + "/" + name;
-      try {
-        const stat = this.vol.statSync(fullPath);
+  walkWorkTree(
+    dir: string,
+    prefix: string,
+    cb: (relPath: string, content: string) => void,
+    state: { entries: number } = { entries: 0 },
+  ): void {
+    const pending = [{ dir, prefix }];
+    while (pending.length > 0) {
+      const current = pending.pop()!;
+      let entries: string[];
+      try { entries = this.vol.readdirSync(current.dir) as string[]; }
+      catch { continue; }
+      for (const name of entries) {
+        if (name === ".git" || name === "node_modules") continue;
+        if (++state.entries > this.maxFilesystemEntries) {
+          throw new Error(`filesystem entry limit ${this.maxFilesystemEntries} exceeded`);
+        }
+        const fullPath = current.dir + "/" + name;
+        let stat: ReturnType<MemoryVolume["lstatSync"]>;
+        try { stat = this.vol.lstatSync(fullPath); } catch { continue; }
+        const relPath = current.prefix ? current.prefix + "/" + name : name;
         if (stat.isDirectory()) {
-          this.walkWorkTree(fullPath, prefix ? prefix + "/" + name : name, cb);
+          pending.push({ dir: fullPath, prefix: relPath });
         } else if (stat.isFile()) {
-          const relPath = prefix ? prefix + "/" + name : name;
-          const content = this.vol.readFileSync(fullPath, "utf8" as any) as string;
+          let content: string;
+          try { content = this.vol.readFileSync(fullPath, "utf8" as any) as string; }
+          catch { continue; }
           cb(relPath, content);
         }
-      } catch { /* skip unreadable */ }
+      }
     }
   }
 
@@ -871,6 +894,8 @@ async function githubApi(
   token: string,
   method = "GET",
   body?: any,
+  signal?: AbortSignal,
+  maxResponseBytes = 4 * 1024 * 1024,
 ): Promise<{ ok: boolean; status: number; data: any }> {
   const url = `https://api.github.com${path}`;
   const headers: Record<string, string> = {
@@ -878,21 +903,81 @@ async function githubApi(
     Authorization: `token ${token}`,
     "User-Agent": "nodepod-git",
   };
-  if (body) headers["Content-Type"] = "application/json";
-
-  const resp = await proxiedFetch(url, {
-    method,
-    headers,
-    body: body ? JSON.stringify(body) : undefined,
-  });
-
-  let data: any;
-  try {
-    data = await resp.json();
-  } catch {
-    data = null;
+  const requestBody = body ? JSON.stringify(body) : undefined;
+  if (requestBody && requestBody.length > maxResponseBytes) {
+    throw new Error(`GitHub request exceeds ${maxResponseBytes} bytes`);
   }
-  return { ok: resp.ok, status: resp.status, data };
+  if (requestBody) headers["Content-Type"] = "application/json";
+
+  const controller = new AbortController();
+  const onAbort = () => controller.abort(signal?.reason);
+  if (signal?.aborted) onAbort();
+  else signal?.addEventListener("abort", onAbort, { once: true });
+  const timer = setTimeout(() => controller.abort(new Error("GitHub request timed out")), 30_000);
+  try {
+    const resp = await proxiedFetch(url, {
+      method,
+      headers,
+      body: requestBody,
+      signal: controller.signal,
+    });
+
+    const declaredLength = Number(resp.headers?.get?.("content-length") ?? 0);
+    if (Number.isFinite(declaredLength) && declaredLength > maxResponseBytes) {
+      throw new Error(`GitHub response exceeds ${maxResponseBytes} bytes`);
+    }
+    let data: any;
+    try {
+      if (resp.body?.getReader) {
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let raw = "";
+        let bytes = 0;
+        for (;;) {
+          const chunk = await reader.read();
+          if (chunk.done) break;
+          bytes += chunk.value.byteLength;
+          if (bytes > maxResponseBytes) {
+            await reader.cancel();
+            throw new Error(`GitHub response exceeds ${maxResponseBytes} bytes`);
+          }
+          raw += decoder.decode(chunk.value, { stream: true });
+        }
+        raw += decoder.decode();
+        data = raw ? JSON.parse(raw) : null;
+      } else if (typeof resp.text === "function") {
+        const raw = await resp.text();
+        if (raw.length > maxResponseBytes) throw new Error(`GitHub response exceeds ${maxResponseBytes} bytes`);
+        data = raw ? JSON.parse(raw) : null;
+      } else {
+        data = await resp.json();
+      }
+    } catch (error) {
+      if (controller.signal.aborted) throw controller.signal.reason;
+      if (error instanceof Error && error.message.includes("response exceeds")) throw error;
+      data = null;
+    }
+    return { ok: resp.ok, status: resp.status, data };
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", onAbort);
+  }
+}
+
+function isSafeRepositoryPath(value: unknown): value is string {
+  if (typeof value !== "string" || value.length === 0 || value.startsWith("/") || value.includes("\0")) return false;
+  return value.split("/").every((part) => part.length > 0 && part !== "." && part !== "..");
+}
+
+function githubApiFor(ctx: ShellContext): typeof githubApi {
+  return (path, token, method = "GET", body) => githubApi(
+    path,
+    token,
+    method,
+    body,
+    ctx.signal,
+    ctx.limits?.maxOutputBytes ?? 4 * 1024 * 1024,
+  );
 }
 
 /* ------------------------------------------------------------------ */
@@ -1242,7 +1327,7 @@ function gitDiff(args: string[], ctx: ShellContext): ShellResult {
     for (const d of diffs) {
       const oldLines = d.oldContent ? d.oldContent.split("\n") : [];
       const newLines = d.newContent ? d.newContent.split("\n") : [];
-      const ops = myersDiff(oldLines, newLines);
+      const ops = myersDiff(oldLines, newLines, ctx.limits?.maxLoopIterations);
       const { insertions: ins, deletions: del } = countChanges(ops);
       totalIns += ins;
       totalDel += del;
@@ -1267,7 +1352,7 @@ function gitDiff(args: string[], ctx: ShellContext): ShellResult {
     out += `--- ${d.status === "added" ? "/dev/null" : "a/" + d.path}\n`;
     out += `+++ ${d.status === "deleted" ? "/dev/null" : "b/" + d.path}\n`;
 
-    const ops = myersDiff(oldLines, newLines);
+    const ops = myersDiff(oldLines, newLines, ctx.limits?.maxLoopIterations);
     const hunks = buildHunks(ops, 3);
 
     for (const hunk of hunks) {
@@ -1911,7 +1996,7 @@ function gitShow(args: string[], ctx: ShellContext): ShellResult {
       const oldC = oldH ? repo.getBlobContent(oldH) ?? "" : "";
       const newC = newH ? repo.getBlobContent(newH) ?? "" : "";
       out += `${BOLD}diff --git a/${path} b/${path}${RESET}\n`;
-      const ops = myersDiff(oldC.split("\n"), newC.split("\n"));
+      const ops = myersDiff(oldC.split("\n"), newC.split("\n"), ctx.limits?.maxLoopIterations);
       for (const hunk of buildHunks(ops, 3)) {
         out += `${CYAN}@@ -${hunk.oldStart},${hunk.oldCount} +${hunk.newStart},${hunk.newCount} @@${RESET}\n`;
         for (const op of hunk.lines) {
@@ -2013,31 +2098,38 @@ function gitClean(args: string[], ctx: ShellContext): ShellResult {
   }
   if (dirs && !dryRun) {
     // best-effort: remove empty dirs under workDir (except .git)
-    const tryRmEmpty = (dir: string) => {
+    let cleanEntries = 0;
+    const cleanLimit = Math.min(ctx.limits?.maxFilesystemEntries ?? 100_000, 10_000);
+    const pending = [repo.workDir];
+    const visitedDirs: string[] = [];
+    while (pending.length > 0) {
+      const dir = pending.pop()!;
+      visitedDirs.push(dir);
       let entries: string[];
       try {
         entries = ctx.volume.readdirSync(dir) as string[];
       } catch {
-        return;
+        continue;
       }
       for (const name of entries) {
         if (name === ".git") continue;
+        if (++cleanEntries > cleanLimit) throw new Error(`filesystem entry limit ${cleanLimit} exceeded`);
         const full = dir + "/" + name;
-        try {
-          if (ctx.volume.statSync(full).isDirectory()) tryRmEmpty(full);
-        } catch {
-          /* */
-        }
+        let stat: ReturnType<MemoryVolume["lstatSync"]>;
+        try { stat = ctx.volume.lstatSync(full); } catch { continue; }
+        if (stat.isDirectory()) pending.push(full);
       }
-      if (dir === repo.workDir) return;
+    }
+    for (let index = visitedDirs.length - 1; index >= 0; index--) {
+      const dir = visitedDirs[index];
+      if (dir === repo.workDir) continue;
       try {
         const left = ctx.volume.readdirSync(dir) as string[];
         if (left.length === 0) ctx.volume.rmdirSync(dir);
       } catch {
         /* */
       }
-    };
-    tryRmEmpty(repo.workDir);
+    }
   }
   return ok(out);
 }
@@ -2166,7 +2258,6 @@ function gitBlame(args: string[], ctx: ShellContext): ShellResult {
     if (oldC !== newC) {
       const newLines = newC.split("\n");
       if (newLines.length && newLines[newLines.length - 1] === "") newLines.pop();
-      const ops = myersDiff(oldC.split("\n").filter((_, idx, arr) => !(idx === arr.length - 1 && arr[idx] === "")), newLines);
       // simpler: if line content appears in this commit's file and differs from previous, attribute
       for (let li = 0; li < lines.length; li++) {
         if (newLines[li] === lines[li] && (oldC.split("\n")[li] !== lines[li] || !prevTree.has(relPath))) {
@@ -2470,6 +2561,7 @@ function requireToken(env: Record<string, string>): string | null {
 }
 
 async function gitClone(args: string[], ctx: ShellContext): Promise<ShellResult> {
+  const request = githubApiFor(ctx);
   const nonFlags = args.filter((a) => !a.startsWith("-"));
   const url = nonFlags[0];
   if (!url) return fail("usage: git clone <repository> [<directory>]\n");
@@ -2492,7 +2584,7 @@ async function gitClone(args: string[], ctx: ShellContext): Promise<ShellResult>
   let targetDir = nonFlags[1] ?? gh.repo;
   if (!targetDir.startsWith("/")) targetDir = pathModule.resolve(ctx.cwd, targetDir);
 
-  const repoInfo = await githubApi(`/repos/${gh.owner}/${gh.repo}`, token);
+  const repoInfo = await request(`/repos/${gh.owner}/${gh.repo}`, token);
   if (!repoInfo.ok) {
     if (repoInfo.status === 404) return fail(`fatal: repository '${url}' not found\n`, 128);
     return fail(`fatal: GitHub API error: ${repoInfo.status} ${repoInfo.data?.message ?? ""}\n`, 128);
@@ -2500,34 +2592,42 @@ async function gitClone(args: string[], ctx: ShellContext): Promise<ShellResult>
   const defaultBranch = repoInfo.data.default_branch ?? "main";
   if (branch === "main" && defaultBranch !== "main") branch = defaultBranch;
 
-  const refResp = await githubApi(`/repos/${gh.owner}/${gh.repo}/git/ref/heads/${branch}`, token);
+  const refResp = await request(`/repos/${gh.owner}/${gh.repo}/git/ref/heads/${branch}`, token);
   if (!refResp.ok) {
     return fail(`fatal: Remote branch '${branch}' not found\n`, 128);
   }
   const commitSha = refResp.data.object.sha;
 
-  const commitResp = await githubApi(`/repos/${gh.owner}/${gh.repo}/git/commits/${commitSha}`, token);
+  const commitResp = await request(`/repos/${gh.owner}/${gh.repo}/git/commits/${commitSha}`, token);
   if (!commitResp.ok) return fail(`fatal: could not fetch commit\n`, 128);
   const treeSha = commitResp.data.tree.sha;
 
-  const treeResp = await githubApi(`/repos/${gh.owner}/${gh.repo}/git/trees/${treeSha}?recursive=1`, token);
+  const treeResp = await request(`/repos/${gh.owner}/${gh.repo}/git/trees/${treeSha}?recursive=1`, token);
   if (!treeResp.ok) return fail(`fatal: could not fetch tree\n`, 128);
+  const treeItems = Array.isArray(treeResp.data?.tree) ? treeResp.data.tree : [];
+  const entryLimit = ctx.limits?.maxFilesystemEntries ?? 100_000;
+  if (treeItems.length > entryLimit) return fail(`fatal: repository exceeds ${entryLimit} entries\n`, 128);
 
   if (!ctx.volume.existsSync(targetDir)) ctx.volume.mkdirSync(targetDir, { recursive: true });
 
   let fileCount = 0;
   const blobs: Array<{ path: string; sha: string }> = [];
-  for (const item of treeResp.data.tree) {
+  for (const item of treeItems) {
     if (item.type === "blob") {
+      if (!isSafeRepositoryPath(item.path)) return fail("fatal: remote contains an unsafe path\n", 128);
       blobs.push({ path: item.path, sha: item.sha });
     }
   }
 
   const BATCH_SIZE = 10;
+  const repositoryByteLimit = (ctx.limits?.maxOutputBytes ?? 4 * 1024 * 1024) * 32;
+  let repositoryBytes = 0;
   for (let i = 0; i < blobs.length; i += BATCH_SIZE) {
+    if (ctx.signal?.aborted) return fail("fatal: clone cancelled\n", 130);
+    if (i > 0) await yieldToEventLoop(ctx.signal);
     const batch = blobs.slice(i, i + BATCH_SIZE);
     const results = await Promise.all(
-      batch.map((b) => githubApi(`/repos/${gh.owner}/${gh.repo}/git/blobs/${b.sha}`, token)),
+      batch.map((b) => request(`/repos/${gh.owner}/${gh.repo}/git/blobs/${b.sha}`, token)),
     );
     for (let j = 0; j < batch.length; j++) {
       const blobResp = results[j];
@@ -2540,6 +2640,10 @@ async function gitClone(args: string[], ctx: ShellContext): Promise<ShellResult>
         content = atob(blobResp.data.content.replace(/\n/g, ""));
       } else {
         content = blobResp.data.content;
+      }
+      repositoryBytes += content.length;
+      if (repositoryBytes > repositoryByteLimit) {
+        return fail(`fatal: repository data exceeds ${repositoryByteLimit} bytes\n`, 128);
       }
       ctx.volume.writeFileSync(filePath, content);
       fileCount++;
@@ -2587,6 +2691,7 @@ async function gitClone(args: string[], ctx: ShellContext): Promise<ShellResult>
 }
 
 async function gitPush(args: string[], ctx: ShellContext): Promise<ShellResult> {
+  const request = githubApiFor(ctx);
   const r = requireRepo(ctx.volume, ctx.cwd);
   if ("error" in r) return r.error;
   const { repo } = r;
@@ -2612,15 +2717,22 @@ async function gitPush(args: string[], ctx: ShellContext): Promise<ShellResult> 
   const commitTree = repo.getCommitTree(headHash);
   const blobShas: Map<string, string> = new Map();
 
+  let pushed = 0;
   for (const [path, localHash] of commitTree) {
+    if (ctx.signal?.aborted) return fail("fatal: push cancelled\n", 130);
+    if (pushed > 0 && (pushed & 31) === 0) await yieldToEventLoop(ctx.signal);
     const content = repo.getBlobContent(localHash);
     if (content === null) continue;
-    const blobResp = await githubApi(`/repos/${gh.owner}/${gh.repo}/git/blobs`, token, "POST", {
+    if (content.length > (ctx.limits?.maxOutputBytes ?? 4 * 1024 * 1024)) {
+      return fail(`fatal: blob '${path}' exceeds request size limit\n`, 128);
+    }
+    const blobResp = await request(`/repos/${gh.owner}/${gh.repo}/git/blobs`, token, "POST", {
       content: btoa(content),
       encoding: "base64",
     });
     if (!blobResp.ok) return fail(`fatal: failed to create blob for ${path}: ${blobResp.data?.message}\n`, 128);
     blobShas.set(path, blobResp.data.sha);
+    pushed++;
   }
 
   const treeEntries = Array.from(blobShas).map(([path, sha]) => ({
@@ -2629,13 +2741,13 @@ async function gitPush(args: string[], ctx: ShellContext): Promise<ShellResult> 
     type: "blob",
     sha,
   }));
-  const treeResp = await githubApi(`/repos/${gh.owner}/${gh.repo}/git/trees`, token, "POST", {
+  const treeResp = await request(`/repos/${gh.owner}/${gh.repo}/git/trees`, token, "POST", {
     tree: treeEntries,
   });
   if (!treeResp.ok) return fail(`fatal: failed to create tree: ${treeResp.data?.message}\n`, 128);
 
   let parentSha: string | null = null;
-  const refResp = await githubApi(`/repos/${gh.owner}/${gh.repo}/git/ref/heads/${remoteBranch}`, token);
+  const refResp = await request(`/repos/${gh.owner}/${gh.repo}/git/ref/heads/${remoteBranch}`, token);
   if (refResp.ok) parentSha = refResp.data.object.sha;
 
   const commit = repo.readCommit(headHash);
@@ -2645,12 +2757,12 @@ async function gitPush(args: string[], ctx: ShellContext): Promise<ShellResult> 
   };
   if (parentSha) commitBody.parents = [parentSha];
 
-  const commitResp = await githubApi(`/repos/${gh.owner}/${gh.repo}/git/commits`, token, "POST", commitBody);
+  const commitResp = await request(`/repos/${gh.owner}/${gh.repo}/git/commits`, token, "POST", commitBody);
   if (!commitResp.ok) return fail(`fatal: failed to create commit: ${commitResp.data?.message}\n`, 128);
 
   if (parentSha) {
     const force = args.includes("-f") || args.includes("--force");
-    const updateResp = await githubApi(
+    const updateResp = await request(
       `/repos/${gh.owner}/${gh.repo}/git/refs/heads/${remoteBranch}`,
       token,
       "PATCH",
@@ -2658,7 +2770,7 @@ async function gitPush(args: string[], ctx: ShellContext): Promise<ShellResult> 
     );
     if (!updateResp.ok) return fail(`fatal: failed to update ref: ${updateResp.data?.message}\n`, 128);
   } else {
-    const createResp = await githubApi(`/repos/${gh.owner}/${gh.repo}/git/refs`, token, "POST", {
+    const createResp = await request(`/repos/${gh.owner}/${gh.repo}/git/refs`, token, "POST", {
       ref: `refs/heads/${remoteBranch}`,
       sha: commitResp.data.sha,
     });
@@ -2669,6 +2781,7 @@ async function gitPush(args: string[], ctx: ShellContext): Promise<ShellResult> 
 }
 
 async function gitPull(args: string[], ctx: ShellContext): Promise<ShellResult> {
+  const request = githubApiFor(ctx);
   const r = requireRepo(ctx.volume, ctx.cwd);
   if ("error" in r) return r.error;
   const { repo } = r;
@@ -2688,31 +2801,41 @@ async function gitPull(args: string[], ctx: ShellContext): Promise<ShellResult> 
   const gh = repo.parseGitHubUrl(remoteUrl);
   if (!gh) return fail(`fatal: remote '${remoteName}' is not a GitHub URL\n`, 128);
 
-  const refResp = await githubApi(`/repos/${gh.owner}/${gh.repo}/git/ref/heads/${remoteBranch}`, token);
+  const refResp = await request(`/repos/${gh.owner}/${gh.repo}/git/ref/heads/${remoteBranch}`, token);
   if (!refResp.ok) return fail(`fatal: couldn't find remote ref refs/heads/${remoteBranch}\n`, 128);
   const remoteCommitSha = refResp.data.object.sha;
 
   const localHead = repo.resolveHEAD();
   if (localHead === remoteCommitSha) return ok("Already up to date.\n");
 
-  const commitResp = await githubApi(`/repos/${gh.owner}/${gh.repo}/git/commits/${remoteCommitSha}`, token);
+  const commitResp = await request(`/repos/${gh.owner}/${gh.repo}/git/commits/${remoteCommitSha}`, token);
   if (!commitResp.ok) return fail("fatal: could not fetch remote commit\n", 128);
   const treeSha = commitResp.data.tree.sha;
 
-  const treeResp = await githubApi(`/repos/${gh.owner}/${gh.repo}/git/trees/${treeSha}?recursive=1`, token);
+  const treeResp = await request(`/repos/${gh.owner}/${gh.repo}/git/trees/${treeSha}?recursive=1`, token);
   if (!treeResp.ok) return fail("fatal: could not fetch tree\n", 128);
+  const treeItems = Array.isArray(treeResp.data?.tree) ? treeResp.data.tree : [];
+  const entryLimit = ctx.limits?.maxFilesystemEntries ?? 100_000;
+  if (treeItems.length > entryLimit) return fail(`fatal: repository exceeds ${entryLimit} entries\n`, 128);
 
   let updated = 0;
   const blobs: Array<{ path: string; sha: string }> = [];
-  for (const item of treeResp.data.tree) {
-    if (item.type === "blob") blobs.push({ path: item.path, sha: item.sha });
+  for (const item of treeItems) {
+    if (item.type === "blob") {
+      if (!isSafeRepositoryPath(item.path)) return fail("fatal: remote contains an unsafe path\n", 128);
+      blobs.push({ path: item.path, sha: item.sha });
+    }
   }
 
   const BATCH_SIZE = 10;
+  const repositoryByteLimit = (ctx.limits?.maxOutputBytes ?? 4 * 1024 * 1024) * 32;
+  let repositoryBytes = 0;
   for (let i = 0; i < blobs.length; i += BATCH_SIZE) {
+    if (ctx.signal?.aborted) return fail("fatal: pull cancelled\n", 130);
+    if (i > 0) await yieldToEventLoop(ctx.signal);
     const batch = blobs.slice(i, i + BATCH_SIZE);
     const results = await Promise.all(
-      batch.map((b) => githubApi(`/repos/${gh.owner}/${gh.repo}/git/blobs/${b.sha}`, token)),
+      batch.map((b) => request(`/repos/${gh.owner}/${gh.repo}/git/blobs/${b.sha}`, token)),
     );
     for (let j = 0; j < batch.length; j++) {
       const blobResp = results[j];
@@ -2725,6 +2848,10 @@ async function gitPull(args: string[], ctx: ShellContext): Promise<ShellResult> 
         content = atob(blobResp.data.content.replace(/\n/g, ""));
       } else {
         content = blobResp.data.content;
+      }
+      repositoryBytes += content.length;
+      if (repositoryBytes > repositoryByteLimit) {
+        return fail(`fatal: repository data exceeds ${repositoryByteLimit} bytes\n`, 128);
       }
       ctx.volume.writeFileSync(filePath, content);
       updated++;
@@ -2773,6 +2900,7 @@ async function gitPull(args: string[], ctx: ShellContext): Promise<ShellResult> 
 }
 
 async function gitFetch(args: string[], ctx: ShellContext): Promise<ShellResult> {
+  const request = githubApiFor(ctx);
   const r = requireRepo(ctx.volume, ctx.cwd);
   if ("error" in r) return r.error;
   const { repo } = r;
@@ -2789,16 +2917,25 @@ async function gitFetch(args: string[], ctx: ShellContext): Promise<ShellResult>
   const gh = repo.parseGitHubUrl(remoteUrl);
   if (!gh) return fail(`fatal: remote '${remoteName}' is not a GitHub URL\n`, 128);
 
-  const branchesResp = await githubApi(`/repos/${gh.owner}/${gh.repo}/branches`, token);
+  const branchesResp = await request(`/repos/${gh.owner}/${gh.repo}/branches`, token);
   if (!branchesResp.ok) return fail(`fatal: could not list remote branches\n`, 128);
+  const branches = Array.isArray(branchesResp.data) ? branchesResp.data : [];
+  const entryLimit = ctx.limits?.maxFilesystemEntries ?? 100_000;
+  if (branches.length > entryLimit) return fail(`fatal: remote exceeds ${entryLimit} branches\n`, 128);
 
   let out = `From ${remoteUrl}\n`;
-  for (const b of branchesResp.data) {
+  const outputLimit = ctx.limits?.maxOutputBytes ?? 4 * 1024 * 1024;
+  for (let index = 0; index < branches.length; index++) {
+    if (ctx.signal?.aborted) return fail("fatal: fetch cancelled\n", 130);
+    if (index > 0 && (index & 127) === 0) await yieldToEventLoop(ctx.signal);
+    const b = branches[index];
+    if (!isSafeRepositoryPath(b.name)) return fail("fatal: remote contains an unsafe branch name\n", 128);
     const refPath = repo.gitDir + "/refs/remotes/" + remoteName + "/" + b.name;
     const dir = refPath.substring(0, refPath.lastIndexOf("/"));
     if (!ctx.volume.existsSync(dir)) ctx.volume.mkdirSync(dir, { recursive: true });
     ctx.volume.writeFileSync(refPath, b.commit.sha + "\n");
     out += ` * [updated]    ${b.name} -> ${remoteName}/${b.name}\n`;
+    if (out.length > outputLimit) return fail(`fatal: output exceeds ${outputLimit} bytes\n`, 128);
   }
 
   return ok(out);

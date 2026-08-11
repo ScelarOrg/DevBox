@@ -26,6 +26,7 @@ import type {
   WorkerToMain_HttpClientRequest,
   WorkerToMain_SqlitePreload,
 } from "./worker-protocol";
+import type { ShellOptions } from "../shell/shell-options";
 import type { VFSBridge } from "./vfs-bridge";
 import { getRuntimeHost } from "../host/runtime-host";
 import type { HostWorker } from "../host/types";
@@ -124,6 +125,7 @@ export class ProcessManager extends EventEmitter {
     args?: string[];
     cwd?: string;
     env?: Record<string, string>;
+    shell?: ShellOptions;
     parentPid?: number;
   }): ProcessHandle {
     const stopSpawn = this._performance?.start("process.ready");
@@ -180,6 +182,7 @@ export class ProcessManager extends EventEmitter {
       args: config.args ?? [],
       cwd: config.cwd ?? "/",
       env: config.env ?? {},
+      shell: config.shell,
       snapshot,
       syncBuffer: this._syncBuffer ?? undefined,
       parentPid: config.parentPid,
@@ -247,6 +250,7 @@ export class ProcessManager extends EventEmitter {
       pid,
       cwd: spawnConfig.cwd,
       env: spawnConfig.env,
+      shell: spawnConfig.shell,
       snapshot: spawnConfig.snapshot,
       syncBuffer: spawnConfig.syncBuffer,
       lazyFsPort,
@@ -310,10 +314,18 @@ export class ProcessManager extends EventEmitter {
   kill(pid: number, signal: string = "SIGTERM"): boolean {
     const handle = this._processes.get(pid);
     if (!handle) return false;
-    handle.kill(signal);
+    this._killWithFallback(handle, signal);
     this._killDescendants(pid, signal);
     this._cleanupServerPorts(pid);
     return true;
+  }
+
+  private _killWithFallback(handle: ProcessHandle, signal: string): void {
+    handle.kill(signal);
+    if (signal === "SIGKILL" || signal === "SIGSTOP" || signal === "SIGCONT") return;
+    setTimeout(() => {
+      if (handle.state !== "exited") handle.kill("SIGKILL");
+    }, 250);
   }
 
   private _cleanupServerPorts(pid: number): void {
@@ -337,7 +349,7 @@ export class ProcessManager extends EventEmitter {
     for (const childPid of children) {
       const childHandle = this._processes.get(childPid);
       if (childHandle && childHandle.state !== "exited") {
-        childHandle.kill(signal);
+        this._killWithFallback(childHandle, signal);
         // stop stale output from dying workers leaking into the terminal
         childHandle.removeAllListeners("stdout");
         childHandle.removeAllListeners("stderr");
@@ -850,6 +862,7 @@ export class ProcessManager extends EventEmitter {
           args: msg.args,
           cwd: msg.cwd,
           env: msg.env,
+          shell: msg.shell,
           parentPid: handle.pid,
         });
 
@@ -935,7 +948,14 @@ export class ProcessManager extends EventEmitter {
           handle.emit("stdin-raw-status", isRaw);
         });
 
+        const relayChildSignal = (signalMsg: { requestId: number; signal: string }) => {
+          if (signalMsg.requestId !== msg.requestId || childHandle.state === "exited") return;
+          this._killWithFallback(childHandle, signalMsg.signal);
+        };
+        handle.on("child-signal", relayChildSignal);
+
         childHandle.on("exit", (exitCode: number) => {
+          handle.removeListener("child-signal", relayChildSignal);
           if (!handle.workerExited) {
             handle.postMessage({
               type: "child-exit",
@@ -1043,16 +1063,26 @@ export class ProcessManager extends EventEmitter {
         });
 
         // IPC parent → child
-        handle.on("ipc-message", (ipcMsg: any) => {
+        const relayIpcToChild = (ipcMsg: any) => {
           if (ipcMsg.targetRequestId === msg.requestId) {
             childHandle.postMessage({
               type: "ipc-message",
               data: ipcMsg.data,
             });
           }
-        });
+        };
+        handle.on("ipc-message", relayIpcToChild);
+
+        const relayChildSignal = (signalMsg: { requestId: number; signal: string }) => {
+          if (signalMsg.requestId === msg.requestId && childHandle.state !== "exited") {
+            this._killWithFallback(childHandle, signalMsg.signal);
+          }
+        };
+        handle.on("child-signal", relayChildSignal);
 
         childHandle.on("exit", (exitCode: number) => {
+          handle.removeListener("ipc-message", relayIpcToChild);
+          handle.removeListener("child-signal", relayChildSignal);
           if (!handle.workerExited) {
             handle.postMessage({
               type: "child-exit",

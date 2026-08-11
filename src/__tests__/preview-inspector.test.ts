@@ -51,6 +51,9 @@ describe("PreviewInspector", () => {
     expect(String(scripts[0])).toContain("w==='settled'");
     expect(String(scripts[0])).toContain("Math.max(lastMutation,started)>=300");
     expect(String(scripts[0])).toContain("visible:true,rect:rect(e)");
+    expect(String(scripts[0])).toContain("setControlValue")
+    expect(String(scripts[0])).toContain("Object.getOwnPropertyDescriptor(proto,'value')")
+    expect(String(scripts[0])).toContain("new InputEvent('input'")
     inspector.dispose();
   });
 

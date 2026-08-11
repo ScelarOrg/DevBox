@@ -108,4 +108,5 @@ describe("rolldown/parseAst polyfill", () => {
     await engine.runFileTLA("/app/via-path.mjs");
     expect(logs[0]).toBe("Program");
   });
+
 });

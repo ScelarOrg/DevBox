@@ -118,7 +118,7 @@ export function createWorkspace(config?: WorkspaceConfig): {
 } {
   const volume = new MemoryVolume();
   const engine = new ScriptEngine(volume, config);
-  const packages = new DependencyInstaller(volume);
+  const packages = new DependencyInstaller(volume, { cwd: config?.cwd });
   const proxy = getProxyInstance({
     baseUrl: config?.baseUrl,
     onServerReady: config?.onServerReady,
@@ -201,6 +201,8 @@ export type {
   StatResult,
   Snapshot,
   SpawnOptions,
+  ShellLimits,
+  ShellOptions,
   PerformanceStats,
   PerformanceTiming,
 } from "./sdk/types";

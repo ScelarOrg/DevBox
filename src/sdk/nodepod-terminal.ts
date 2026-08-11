@@ -162,6 +162,8 @@ export class NodepodTerminal {
 
     if (this._serializedBuffer) {
       this._term.write(this._serializedBuffer);
+    } else if (this._opts.autoPrompt !== false && !this._running) {
+      this._writePrompt();
     }
 
     if (this._opts.WebglAddon) {

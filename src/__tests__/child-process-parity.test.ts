@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { MemoryVolume } from "../memory-volume";
 import {
   installPackageNames,
@@ -6,8 +6,12 @@ import {
   shellCommandFromArgv,
   spawn,
   setSpawnChildCallback,
+  setStreamingCallbacks,
+  clearStreamingCallbacks,
+  shellExec,
   promises as cpPromises,
   initShellExec,
+  getUnsupportedNativeExecutableMessage,
 } from "../polyfills/child_process";
 
 describe("installPackageNames", () => {
@@ -60,6 +64,7 @@ describe("spawn env inheritance", () => {
 
   afterEach(() => {
     setSpawnChildCallback(null);
+    clearStreamingCallbacks();
     if ((globalThis as any).process) {
       (globalThis as any).process.env = prevEnv;
     }
@@ -95,6 +100,89 @@ describe("spawn env inheritance", () => {
     });
 
     expect(captured).toEqual({});
+  });
+
+  it("routes kill to the real child operation", async () => {
+    let finish!: (value: { pid: number; exitCode: number; stdout: string; stderr: string }) => void;
+    const kill = vi.fn(() => true);
+    const operation = Object.assign(
+      new Promise<{ pid: number; exitCode: number; stdout: string; stderr: string }>((resolve) => { finish = resolve; }),
+      { kill },
+    );
+    setSpawnChildCallback(() => operation);
+
+    const child = spawn("node", ["loop.js"]);
+    expect(child.kill("SIGKILL")).toBe(true);
+    expect(kill).toHaveBeenCalledWith("SIGKILL");
+    finish({ pid: 2, exitCode: 137, stdout: "", stderr: "" });
+    await new Promise<void>((resolve) => child.once("exit", () => resolve()));
+  });
+
+  it("streams shell node binary output and inherits stdin before the child exits", async () => {
+    const volume = new MemoryVolume();
+    volume.writeFileSync("/dev-server.js", "");
+    initShellExec(volume, { cwd: "/" });
+
+    let finish!: (value: { pid: number; exitCode: number; stdout: string; stderr: string }) => void;
+    let childOptions: Parameters<NonNullable<Parameters<typeof setSpawnChildCallback>[0]>>[2];
+    const operation = new Promise<{ pid: number; exitCode: number; stdout: string; stderr: string }>(
+      (resolve) => { finish = resolve; },
+    );
+    setSpawnChildCallback((_command, _args, options) => {
+      childOptions = options;
+      return operation;
+    });
+
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    setStreamingCallbacks({
+      onStdout: (text) => stdout.push(text),
+      onStderr: (text) => stderr.push(text),
+    });
+
+    const completion = new Promise<void>((resolve) => {
+      shellExec("node /dev-server.js", {}, () => resolve());
+    });
+
+    await vi.waitFor(() => expect(childOptions).toBeDefined());
+    expect(childOptions?.stdio).toBe("inherit");
+    childOptions?.onStdout?.("VITE ready\n");
+    childOptions?.onStderr?.("warning\n");
+
+    expect(stdout).toEqual(["VITE ready\n"]);
+    expect(stderr).toEqual(["warning\n"]);
+
+    finish({
+      pid: 2,
+      exitCode: 0,
+      stdout: "VITE ready\n",
+      stderr: "warning\n",
+    });
+    await completion;
+  });
+});
+
+describe("browser-incompatible native binaries", () => {
+  it("explains why the TypeScript 7 native compiler cannot run", () => {
+    expect(
+      getUnsupportedNativeExecutableMessage(
+        "/project/node_modules/typescript/lib/tsc.exe",
+      ),
+    ).toMatch(/TypeScript 7\+.*native compiler.*browser/i);
+    expect(
+      getUnsupportedNativeExecutableMessage("/project/node_modules/.bin/tsc"),
+    ).toBeNull();
+  });
+
+  it("returns a deterministic 127 for the native TypeScript executable", async () => {
+    const child = spawn("/project/node_modules/typescript/lib/tsc.exe", []);
+    let stderr = "";
+    child.stderr?.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    await new Promise<void>((resolve) => child.once("exit", () => resolve()));
+    expect(child.exitCode).toBe(127);
+    expect(stderr).toMatch(/Pin `typescript` to 5\.9\.x/);
   });
 });
 

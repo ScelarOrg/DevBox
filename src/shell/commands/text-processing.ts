@@ -13,6 +13,8 @@ import {
   MAGENTA,
   CYAN,
   BOLD_RED,
+  yieldToEventLoop,
+  regexSafetyError,
 } from "../shell-helpers";
 import { YES_REPEAT_COUNT } from "../../constants/config";
 
@@ -51,12 +53,14 @@ const echo: BuiltinFn = (args) => {
   return ok(output + (noNewline ? "" : "\n"));
 };
 
-const printf_cmd: BuiltinFn = (args) => {
-  if (args.length === 0) return ok();
-  const fmt = args[0];
-  const vals = args.slice(1);
+function formatPrintfOnce(
+  fmt: string,
+  vals: string[],
+  initialIndex = 0,
+  outputLimit = 4 * 1024 * 1024,
+): { output: string; nextIndex: number } {
   let out = "";
-  let vi = 0;
+  let vi = initialIndex;
 
   let i = 0;
   while (i < fmt.length) {
@@ -107,6 +111,14 @@ const printf_cmd: BuiltinFn = (args) => {
       }
       const spec = fmt[i++];
       const val = vals[vi++] ?? "";
+      const parsedWidth = width === "" ? 0 : Number(width);
+      if (!Number.isFinite(parsedWidth) || parsedWidth < 0 || parsedWidth > outputLimit) {
+        throw new Error("field width exceeds output limit");
+      }
+      const parsedPrecision = prec === "" ? null : Number(prec);
+      if (parsedPrecision !== null && (!Number.isFinite(parsedPrecision) || parsedPrecision < 0 || parsedPrecision > outputLimit)) {
+        throw new Error("precision exceeds output limit");
+      }
 
       if (spec === "%") { out += "%"; vi--; continue; }
       if (spec === "s") {
@@ -181,8 +193,34 @@ const printf_cmd: BuiltinFn = (args) => {
       continue;
     }
     out += fmt[i++];
+    if (out.length > outputLimit) throw new Error("output limit exceeded");
   }
-  return ok(out);
+  if (out.length > outputLimit) throw new Error("output limit exceeded");
+  return { output: out, nextIndex: vi };
+}
+
+const printf_cmd: BuiltinFn = (args, ctx) => {
+  if (args.length === 0) return ok();
+  const fmt = args[0];
+  const vals = args.slice(1);
+  const outputLimit = ctx.limits?.maxOutputBytes ?? 4 * 1024 * 1024;
+  const conversionCount = [...fmt.matchAll(/%(?:[-+ 0#]*\d*(?:\.\d+)?[sdifxXoeEgGc%])/g)].filter((match) => match[0] !== "%%").length;
+  try {
+    const first = formatPrintfOnce(fmt, vals, 0, outputLimit);
+    if (vals.length === 0 || conversionCount === 0) return ok(first.output);
+    let output = first.output;
+    let index = first.nextIndex;
+    while (index < vals.length && index > 0) {
+      const next = formatPrintfOnce(fmt, vals, index, outputLimit - output.length);
+      output += next.output;
+      if (output.length > outputLimit) throw new Error("output limit exceeded");
+      if (next.nextIndex === index) break;
+      index = next.nextIndex;
+    }
+    return ok(output);
+  } catch (error) {
+    return fail(`printf: ${error instanceof Error ? error.message : String(error)}\n`);
+  }
 };
 
 /* ------------------------------------------------------------------ */
@@ -203,6 +241,10 @@ interface GrepOpts {
   beforeCtx: number;
   afterCtx: number;
   maxCount: number;
+  maxOutputBytes: number;
+  maxInputBytes: number;
+  maxLoopIterations: number;
+  work: number;
 }
 
 interface GrepLinesResult {
@@ -216,7 +258,10 @@ function grepLines(content: string, opts: GrepOpts, label?: string): GrepLinesRe
     countOnly, filesOnly, lineNumbers, onlyMatching, quiet,
     beforeCtx, afterCtx, maxCount,
   } = opts;
+  if (content.length > opts.maxInputBytes) throw new Error("input limit exceeded");
   const lines = content.split("\n");
+  if (opts.work + lines.length > opts.maxLoopIterations) throw new Error("operation limit exceeded");
+  opts.work += lines.length;
   const matchedIndices = new Set<number>();
   let matchCount = 0;
 
@@ -251,6 +296,7 @@ function grepLines(content: string, opts: GrepOpts, label?: string): GrepLinesRe
       j <= Math.min(lines.length - 1, idx + afterCtx);
       j++
     ) {
+      if (++opts.work > opts.maxLoopIterations) throw new Error("operation limit exceeded");
       showLines.add(j);
     }
   }
@@ -277,7 +323,17 @@ function grepLines(content: string, opts: GrepOpts, label?: string): GrepLinesRe
       const gRe = new RegExp(patternStr, ignoreCase ? "gi" : "g");
       let m: RegExpExecArray | null;
       while ((m = gRe.exec(lines[i])) !== null) {
+        if (++opts.work > opts.maxLoopIterations) throw new Error("operation limit exceeded");
+        // JavaScript global regexes do not advance after an empty match.
+        // GNU grep -o does not print empty matches, so advance manually and
+        // suppress them instead of spinning forever.
+        if (m[0].length === 0) {
+          if (gRe.lastIndex >= lines[i].length) break;
+          gRe.lastIndex++;
+          continue;
+        }
         out += `${prefix}${num}${BOLD_RED}${m[0]}${RESET}\n`;
+        if (out.length > opts.maxOutputBytes) throw new Error("output limit exceeded");
       }
     } else {
       const hl =
@@ -285,45 +341,56 @@ function grepLines(content: string, opts: GrepOpts, label?: string): GrepLinesRe
           ? lines[i].replace(highlightRe, (m) => `${BOLD_RED}${m}${RESET}`)
           : lines[i];
       out += `${prefix}${num}${hl}\n`;
+      if (out.length > opts.maxOutputBytes) throw new Error("output limit exceeded");
     }
   }
 
   return { text: out, hits };
 }
 
-function grepDirFull(
+async function grepDirFull(
   ctx: ShellContext,
   dir: string,
   opts: GrepOpts,
-): GrepLinesResult {
+  state: { entries: number },
+): Promise<GrepLinesResult> {
   let text = "";
   let hits = 0;
+  let names: string[];
   try {
-    for (const name of ctx.volume.readdirSync(dir)) {
-      const full = `${dir}/${name}`;
-      const st = ctx.volume.statSync(full);
-      if (st.isDirectory()) {
-        const nested = grepDirFull(ctx, full, opts);
-        text += nested.text;
-        hits += nested.hits;
-      } else {
-        try {
-          const content = ctx.volume.readFileSync(full, "utf8");
-          const result = grepLines(content, opts, full);
-          text += result.text;
-          hits += result.hits;
-        } catch {
-          /* skip binary/unreadable */
-        }
+    names = ctx.volume.readdirSync(dir);
+  } catch {
+    return { text, hits };
+  }
+  for (const name of names) {
+    if (ctx.signal?.aborted) throw new Error("command cancelled");
+    const limit = ctx.limits?.maxFilesystemEntries ?? 100_000;
+    if (++state.entries > limit) throw new Error(`filesystem entry limit ${limit} exceeded`);
+    if ((state.entries & 127) === 0) await yieldToEventLoop(ctx.signal);
+    const full = dir === "/" ? `/${name}` : `${dir}/${name}`;
+    let st: ReturnType<ShellContext["volume"]["lstatSync"]>;
+    try { st = ctx.volume.lstatSync(full); } catch { continue; }
+    if (st.isDirectory()) {
+      const nested = await grepDirFull(ctx, full, opts, state);
+      text += nested.text;
+      hits += nested.hits;
+    } else if (!st.isSymbolicLink()) {
+      try {
+        const content = ctx.volume.readFileSync(full, "utf8");
+        const result = grepLines(content, opts, full);
+        text += result.text;
+        hits += result.hits;
+      } catch (error) {
+        if (error instanceof Error && error.message === "output limit exceeded") throw error;
+        /* skip binary/unreadable */
       }
     }
-  } catch {
-    /* skip unreadable dirs */
+    if (text.length > opts.maxOutputBytes) throw new Error("output limit exceeded");
   }
   return { text, hits };
 }
 
-const grep_cmd: BuiltinFn = (args, ctx, stdin) => {
+const grep_cmd: BuiltinFn = async (args, ctx, stdin) => {
   const { flags, opts: parsedOpts, positional } = parseArgs(
     args,
     [
@@ -344,9 +411,15 @@ const grep_cmd: BuiltinFn = (args, ctx, stdin) => {
   const fixedStrings = flags.has("F");
   const quiet = flags.has("q");
   const suppressErrors = flags.has("s");
-  const afterCtx = parseInt(parsedOpts["A"] || parsedOpts["C"] || "0");
-  const beforeCtx = parseInt(parsedOpts["B"] || parsedOpts["C"] || "0");
-  const maxCount = parsedOpts["m"] ? parseInt(parsedOpts["m"]) : Infinity;
+  const operationLimit = ctx.limits?.maxLoopIterations ?? 100_000;
+  const parseCount = (value: string | undefined, fallback: number): number => {
+    if (value === undefined) return fallback;
+    const parsed = Number(value);
+    return Number.isSafeInteger(parsed) && parsed >= 0 ? Math.min(parsed, operationLimit) : fallback;
+  };
+  const afterCtx = parseCount(parsedOpts["A"] ?? parsedOpts["C"], 0);
+  const beforeCtx = parseCount(parsedOpts["B"] ?? parsedOpts["C"], 0);
+  const maxCount = parseCount(parsedOpts["m"], Infinity);
 
   let patternStr: string;
   if (parsedOpts["e"] !== undefined) {
@@ -362,6 +435,12 @@ const grep_cmd: BuiltinFn = (args, ctx, stdin) => {
   if (wordRegex) patternStr = `\\b${patternStr}\\b`;
   if (lineRegex) patternStr = `^${patternStr}$`;
 
+  const regexError = regexSafetyError(
+    patternStr,
+    Math.min(ctx.limits?.maxExpansionBytes ?? 1024 * 1024, 64 * 1024),
+  );
+  if (regexError) return fail(`grep: ${regexError}\n`, 2);
+
   let regex: RegExp;
   let highlightRe: RegExp;
   try {
@@ -375,12 +454,18 @@ const grep_cmd: BuiltinFn = (args, ctx, stdin) => {
     regex, highlightRe, patternStr, ignoreCase, invert,
     countOnly, filesOnly, lineNumbers, onlyMatching, quiet,
     beforeCtx, afterCtx, maxCount,
+    maxOutputBytes: ctx.limits?.maxOutputBytes ?? 4 * 1024 * 1024,
+    maxInputBytes: ctx.limits?.maxOutputBytes ?? 4 * 1024 * 1024,
+    maxLoopIterations: operationLimit,
+    work: 0,
   };
 
   const files = positional;
 
   if (files.length === 0 && stdin !== undefined) {
-    const result = grepLines(stdin, grepOpts);
+    let result: GrepLinesResult;
+    try { result = grepLines(stdin, grepOpts); }
+    catch (error) { return fail(`grep: ${error instanceof Error ? error.message : String(error)}\n`); }
     if (quiet) return result.hits > 0 ? EXIT_OK : EXIT_FAIL;
     return result.hits > 0
       ? ok(result.text)
@@ -394,14 +479,16 @@ const grep_cmd: BuiltinFn = (args, ctx, stdin) => {
   let out = "";
   const multiFile = files.length > 1 || recursive;
   let totalHits = 0;
+  const walkState = { entries: 0 };
 
   for (const file of files) {
+    if (ctx.signal?.aborted) return fail("grep: command cancelled\n", 130);
     const p = resolvePath(file, ctx.cwd);
     try {
       const st = ctx.volume.statSync(p);
       if (st.isDirectory()) {
         if (recursive) {
-          const r = grepDirFull(ctx, p, grepOpts);
+          const r = await grepDirFull(ctx, p, grepOpts, walkState);
           out += r.text;
           totalHits += r.hits;
         } else if (!suppressErrors) {
@@ -413,7 +500,11 @@ const grep_cmd: BuiltinFn = (args, ctx, stdin) => {
       const result = grepLines(content, grepOpts, multiFile ? file : undefined);
       out += result.text;
       totalHits += result.hits;
-    } catch {
+      if (out.length > grepOpts.maxOutputBytes) throw new Error("output limit exceeded");
+    } catch (error) {
+      if (error instanceof Error && (error.message.includes("limit") || error.message === "command cancelled")) {
+        return fail(`grep: ${error.message}\n`, ctx.signal?.aborted ? 130 : 1);
+      }
       if (!suppressErrors)
         return fail(`grep: ${file}: No such file or directory\n`);
     }
@@ -437,11 +528,12 @@ interface SedCmd {
   pattern?: string;
   replacement?: string;
   sFlags?: string;
+  substitutionRe?: RegExp;
   text?: string;
   printAfter?: boolean;
 }
 
-function parseSedScript(script: string): SedCmd[] | string {
+function parseSedScript(script: string, regexLimit: number): SedCmd[] | string {
   const cmds: SedCmd[] = [];
   const parts = script.split(/\s*;\s*|\n/).filter(Boolean);
 
@@ -468,6 +560,8 @@ function parseSedScript(script: string): SedCmd[] | string {
       const end = rest.indexOf("/", 1);
       if (end > 0) {
         const pattern = rest.slice(1, end);
+        const safetyError = regexSafetyError(pattern, regexLimit);
+        if (safetyError) return safetyError;
         try {
           addr = { type: "regex", re: new RegExp(pattern) };
         } catch {
@@ -487,7 +581,15 @@ function parseSedScript(script: string): SedCmd[] | string {
       if (parts2.length < 2) return `unsupported expression: ${part}`;
       const printAfter = parts2[2]?.includes("p") ?? false;
       const sFlags = (parts2[2] ?? "").replace("p", "") || undefined;
-      cmds.push({ addr, type: "s", pattern: parts2[0], replacement: parts2[1], sFlags, printAfter });
+      const safetyError = regexSafetyError(parts2[0], regexLimit);
+      if (safetyError) return safetyError;
+      let substitutionRe: RegExp;
+      try {
+        substitutionRe = new RegExp(parts2[0], sFlags);
+      } catch {
+        return `invalid regular expression: ${parts2[0]}`;
+      }
+      cmds.push({ addr, type: "s", pattern: parts2[0], replacement: parts2[1], sFlags, substitutionRe, printAfter });
     } else if (cmd === "d") { cmds.push({ addr, type: "d" }); }
     else if (cmd === "p") { cmds.push({ addr, type: "p" }); }
     else if (cmd === "q") { cmds.push({ addr, type: "q" }); }
@@ -530,13 +632,23 @@ const sed_cmd: BuiltinFn = (args, ctx, stdin) => {
   const expressions = positional[0];
   const files = positional.slice(1);
 
-  const cmds = parseSedScript(expressions);
+  const cmds = parseSedScript(
+    expressions,
+    Math.min(ctx.limits?.maxExpansionBytes ?? 1024 * 1024, 64 * 1024),
+  );
   if (typeof cmds === "string") return fail(`sed: ${cmds}\n`);
 
   const doSed = (content: string): string => {
+    const inputLimit = ctx.limits?.maxOutputBytes ?? 4 * 1024 * 1024;
+    if (content.length > inputLimit) throw new Error(`input limit ${inputLimit} exceeded`);
     // drop trailing empty segment from a final newline so $ is the last real line
     const lines = content.split("\n");
     if (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
+    const operationLimit = ctx.limits?.maxLoopIterations ?? 100_000;
+    if (lines.length * Math.max(1, cmds.length) > operationLimit) {
+      throw new Error(`operation limit ${operationLimit} exceeded`);
+    }
+    const outputLimit = ctx.limits?.maxOutputBytes ?? 4 * 1024 * 1024;
     let out = "";
     for (let i = 0; i < lines.length; i++) {
       const lineNum = i + 1;
@@ -551,13 +663,10 @@ const sed_cmd: BuiltinFn = (args, ctx, stdin) => {
 
         switch (cmd.type) {
           case "s": {
-            let re: RegExp;
-            try {
-              re = new RegExp(cmd.pattern!, cmd.sFlags || undefined);
-            } catch {
-              throw new Error(`invalid regular expression: ${cmd.pattern}`);
-            }
+            const re = cmd.substitutionRe!;
+            re.lastIndex = 0;
             line = line.replace(re, cmd.replacement!);
+            re.lastIndex = 0;
             if (cmd.printAfter && re.test(lines[i])) suppress = false;
             break;
           }
@@ -584,6 +693,7 @@ const sed_cmd: BuiltinFn = (args, ctx, stdin) => {
       if (!deleted && !suppress) {
         out += line + (isLast && !content.endsWith("\n") ? "" : "\n");
       }
+      if (out.length > outputLimit) throw new Error("output limit exceeded");
     }
     return out;
   };
@@ -657,6 +767,8 @@ const sort_cmd: BuiltinFn = (args, ctx, stdin) => {
   }
 
   let lines = content.split("\n").filter(Boolean);
+  const operationLimit = ctx.limits?.maxLoopIterations ?? 100_000;
+  if (lines.length > operationLimit) return fail(`sort: operation limit ${operationLimit} exceeded\n`);
 
   const getKey = (line: string): string => {
     if (!keySpec) return line;
@@ -710,6 +822,8 @@ const sort_cmd: BuiltinFn = (args, ctx, stdin) => {
   }
 
   const result = lines.join("\n") + (lines.length ? "\n" : "");
+  const outputLimit = ctx.limits?.maxOutputBytes ?? 4 * 1024 * 1024;
+  if (result.length > outputLimit) return fail(`sort: output limit ${outputLimit} exceeded\n`);
   if (outputFile) {
     const p = resolvePath(outputFile, ctx.cwd);
     try {
@@ -762,6 +876,8 @@ const uniq_cmd: BuiltinFn = (args, ctx, stdin) => {
   };
 
   const lines = content.split("\n");
+  const operationLimit = ctx.limits?.maxLoopIterations ?? 100_000;
+  if (lines.length > operationLimit) return fail(`uniq: operation limit ${operationLimit} exceeded\n`);
   const result: string[] = [];
   let prev = "";
   let prevLine = "";
@@ -788,7 +904,9 @@ const uniq_cmd: BuiltinFn = (args, ctx, stdin) => {
       result.push(count ? `${String(prevCount).padStart(7)} ${prevLine}` : prevLine);
   }
 
-  return ok(result.join("\n") + (result.length ? "\n" : ""));
+  const output = result.join("\n") + (result.length ? "\n" : "");
+  const outputLimit = ctx.limits?.maxOutputBytes ?? 4 * 1024 * 1024;
+  return output.length > outputLimit ? fail(`uniq: output limit ${outputLimit} exceeded\n`) : ok(output);
 };
 
 /* ------------------------------------------------------------------ */
@@ -826,7 +944,7 @@ function buildComplement(set: string): string {
   return result;
 }
 
-const tr_cmd: BuiltinFn = (args, _ctx, stdin) => {
+const tr_cmd: BuiltinFn = (args, ctx, stdin) => {
   const { flags, positional } = parseArgs(args, ["d", "s", "c", "C"]);
   const deleteMode = flags.has("d");
   const squeeze = flags.has("s");
@@ -840,6 +958,11 @@ const tr_cmd: BuiltinFn = (args, _ctx, stdin) => {
 
   set1 = expandRange(set1);
   const expandedSet2 = set2 ? expandRange(set2) : "";
+  const operationLimit = ctx.limits?.maxLoopIterations ?? 100_000;
+  const lookupWidth = !deleteMode || complement ? Math.max(1, set1.length) : 1;
+  if (content.length * lookupWidth > operationLimit) {
+    return fail(`tr: operation limit ${operationLimit} exceeded\n`);
+  }
 
   if (deleteMode) {
     const chars = complement ? null : new Set(set1);
@@ -888,13 +1011,17 @@ const tr_cmd: BuiltinFn = (args, _ctx, stdin) => {
 /*  cut                                                                */
 /* ------------------------------------------------------------------ */
 
-function parseRangeSpec(spec: string): number[] {
+function parseRangeSpec(spec: string, limit: number): number[] {
   const result: number[] = [];
   for (const part of spec.split(",")) {
     const range = part.match(/^(\d+)-(\d*)$/);
     if (range) {
       const start = parseInt(range[1]);
       const end = range[2] ? parseInt(range[2]) : start + 100;
+      const count = Math.max(0, end - start + 1);
+      if (!Number.isSafeInteger(count) || result.length + count > limit) {
+        throw new Error(`range contains more than ${limit} positions`);
+      }
       for (let i = start; i <= end; i++) result.push(i);
     } else {
       result.push(parseInt(part));
@@ -910,25 +1037,37 @@ const cut_cmd: BuiltinFn = (args, ctx, stdin) => {
   let chars: number[] = [];
   let outputDelimiter: string | null = null;
   const files: string[] = [];
+  const rangeLimit = Math.min(
+    ctx.limits?.maxLoopIterations ?? 1_000_000,
+    ctx.limits?.maxOutputBytes ?? 4 * 1024 * 1024,
+  );
 
-  for (let i = 0; i < args.length; i++) {
-    if (args[i] === "-d" && i + 1 < args.length) delimiter = args[++i];
-    else if (args[i] === "-f" && i + 1 < args.length)
-      fields = parseRangeSpec(args[++i]);
-    else if (args[i] === "-b" && i + 1 < args.length)
-      bytes = parseRangeSpec(args[++i]);
-    else if (args[i] === "-c" && i + 1 < args.length)
-      chars = parseRangeSpec(args[++i]);
-    else if (args[i] === "--output-delimiter" && i + 1 < args.length)
-      outputDelimiter = args[++i];
-    else if (!args[i].startsWith("-")) files.push(args[i]);
+  try {
+    for (let i = 0; i < args.length; i++) {
+      if (args[i] === "-d" && i + 1 < args.length) delimiter = args[++i];
+      else if (args[i] === "-f" && i + 1 < args.length)
+        fields = parseRangeSpec(args[++i], rangeLimit);
+      else if (args[i] === "-b" && i + 1 < args.length)
+        bytes = parseRangeSpec(args[++i], rangeLimit);
+      else if (args[i] === "-c" && i + 1 < args.length)
+        chars = parseRangeSpec(args[++i], rangeLimit);
+      else if (args[i] === "--output-delimiter" && i + 1 < args.length)
+        outputDelimiter = args[++i];
+      else if (!args[i].startsWith("-")) files.push(args[i]);
+    }
+  } catch (error) {
+    return fail(`cut: ${error instanceof Error ? error.message : String(error)}\n`);
   }
 
   const outDelim = outputDelimiter ?? delimiter;
 
   const doCut = (content: string) => {
-    return content
-      .split("\n")
+    const lines = content.split("\n");
+    const selectionCount = (bytes.length > 0 ? bytes.length : chars.length > 0 ? chars.length : fields.length);
+    if (lines.length * Math.max(1, selectionCount) > rangeLimit) {
+      throw new Error(`operation limit ${rangeLimit} exceeded`);
+    }
+    const output = lines
       .map((line) => {
         if (bytes.length > 0 || chars.length > 0) {
           const indices = bytes.length > 0 ? bytes : chars;
@@ -938,15 +1077,24 @@ const cut_cmd: BuiltinFn = (args, ctx, stdin) => {
         return fields.map((f) => parts[f - 1] ?? "").join(outDelim);
       })
       .join("\n");
+    const outputLimit = ctx.limits?.maxOutputBytes ?? 4 * 1024 * 1024;
+    if (output.length > outputLimit) throw new Error(`output limit ${outputLimit} exceeded`);
+    return output;
   };
 
-  if (files.length === 0) return ok(doCut(stdin ?? ""));
+  if (files.length === 0) {
+    try { return ok(doCut(stdin ?? "")); }
+    catch (error) { return fail(`cut: ${error instanceof Error ? error.message : String(error)}\n`); }
+  }
   let out = "";
   for (const file of files) {
     const p = resolvePath(file, ctx.cwd);
     try {
       out += doCut(ctx.volume.readFileSync(p, "utf8"));
-    } catch {
+      if (out.length > (ctx.limits?.maxOutputBytes ?? 4 * 1024 * 1024)) throw new Error("output limit exceeded");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.includes("limit")) return fail(`cut: ${message}\n`);
       return fail(`cut: ${file}: No such file or directory\n`);
     }
   }
@@ -967,6 +1115,8 @@ const rev_cmd: BuiltinFn = (args, ctx, stdin) => {
       return fail(`rev: ${args[0]}: No such file or directory\n`);
     }
   }
+  const outputLimit = ctx.limits?.maxOutputBytes ?? 4 * 1024 * 1024;
+  if (content.length > outputLimit) return fail(`rev: input limit ${outputLimit} exceeded\n`);
   return ok(
     content
       .split("\n")
@@ -994,10 +1144,16 @@ const paste_cmd: BuiltinFn = (args, ctx, stdin) => {
   }
   if (contents.length === 0 && stdin) contents.push(stdin.split("\n"));
 
-  const maxLen = Math.max(...contents.map((c) => c.length));
+  const maxLen = contents.reduce((max, content) => Math.max(max, content.length), 0);
+  const operationLimit = ctx.limits?.maxLoopIterations ?? 100_000;
+  if (maxLen * Math.max(1, contents.length) > operationLimit) {
+    return fail(`paste: operation limit ${operationLimit} exceeded\n`);
+  }
+  const outputLimit = ctx.limits?.maxOutputBytes ?? 4 * 1024 * 1024;
   let out = "";
   for (let i = 0; i < maxLen; i++) {
     out += contents.map((c) => c[i] ?? "").join(delim) + "\n";
+    if (out.length > outputLimit) return fail(`paste: output limit ${outputLimit} exceeded\n`);
   }
   return ok(out);
 };
@@ -1014,6 +1170,9 @@ const comm_cmd: BuiltinFn = (args, ctx) => {
   try {
     const a = readFile(positional[0]);
     const b = readFile(positional[1]);
+    const operationLimit = ctx.limits?.maxLoopIterations ?? 100_000;
+    if (a.length + b.length > operationLimit) return fail(`comm: operation limit ${operationLimit} exceeded\n`);
+    const outputLimit = ctx.limits?.maxOutputBytes ?? 4 * 1024 * 1024;
     let out = "";
     let ai = 0, bi = 0;
     while (ai < a.length || bi < b.length) {
@@ -1036,6 +1195,7 @@ const comm_cmd: BuiltinFn = (args, ctx) => {
         ai++;
         bi++;
       }
+      if (out.length > outputLimit) return fail(`comm: output limit ${outputLimit} exceeded\n`);
     }
     return ok(out);
   } catch (e) {
@@ -1064,13 +1224,13 @@ function simpleLCS(a: string[], b: string[]): string[] {
   let i = m, j = n;
   while (i > 0 && j > 0) {
     if (a[i - 1] === b[j - 1]) {
-      result.unshift(a[i - 1]);
+      result.push(a[i - 1]);
       i--;
       j--;
     } else if (dp[i - 1][j] > dp[i][j - 1]) i--;
     else j--;
   }
-  return result;
+  return result.reverse();
 }
 
 const diff_cmd: BuiltinFn = (args, ctx) => {
@@ -1084,10 +1244,16 @@ const diff_cmd: BuiltinFn = (args, ctx) => {
   const p2 = resolvePath(positional[1], ctx.cwd);
 
   try {
-    const a = ctx.volume.readFileSync(p1, "utf8").split("\n");
-    const b = ctx.volume.readFileSync(p2, "utf8").split("\n");
+    const aText = ctx.volume.readFileSync(p1, "utf8");
+    const bText = ctx.volume.readFileSync(p2, "utf8");
+    const inputLimit = (ctx.limits?.maxOutputBytes ?? 4 * 1024 * 1024) * 2;
+    if (aText.length + bText.length > inputLimit) {
+      return fail(`diff: input exceeds ${inputLimit} bytes\n`);
+    }
+    const a = aText.split("\n");
+    const b = bText.split("\n");
 
-    if (a.join("\n") === b.join("\n")) return ok();
+    if (aText === bText) return ok();
     if (brief)
       return {
         stdout: `Files ${positional[0]} and ${positional[1]} differ\n`,
@@ -1096,7 +1262,13 @@ const diff_cmd: BuiltinFn = (args, ctx) => {
       };
 
     let out = "";
+    const workLimit = ctx.limits?.maxLoopIterations ?? 100_000;
+    const outputLimit = ctx.limits?.maxOutputBytes ?? 4 * 1024 * 1024;
     if (unified) {
+      const cells = (a.length + 1) * (b.length + 1);
+      if (!Number.isSafeInteger(cells) || cells > workLimit) {
+        return fail(`diff: comparison limit ${workLimit} exceeded\n`);
+      }
       out += `--- ${positional[0]}\n+++ ${positional[1]}\n`;
       out += `@@ -1,${a.length} +1,${b.length} @@\n`;
       const lcs = simpleLCS(a, b);
@@ -1116,14 +1288,19 @@ const diff_cmd: BuiltinFn = (args, ctx) => {
           out += `+${b[bi]}\n`;
           bi++;
         }
+        if (out.length > outputLimit) return fail(`diff: output limit ${outputLimit} exceeded\n`);
       }
     } else {
+      if (Math.max(a.length, b.length) > workLimit) {
+        return fail(`diff: comparison limit ${workLimit} exceeded\n`);
+      }
       for (let i = 0; i < Math.max(a.length, b.length); i++) {
         if (i >= a.length) out += `> ${b[i]}\n`;
         else if (i >= b.length) out += `< ${a[i]}\n`;
         else if (a[i] !== b[i]) {
           out += `< ${a[i]}\n---\n> ${b[i]}\n`;
         }
+        if (out.length > outputLimit) return fail(`diff: output limit ${outputLimit} exceeded\n`);
       }
     }
 
@@ -1137,7 +1314,7 @@ const diff_cmd: BuiltinFn = (args, ctx) => {
 /*  seq / yes                                                          */
 /* ------------------------------------------------------------------ */
 
-const seq_cmd: BuiltinFn = (args) => {
+const seq_cmd: BuiltinFn = async (args, ctx) => {
   if (args.length === 0) return fail("seq: missing operand\n");
   let first = 1, increment = 1, last = 1;
   if (args.length === 1) {
@@ -1151,11 +1328,25 @@ const seq_cmd: BuiltinFn = (args) => {
     last = parseFloat(args[2]);
   }
 
+  if (![first, increment, last].every(Number.isFinite) || increment === 0) {
+    return fail("seq: invalid floating point argument\n");
+  }
+  const span = (last - first) / increment;
+  const count = span < 0 ? 0 : Math.floor(span + Number.EPSILON) + 1;
+  const iterationLimit = ctx.limits?.maxLoopIterations ?? 1_000_000;
+  if (!Number.isSafeInteger(count) || count > iterationLimit) {
+    return fail(`seq: iteration limit ${iterationLimit} exceeded\n`);
+  }
+  const outputLimit = ctx.limits?.maxOutputBytes ?? 4 * 1024 * 1024;
   const lines: string[] = [];
-  if (increment > 0) {
-    for (let i = first; i <= last; i += increment) lines.push(String(i));
-  } else if (increment < 0) {
-    for (let i = first; i >= last; i += increment) lines.push(String(i));
+  let outputLength = 0;
+  for (let index = 0; index < count; index++) {
+    if (ctx.signal?.aborted) return fail("seq: command cancelled\n", 130);
+    if (index > 0 && (index & 255) === 0) await yieldToEventLoop(ctx.signal);
+    const line = String(first + index * increment);
+    outputLength += line.length + 1;
+    if (outputLength > outputLimit) return fail(`seq: output exceeds ${outputLimit} bytes\n`);
+    lines.push(line);
   }
   return ok(lines.join("\n") + (lines.length ? "\n" : ""));
 };

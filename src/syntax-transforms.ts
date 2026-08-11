@@ -37,11 +37,19 @@ const RE_AS_RENAME = /(\w+)\s+as\s+(\w+)/g;
 const RE_TYPE_SPEC = /^\s*type\s+\w+/;
 const RE_AS_SPLIT = /\s+as\s+/;
 
-export function esmToCjs(code: string): string {
+export interface ESMToCJSOptions {
+  /** Target used for pure default exports. */
+  exportTarget?: string;
+}
+
+export function esmToCjs(
+  code: string,
+  options: ESMToCJSOptions = {},
+): string {
   try {
-    return esmToCjsViaAst(code);
+    return esmToCjsViaAst(code, options);
   } catch {
-    return esmToCjsViaRegex(code);
+    return esmToCjsViaRegex(code, options);
   }
 }
 
@@ -50,6 +58,7 @@ export function collectEsmCjsPatches(
   ast: any,
   code: string,
   patches: Array<[number, number, string]>,
+  options: ESMToCJSOptions = {},
 ): void {
   const hasDefaultExport = ast.body.some(
     (n: any) => n.type === "ExportDefaultDeclaration",
@@ -62,7 +71,7 @@ export function collectEsmCjsPatches(
       n.type === "ExportNamedDeclaration" || n.type === "ExportAllDeclaration",
   );
   const mixedExports = hasDefaultExport && hasNamedExport;
-
+  const defaultExportTarget = options.exportTarget ?? "module.exports";
   // collected during the walk, prepended at the bottom of this fn
   const hoistedFunctionExports: string[] = [];
 
@@ -131,7 +140,9 @@ export function collectEsmCjsPatches(
       }
     } else if (node.type === "ExportDefaultDeclaration") {
       const decl = node.declaration;
-      const exportTarget = mixedExports ? "exports.default" : "module.exports";
+      const exportTarget = mixedExports
+        ? "exports.default"
+        : defaultExportTarget;
 
       if (
         (decl.type === "FunctionDeclaration" ||
@@ -262,13 +273,13 @@ export function collectEsmCjsPatches(
   }
 }
 
-function esmToCjsViaAst(code: string): string {
+function esmToCjsViaAst(code: string, options: ESMToCJSOptions): string {
   const ast = acorn.parse(code, {
     ecmaVersion: "latest",
     sourceType: "module",
   });
   const patches: Array<[number, number, string]> = [];
-  collectEsmCjsPatches(ast as any, code, patches);
+  collectEsmCjsPatches(ast as any, code, patches, options);
 
   let output = code;
   patches.sort((a, b) => b[0] - a[0] || b[1] - a[1]);
@@ -490,8 +501,12 @@ export function stripTopLevelAwait(
   }
 }
 
-function esmToCjsViaRegex(code: string): string {
+function esmToCjsViaRegex(
+  code: string,
+  options: ESMToCJSOptions,
+): string {
   let out = code;
+  const exportTarget = options.exportTarget ?? "module.exports";
   // strip TS type-only imports
   out = out.replace(RE_TYPE_IMPORT_BRACES, "");
   out = out.replace(RE_TYPE_IMPORT_DEFAULT, "");
@@ -532,10 +547,10 @@ function esmToCjsViaRegex(code: string): string {
   );
   out = out.replace(RE_IMPORT_SIDE_EFFECT, 'require("$1");');
   // export default
-  out = out.replace(RE_EXPORT_DEFAULT_CLASS, "module.exports = class $1");
-  out = out.replace(RE_EXPORT_DEFAULT_FN_NAMED, "module.exports = function $1");
-  out = out.replace(RE_EXPORT_DEFAULT_FN_ANON, "module.exports = function(");
-  out = out.replace(RE_EXPORT_DEFAULT, "module.exports = ");
+  out = out.replace(RE_EXPORT_DEFAULT_CLASS, `${exportTarget} = class $1`);
+  out = out.replace(RE_EXPORT_DEFAULT_FN_NAMED, `${exportTarget} = function $1`);
+  out = out.replace(RE_EXPORT_DEFAULT_FN_ANON, `${exportTarget} = function(`);
+  out = out.replace(RE_EXPORT_DEFAULT, `${exportTarget} = `);
   // re-exports
   out = out.replace(RE_EXPORT_STAR_AS, 'exports.$1 = require("$2");');
   out = out.replace(RE_EXPORT_STAR, 'Object.assign(exports, require("$1"));');

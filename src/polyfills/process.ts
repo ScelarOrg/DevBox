@@ -583,6 +583,11 @@ export function buildProcessEnv(config?: {
     npm_execpath: DEFAULT_ENV.npm_execpath,
     npm_node_execpath: DEFAULT_ENV.npm_node_execpath,
     NAPI_RS_FORCE_WASM: "1",
+    // Keep napi-rs async WASM work serialized in the browser runtime. The
+    // generated WASI loaders share memory across delegated workers, so their
+    // callbacks must not overtake one another through the tab broker.
+    NAPI_RS_ASYNC_WORK_POOL_SIZE: "1",
+    UV_THREADPOOL_SIZE: "1",
     NEXT_TELEMETRY_DISABLED: "1",
     DO_NOT_TRACK: "1",
     ...config?.env,

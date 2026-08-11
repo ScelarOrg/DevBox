@@ -218,6 +218,35 @@ describe("tab-realm WASI worker broker", () => {
     }));
   });
 
+  it("cleans up immediately when worker initialization reports an error", () => {
+    vi.stubGlobal("Worker", FakeWorker);
+    const manager = new ProcessManager(new MemoryVolume());
+    const handle = new FakeProcessHandle();
+    (manager as any)._wireHandleEvents(handle);
+    handle.emit("wasiworker-request", {
+      type: "wasiworker-request",
+      requestId: 10,
+      source: "throw new Error('missing wasm asset')",
+      name: "broken-wasi",
+      workerData: null,
+    });
+
+    const worker = FakeWorker.instances[0];
+    worker.emitMessage({
+      __nodepod_worker_error__: "Error: missing wasm asset",
+    });
+
+    expect(manager.resourceStats().workers).toBe(0);
+    expect(worker.terminated).toBe(true);
+    expect(handle.sent).toContainEqual({
+      type: "child-exit",
+      requestId: 10,
+      exitCode: 1,
+      stdout: "",
+      stderr: "",
+    });
+  });
+
   it("spawns delegated emnapi threads without waiting on the process worker", () => {
     vi.stubGlobal("Worker", FakeWorker);
     const manager = new ProcessManager(new MemoryVolume());

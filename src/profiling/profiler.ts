@@ -220,6 +220,9 @@ class ProfileSessionImpl implements InternalSession {
   private longTaskLongestMs = 0;
   private droppedMetricKeys = 0;
   private memoryTimer: ReturnType<typeof setInterval> | null = null;
+  private readonly memorySamplePromises = new Set<Promise<void>>();
+  private memoryCapabilityWarningIssued = false;
+  private memorySampleWarningIssued = false;
   private observer: PerformanceObserver | null = null;
   private stopping: Promise<NodepodProfileReport> | null = null;
   private reportValue: NodepodProfileReport | null = null;
@@ -258,13 +261,22 @@ class ProfileSessionImpl implements InternalSession {
     }
 
     if (this.options.captureMemory) {
-      void this.addMemorySample();
+      this.scheduleMemorySample();
       this.memoryTimer = setInterval(() => {
-        void this.addMemorySample();
+        this.scheduleMemorySample();
       }, this.options.memorySampleIntervalMs);
       const unref = (this.memoryTimer as unknown as { unref?: () => void }).unref;
       unref?.call(this.memoryTimer);
     }
+  }
+
+  private scheduleMemorySample(): void {
+    const promise = this.addMemorySample();
+    this.memorySamplePromises.add(promise);
+    void promise.then(
+      () => this.memorySamplePromises.delete(promise),
+      () => this.memorySamplePromises.delete(promise),
+    );
   }
 
   begin(name: string, options: ProfileSpanOptions = {}): ProfileSpanToken | null {
@@ -298,6 +310,12 @@ class ProfileSessionImpl implements InternalSession {
     options: ProfileSpanOptions = {},
   ): void {
     if (this.options.level === "counters") return;
+    if (endedAt < startedAt) {
+      this.warning(
+        "clock-skew",
+        `The ${name} span ended before it started; its duration was clamped to zero.`,
+      );
+    }
     const token: ProfileSpanToken = {
       id: this.nextSpanId++,
       startedAt,
@@ -345,6 +363,7 @@ class ProfileSessionImpl implements InternalSession {
       if (durationMs >= this.options.slowSpanThresholdMs && durationMs > fastest.durationMs) {
         this.spansById.delete(fastest.id);
         this.spansById.set(span.id, span);
+        this.droppedSpansValue++;
       } else {
         this.droppedSpansValue++;
       }
@@ -416,7 +435,7 @@ class ProfileSessionImpl implements InternalSession {
           source: "measureUserAgentSpecificMemory",
           confidence: "estimated",
         };
-      } else if (perf?.memory) {
+    } else if (perf?.memory) {
         sample.browserHeap = {
           usedBytes: Number(perf.memory.usedJSHeapSize),
           totalBytes: Number(perf.memory.totalJSHeapSize),
@@ -424,11 +443,28 @@ class ProfileSessionImpl implements InternalSession {
           source: "performance.memory",
           confidence: "estimated",
         };
-      } else if (!this.profiler.memoryProvider) {
-        this.warning("memory-unsupported", "No supported memory measurement API is available.");
+      } else {
+        if (!this.memoryCapabilityWarningIssued) {
+          this.warning(
+            "memory-browser-api-unsupported",
+            "No browser heap measurement API is available; deterministic Nodepod memory data was retained.",
+          );
+          this.memoryCapabilityWarningIssued = true;
+        }
       }
     } catch {
-      this.warning("memory-sample-failed", "The browser memory measurement failed and was omitted.");
+      if (perf?.memory) {
+        sample.browserHeap = {
+          usedBytes: Number(perf.memory.usedJSHeapSize),
+          totalBytes: Number(perf.memory.totalJSHeapSize),
+          limitBytes: Number(perf.memory.jsHeapSizeLimit),
+          source: "performance.memory",
+          confidence: "estimated",
+        };
+      } else if (!this.memorySampleWarningIssued) {
+        this.warning("memory-sample-failed", "The browser memory measurement failed and was omitted.");
+        this.memorySampleWarningIssued = true;
+      }
     }
     this.sample(sample);
   }
@@ -447,7 +483,10 @@ class ProfileSessionImpl implements InternalSession {
     }
     this.observer?.disconnect();
     this.observer = null;
-    if (this.options.captureMemory && this.profiler.enabled) await this.addMemorySample();
+    if (this.options.captureMemory && this.profiler.enabled) {
+      await Promise.allSettled([...this.memorySamplePromises]);
+      await this.addMemorySample();
+    }
 
     const finishedAt = profileTimestamp();
     if (this.droppedMetricKeys > 0) {
@@ -554,6 +593,29 @@ function createReport(data: ReportData): NodepodProfileReport {
             args: { overlapSpanIds: sample.overlapSpanIds ?? [] },
           });
         }
+      }
+      for (const [name, value] of Object.entries(data.gauges)) {
+        traceEvents.push({
+          name: `nodepod.gauge.${name}`,
+          cat: "nodepod.metrics",
+          ph: "C",
+          ts: Math.round((data.startedAt - base) * 1000),
+          pid: 1,
+          tid: "main",
+          args: { [name]: value },
+        });
+      }
+      for (const warning of data.warnings) {
+        traceEvents.push({
+          name: warning.code,
+          cat: "nodepod.warning",
+          ph: "i",
+          s: "t",
+          ts: Math.round(((warning.timestamp ?? data.startedAt) - base) * 1000),
+          pid: 1,
+          tid: "main",
+          args: { message: warning.message },
+        });
       }
       return JSON.stringify({ traceEvents }, null, 2);
     },

@@ -39,6 +39,8 @@ export type {
   NodepodRequestOptions,
   Snapshot,
   SpawnOptions,
+  ShellLimits,
+  ShellOptions,
   StatResult,
   PerformanceStats,
   PerformanceTiming,

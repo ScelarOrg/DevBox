@@ -20,6 +20,7 @@ import {
 import { createProcessContext, getActiveContext, setActiveContext } from "../threading/process-context";
 import type { ProcessContext } from "../threading/process-context";
 import type { PmDeps, PkgManager } from "../shell/commands/pm-types";
+import type { ShellOptions } from "../shell/shell-options";
 import { createNpmCommand } from "../shell/commands/npm";
 import { createPnpmCommand } from "../shell/commands/pnpm";
 import { createYarnCommand } from "../shell/commands/yarn";
@@ -145,6 +146,8 @@ export function setStreamingCallbacks(cfg: {
   _termCols = cfg.getCols ?? null;
   _termRows = cfg.getRows ?? null;
   _rawModeChangeCb = cfg.onRawModeChange ?? null;
+  _shell?.setCancellationSignal(cfg.signal ?? null);
+  _shell?.setBackgroundOutputCallbacks(cfg.onStdout ?? null, cfg.onStderr ?? null);
 
   // also update active ProcessContext if present
   const ctx = getActiveContext();
@@ -166,6 +169,8 @@ export function clearStreamingCallbacks(): void {
   _termCols = null;
   _termRows = null;
   _rawModeChangeCb = null;
+  _shell?.setCancellationSignal(null);
+  _shell?.setBackgroundOutputCallbacks(null, null);
 
   // also clear active ProcessContext if present
   const ctx = getActiveContext();
@@ -187,6 +192,10 @@ export function setSabEnabled(enabled: boolean): void {
 }
 
 // onStdout/onStderr fire in real-time as output arrives; promise resolves on child exit
+export type SpawnChildOperation = Promise<{ pid: number; exitCode: number; stdout: string; stderr: string }> & {
+  kill?(signal?: string): boolean;
+};
+
 export type SpawnChildCallback = (
   command: string,
   args: string[],
@@ -197,7 +206,7 @@ export type SpawnChildCallback = (
     onStdout?: (data: string) => void;
     onStderr?: (data: string) => void;
   },
-) => Promise<{ pid: number; exitCode: number; stdout: string; stderr: string }>;
+) => SpawnChildOperation;
 
 let _spawnChildFn: SpawnChildCallback | null = null;
 
@@ -220,6 +229,7 @@ export type ForkChildCallback = (
 ) => {
   sendIPC: (data: unknown) => void;
   disconnect: () => void;
+  kill: (signal?: string) => boolean;
   requestId: number;
 };
 
@@ -314,7 +324,7 @@ export function sendStdin(text: string): void {
   stdin.emit("data", text);
 }
 
-export function initShellExec(volume: MemoryVolume, opts?: { cwd?: string; env?: Record<string, string> }): void {
+export function initShellExec(volume: MemoryVolume, opts?: { cwd?: string; env?: Record<string, string>; shell?: ShellOptions }): void {
   _vol = volume;
 
   _shell = new NodepodShell(volume, {
@@ -331,6 +341,7 @@ export function initShellExec(volume: MemoryVolume, opts?: { cwd?: string; env?:
       npm_node_execpath: DEFAULT_ENV.npm_node_execpath,
       ...opts?.env,
     },
+    shell: opts?.shell,
   });
 
   const pmDeps: PmDeps = {
@@ -351,9 +362,9 @@ export function initShellExec(volume: MemoryVolume, opts?: { cwd?: string; env?:
     npmWhoami: (ctx) => npmWhoami(_vol!, ctx),
     npmCacheClean: () => clearPmCaches(),
     npxExecute,
-    executeNodeBinary,
-    evalCode: (code, ctx) => evalNodeCode(code, ctx),
-    printCode: (code, ctx) => printNodeCode(code, ctx),
+    executeNodeBinary: executeShellNodeBinary,
+    evalCode: (code, ctx) => evalNodeCode(code, ctx, executeShellNodeBinary),
+    printCode: (code, ctx) => printNodeCode(code, ctx, executeShellNodeBinary),
     removeNodeModules: (cwd) => {
       const dir = `${cwd}/node_modules`.replace(/\/+/g, "/");
       if (_vol!.existsSync(dir)) removeDir(_vol!, dir);
@@ -378,11 +389,49 @@ export function initShellExec(volume: MemoryVolume, opts?: { cwd?: string; env?:
 
 // node -e / -p helpers (used by PmDeps)
 
-function evalNodeCode(code: string, ctx: ShellContext): Promise<ShellResult> {
+async function executeShellNodeBinary(filePath: string, args: string[], ctx: ShellContext): Promise<ShellResult> {
+  if (!_spawnChildFn) return executeNodeBinary(filePath, args, ctx);
+  // package scripts run Node binaries in a dedicated worker. stream output and
+  // inherit stdin so long-running interactive CLIs behave like local processes.
+  const stdoutSink = getStdoutSink();
+  const stderrSink = getStderrSink();
+  const operation = _spawnChildFn("node", [filePath, ...args], {
+    cwd: ctx.cwd,
+    env: ctx.env,
+    stdio: "inherit",
+    onStdout: stdoutSink ?? undefined,
+    onStderr: stderrSink ?? undefined,
+  });
+  const onAbort = () => operation.kill?.("SIGKILL");
+  if (ctx.signal?.aborted) onAbort();
+  else ctx.signal?.addEventListener("abort", onAbort, { once: true });
+  try {
+    const result = await operation;
+    return {
+      stdout: result.stdout,
+      stderr: result.stderr,
+      exitCode: ctx.signal?.aborted ? 130 : result.exitCode,
+    };
+  } catch (error) {
+    return {
+      stdout: "",
+      stderr: `node: ${error instanceof Error ? error.message : String(error)}\n`,
+      exitCode: ctx.signal?.aborted ? 130 : 1,
+    };
+  } finally {
+    ctx.signal?.removeEventListener("abort", onAbort);
+  }
+}
+
+function evalNodeCode(
+  code: string,
+  ctx: ShellContext,
+  executor: typeof executeNodeBinary = executeNodeBinary,
+): Promise<ShellResult> {
   if (!_vol) return Promise.resolve({ stdout: "", stderr: "Volume unavailable\n", exitCode: 1 });
   const evalPath = `/<eval-${Date.now()}-${Math.random().toString(36).slice(2)}>.js`;
   _vol.writeFileSync(evalPath, code);
-  return executeNodeBinary(evalPath, [], ctx).finally(() => {
+  return executor(evalPath, [], ctx).finally(() => {
     try {
       if (_vol!.existsSync(evalPath)) _vol!.unlinkSync(evalPath);
     } catch {
@@ -391,21 +440,37 @@ function evalNodeCode(code: string, ctx: ShellContext): Promise<ShellResult> {
   });
 }
 
-function printNodeCode(code: string, ctx: ShellContext): Promise<ShellResult> {
+function printNodeCode(
+  code: string,
+  ctx: ShellContext,
+  executor: typeof executeNodeBinary = executeNodeBinary,
+): Promise<ShellResult> {
   const wrapped = `const __nodepodPrintResult = (${code});\nif (typeof __nodepodPrintResult !== 'undefined') { process.stdout.write(String(__nodepodPrintResult) + '\\n'); }\n`;
-  return evalNodeCode(wrapped, ctx);
+  return evalNodeCode(wrapped, ctx, executor);
 }
 
 // npm helpers
 
-function removeDir(vol: MemoryVolume, dir: string): void {
-  for (const name of vol.readdirSync(dir)) {
-    const full = `${dir}/${name}`;
-    const st = vol.statSync(full);
-    if (st.isDirectory()) removeDir(vol, full);
-    else vol.unlinkSync(full);
+function removeDir(vol: MemoryVolume, dir: string, state = { entries: 0 }): void {
+  const pending: Array<{ path: string; visited: boolean }> = [{ path: dir, visited: false }];
+  while (pending.length > 0) {
+    const current = pending.pop()!;
+    if (current.visited) {
+      vol.rmdirSync(current.path);
+      continue;
+    }
+    if (++state.entries > 100_000) throw new Error("filesystem entry limit 100000 exceeded");
+    pending.push({ path: current.path, visited: true });
+    for (const name of vol.readdirSync(current.path)) {
+      const full = `${current.path}/${name}`;
+      const st = vol.lstatSync(full);
+      if (st.isDirectory()) pending.push({ path: full, visited: false });
+      else {
+        if (++state.entries > 100_000) throw new Error("filesystem entry limit 100000 exceeded");
+        vol.unlinkSync(full);
+      }
+    }
   }
-  vol.rmdirSync(dir);
 }
 
 function loadManifest(
@@ -1184,14 +1249,28 @@ export async function executeNodeBinary(
   let err = "";
   let didExit = false;
   let code = 0;
+  const outputLimit = ctx.limits?.maxOutputBytes ?? 4 * 1024 * 1024;
+  let outputLimitExceeded = false;
 
   const pushOut = (s: string): boolean => {
+    if (out.length + err.length + s.length > outputLimit) {
+      outputLimitExceeded = true;
+      out = "";
+      err = `shell: output exceeds ${outputLimit} bytes\n`;
+      throw new Error(`shell: output exceeds ${outputLimit} bytes`);
+    }
     out += s;
     const sink = getStdoutSink();
     if (sink) sink(s);
     return true;
   };
   const pushErr = (s: string): boolean => {
+    if (outputLimitExceeded) return false;
+    if (out.length + err.length + s.length > outputLimit) {
+      outputLimitExceeded = true;
+      err = `shell: output exceeds ${outputLimit} bytes\n`;
+      return false;
+    }
     err += s;
     const sink = getStderrSink();
     if (sink) sink(s);
@@ -1212,22 +1291,28 @@ export async function executeNodeBinary(
     cwd: ctx.cwd,
     env: ctx.env,
   });
+  const executionSignal = localCtx.abortController.signal;
   localCtx.stdoutSink = prevCtx?.stdoutSink ?? _stdoutSink;
   localCtx.stderrSink = prevCtx?.stderrSink ?? _stderrSink;
   localCtx.liveStdin = prevCtx?.liveStdin ?? _liveStdin;
   localCtx.termCols = prevCtx?.termCols ?? _termCols;
   localCtx.termRows = prevCtx?.termRows ?? _termRows;
-  // Propagate halt/abort from parent context or module signal
-  if (prevCtx && prevCtx.abortController.signal.aborted) {
-    localCtx.abortController.abort();
-  } else if (_haltSignal?.aborted) {
-    localCtx.abortController.abort();
-  } else if (_haltSignal) {
-    _haltSignal.addEventListener(
-      "abort",
-      () => localCtx.abortController.abort(),
-      { once: true },
-    );
+  // Propagate cancellation from every relevant parent signal and remove the
+  // listeners when this virtual process exits. Reusing a worker for many
+  // shell commands must not accumulate abort listeners.
+  const parentSignals = [
+    prevCtx?.abortController.signal,
+    _haltSignal,
+    ctx.signal,
+  ].filter((signal): signal is AbortSignal => !!signal);
+  const parentSignalCleanups: Array<() => void> = [];
+  for (const parentSignal of new Set(parentSignals)) {
+    const abortChild = () => localCtx.abortController.abort(parentSignal.reason);
+    if (parentSignal.aborted) abortChild();
+    else {
+      parentSignal.addEventListener("abort", abortChild, { once: true });
+      parentSignalCleanups.push(() => parentSignal.removeEventListener("abort", abortChild));
+    }
   }
   setActiveContext(localCtx);
 
@@ -1412,7 +1497,7 @@ export async function executeNodeBinary(
   // process.exit() called synchronously -- bail
   if (didExit) {
     cleanup();
-    return { stdout: out, stderr: err, exitCode: code };
+    return { stdout: outputLimitExceeded ? "" : out, stderr: err, exitCode: outputLimitExceeded ? 1 : code };
   }
 
   // yield once before the first wait-loop decision. crossing a macrotask
@@ -1485,7 +1570,11 @@ export async function executeNodeBinary(
       // path already emitted it from the proc.exit override.
       try { proc.emit("exit", finalCode); } catch { /* ignore */ }
       cleanup();
-      return { stdout: out, stderr: err, exitCode: finalCode };
+      return {
+        stdout: outputLimitExceeded ? "" : out,
+        stderr: err,
+        exitCode: outputLimitExceeded ? 1 : finalCode,
+      };
     }
     // a beforeExit handler revived the loop, fall through to the wait loop
     if (shouldStayAlive()) beforeExitEmitted = false;
@@ -1552,10 +1641,10 @@ export async function executeNodeBinary(
 
   try {
     // resolves when Ctrl+C / signal fires
-    const haltPromise = myHaltSignal
+    const haltPromise = executionSignal
       ? new Promise<void>((r) => {
-          if (myHaltSignal!.aborted) { r(); return; }
-          myHaltSignal!.addEventListener("abort", () => r(), { once: true });
+          if (executionSignal.aborted) { r(); return; }
+          executionSignal.addEventListener("abort", () => r(), { once: true });
         })
       : null;
 
@@ -1571,7 +1660,7 @@ export async function executeNodeBinary(
     // on any wake, check if we should still be alive. if not, emit beforeExit,
     // let handlers schedule more work, re-check, exit if truly drained.
 
-    while (!didExit && !myHaltSignal?.aborted) {
+    while (!didExit && !executionSignal.aborted) {
       // TLA still pending, wait for it (or drain/halt/exit).
       if (!tlaSettled) {
         const racers: Promise<unknown>[] = [
@@ -1588,7 +1677,7 @@ export async function executeNodeBinary(
       if (registry.activeRefedCount() === 0) {
         if (!beforeExitEmitted) {
           await emitBeforeExitOnce();
-          if (didExit || myHaltSignal?.aborted) break;
+          if (didExit || executionSignal.aborted) break;
           if (registry.activeRefedCount() > 0) {
             // a beforeExit handler revived us, reset for the next drain
             beforeExitEmitted = false;
@@ -1621,7 +1710,11 @@ export async function executeNodeBinary(
     if (!didExit) {
       try { proc.emit("exit", finalCode); } catch { /* ignore */ }
     }
-    return { stdout: out, stderr: err, exitCode: finalCode };
+    return {
+      stdout: outputLimitExceeded ? "" : out,
+      stderr: err,
+      exitCode: executionSignal.aborted ? 130 : outputLimitExceeded ? 1 : finalCode,
+    };
   } finally {
     cleanup();
     // defuse proc.exit so floating promises don't throw unhandled rejections
@@ -1638,6 +1731,7 @@ export async function executeNodeBinary(
     disposeAllTimers();
     getRegistry().closeAll();
     resetActiveInterfaceCount();
+    for (const cleanupParentSignal of parentSignalCleanups) cleanupParentSignal();
   }
   } finally {
     // restore outer process context. must happen AFTER the inner finally
@@ -1976,6 +2070,29 @@ const KNOWN_BINS: Record<string, string> = {
   git: "/usr/bin/git",
 };
 
+/**
+ * TypeScript 7's `tsc.js` is a launcher for a platform-native compiler. A
+ * browser Nodepod process cannot execute that binary, so make the limitation
+ * explicit instead of surfacing a misleading generic 127 / not-found error.
+ */
+export function getUnsupportedNativeExecutableMessage(
+  command: string,
+): string | null {
+  const normalized = command.replace(/\\/g, "/");
+  const isTypeScriptNativeCompiler =
+    /\/node_modules\/typescript\/(?:lib\/)?tsc(?:\.exe)?$/i.test(normalized) ||
+    /\/node_modules\/@typescript\/typescript-[^/]+\/(?:bin|lib)\/tsc(?:\.exe)?$/i.test(
+      normalized,
+    );
+  if (!isTypeScriptNativeCompiler) return null;
+  return (
+    "[Nodepod] TypeScript 7+ requires a native compiler executable that " +
+    "cannot run in the browser. Pin `typescript` to 5.9.x (or use an " +
+    "explicitly browser-compatible compiler); Nodepod does not rewrite " +
+    "package versions automatically."
+  );
+}
+
 function isBinaryAvailable(name: string): string | null {
   if (KNOWN_BINS[name]) return KNOWN_BINS[name];
   if (_vol) {
@@ -2071,6 +2188,14 @@ function syncFail(stderr: string, status = 1): SyncCommandResult {
 }
 
 function handleSyncCommand(cmd: string, opts?: RunOptions): SyncCommandResult | null {
+  const firstToken = cmd.trim().split(/\s+/, 1)[0]?.replace(/^['"]|['"]$/g, "");
+  const unsupportedNativeMessage = firstToken
+    ? getUnsupportedNativeExecutableMessage(firstToken)
+    : null;
+  if (unsupportedNativeMessage) {
+    return syncFail(`${unsupportedNativeMessage}\n`, 127);
+  }
+
   if (/^node\s+(--version|-v)\s*$/.test(cmd)) return syncOk(VERSIONS.NODE + "\n");
   if (/^npm\s+(--version|-v)\s*$/.test(cmd)) return syncOk(VERSIONS.NPM + "\n");
   if (/^pnpm\s+(--version|-v)\s*$/.test(cmd)) return syncOk(VERSIONS.PNPM + "\n");
@@ -2233,6 +2358,20 @@ export function spawn(
   } else if (argsOrOpts) cfg = argsOrOpts;
 
   const child = new ShellProcess();
+  const unsupportedNativeMessage = getUnsupportedNativeExecutableMessage(command);
+  if (unsupportedNativeMessage) {
+    queueMicrotask(() => {
+      child.emit("spawn");
+      child.stderr?.push(Buffer.from(`${unsupportedNativeMessage}\n`));
+      child.stdout?.push(null);
+      child.stderr?.push(null);
+      child.exitCode = 127;
+      child.emit("close", 127, null);
+      child.emit("exit", 127, null);
+    });
+    return child;
+  }
+
   // normalize stdio, node parity: 'pipe' default, 'inherit' to share parent
   // streams, 'ignore' to drop. current spawn protocol only carries one
   // top-level "pipe"|"inherit" so we pass "inherit" when stdin is inherit,
@@ -2262,7 +2401,7 @@ export function spawn(
     let stdoutStreamed = false;
     let stderrStreamed = false;
 
-    _spawnChildFn(command, spawnArgs, {
+    const operation = _spawnChildFn(command, spawnArgs, {
       cwd,
       env,
       stdio: stdinInherit ? "inherit" : "pipe",
@@ -2287,8 +2426,16 @@ export function spawn(
           if (sink) sink(data);
         }
       },
-    }).then(({ exitCode, stdout, stderr }) => {
+    });
+    child.kill = (signal = "SIGTERM") => {
+      if (child.exitCode !== null || child.killed) return false;
+      child.killed = true;
+      child.signalCode = signal;
+      return operation.kill?.(signal) ?? false;
+    };
+    operation.then(({ pid, exitCode, stdout, stderr }) => {
       childHandle.close();
+      child.pid = pid;
       // For commands that don't stream (builtins), push the buffered output
       if (!stdoutStreamed && stdout) child.stdout?.push(Buffer.from(stdout));
       if (!stderrStreamed && stderr) child.stderr?.push(Buffer.from(stderr));
@@ -2667,12 +2814,10 @@ export function fork(
   };
 
   child.kill = (sig?: string): boolean => {
+    if (child.killed || child.exitCode !== null) return false;
     child.killed = true;
     child.connected = false;
-    handle.disconnect();
-    child.emit("exit", null, sig ?? "SIGTERM");
-    child.emit("close", null, sig ?? "SIGTERM");
-    return true;
+    return handle.kill(sig ?? "SIGTERM");
   };
 
   child.disconnect = (): void => {

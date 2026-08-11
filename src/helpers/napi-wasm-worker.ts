@@ -195,8 +195,10 @@ export function buildNapiWorkerBundle(
 try {
   __require(${entryId});
 } catch(e) {
-  console.error('[worker] Entry point failed:', e?.message || e);
-  if (e?.stack) console.error(e.stack);
+  const __nodepodWorkerError = String(e && e.stack || e);
+  console.error('[worker] Entry point failed:', __nodepodWorkerError);
+  self.postMessage({ __nodepod_worker_error__: __nodepodWorkerError });
+  throw e;
 }
 `);
   }
@@ -571,13 +573,12 @@ function isBuiltin(id: string): boolean {
 
 // worker preamble: minimal Node.js stubs for running inside a Web Worker
 function WORKER_PREAMBLE(env: Record<string, string>): string {
-  // Generated NAPI-RS loaders interpret zero as their default pool size. Use
-  // one worker here; child-thread delegation remains owned by the parent.
+  // Generated NAPI-RS loaders interpret zero as their default pool size. Keep
+  // async work serialized here; child-thread delegation remains owned by the
+  // parent and can still create the workers required by the WASI runtime.
   // rayon/tokio thread spawning goes via emnapi's child-thread delegation:
   // child posts 'spawn-thread' to main, main creates Worker, writes TID to SAB
-  const defaultPoolSize = String(Math.max(1, Math.min(4,
-    typeof navigator !== "undefined" ? navigator.hardwareConcurrency || 4 : 4,
-  )));
+  const defaultPoolSize = "1";
   const workerEnv = { ...env };
   workerEnv.UV_THREADPOOL_SIZE ??= defaultPoolSize;
   workerEnv.NAPI_RS_ASYNC_WORK_POOL_SIZE ??= defaultPoolSize;
@@ -588,6 +589,12 @@ function WORKER_PREAMBLE(env: Record<string, string>): string {
 
 // retain the native sender before installing node-compatible globals
 const __nativePostMessage = self.postMessage.bind(self);
+
+const __reportWorkerError = (err) => {
+  const message = String(err && err.stack || err);
+  try { __nativePostMessage({ __nodepod_worker_error__: message }); } catch {}
+  return message;
+};
 
 // Bridge parentPort ↔ Web Worker message API
 const __parentPortListeners = [];
@@ -657,10 +664,16 @@ try { if (!globalThis.importScripts) globalThis.importScripts = function(f) {}; 
 self.onmessage = function(e) {
   if (__parentPortListeners.length > 0) {
     for (const fn of __parentPortListeners) {
-      try { fn(e.data); } catch (err) { console.error('[wasi-worker] parentPort listener error:', err); }
+      try { fn(e.data); } catch (err) {
+        const message = __reportWorkerError(err);
+        console.error('[wasi-worker] parentPort listener error:', message);
+      }
     }
   } else if (typeof globalThis.__userOnMessage === 'function') {
-    globalThis.__userOnMessage(e);
+    try { globalThis.__userOnMessage(e); } catch (err) {
+      const message = __reportWorkerError(err);
+      console.error('[wasi-worker] onmessage error:', message);
+    }
   }
 };
 

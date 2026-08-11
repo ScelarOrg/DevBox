@@ -1,7 +1,7 @@
 // Plan 017: persistent WASM module cache — hashing, content keying, and
 // graceful degradation when IndexedDB / structured clone are unavailable.
 
-import { describe, it, expect } from "vitest";
+import { afterEach, describe, it, expect, vi } from "vitest";
 import {
   quickWasmHash,
   wasmContentHash,
@@ -12,8 +12,14 @@ import {
   getCachedModule,
   precompileWasm,
 } from "../helpers/wasm-cache";
-import { buildCdnWasmUrl } from "../helpers/wasm-cdn";
+import {
+  buildCdnWasmUrl,
+  prefetchWasmFromCdn,
+  resolveWasmAssetPath,
+} from "../helpers/wasm-cdn";
 import { MemoryVolume } from "../memory-volume";
+
+afterEach(() => vi.unstubAllGlobals());
 
 // smallest valid wasm binary: magic + version
 const EMPTY_WASM = new Uint8Array([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]);
@@ -132,5 +138,46 @@ describe("buildCdnWasmUrl", () => {
     expect(buildCdnWasmUrl(vol, "/p/node_modules/foo/a.js")).toBeNull();
     expect(buildCdnWasmUrl(vol, "/p/src/a.wasm")).toBeNull();
     expect(buildCdnWasmUrl(vol, "/p/node_modules/@scope/a.wasm")).toBeNull();
+  });
+
+  it("maps a missing generic napi debug probe to the published release asset", () => {
+    const vol = volWith(
+      "/p/node_modules/@scope/binding-wasm32-wasi/package.json",
+      { name: "@scope/binding-wasm32-wasi", version: "1.2.3" },
+    );
+    const debugPath =
+      "/p/node_modules/@scope/binding-wasm32-wasi/binding.wasm32-wasi.debug.wasm";
+    expect(resolveWasmAssetPath(vol, debugPath)).toBe(
+      "/p/node_modules/@scope/binding-wasm32-wasi/binding.wasm32-wasi.wasm",
+    );
+    expect(buildCdnWasmUrl(vol, debugPath)).toBe(
+      "https://cdn.jsdelivr.net/npm/@scope/binding-wasm32-wasi@1.2.3/binding.wasm32-wasi.wasm",
+    );
+  });
+
+  it("prefetches and stores the real asset when a debug probe is missing", async () => {
+    const vol = volWith(
+      "/p/node_modules/@rolldown/binding-wasm32-wasi/package.json",
+      { name: "@rolldown/binding-wasm32-wasi", version: "1.2.3" },
+    );
+    const bytes = new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0]);
+    const fetchMock = vi.fn(async () =>
+      new Response(bytes, { status: 200, headers: { "content-type": "application/wasm" } }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const debugPath =
+      "/p/node_modules/@rolldown/binding-wasm32-wasi/rolldown-binding.wasm32-wasi.debug.wasm";
+    await expect(prefetchWasmFromCdn(vol, debugPath)).resolves.toBe(true);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://cdn.jsdelivr.net/npm/@rolldown/binding-wasm32-wasi@1.2.3/rolldown-binding.wasm32-wasi.wasm",
+    );
+    expect(vol.existsSync(debugPath)).toBe(false);
+    expect(
+      vol.existsSync(
+        "/p/node_modules/@rolldown/binding-wasm32-wasi/rolldown-binding.wasm32-wasi.wasm",
+      ),
+    ).toBe(true);
   });
 });

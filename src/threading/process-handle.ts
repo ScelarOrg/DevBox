@@ -12,6 +12,7 @@ import type {
 } from "./worker-protocol";
 
 const MAX_HANDLE_OUTPUT_BYTES = 5_000_000;
+const PROCESS_READY_TIMEOUT_MS = 30_000;
 
 /* ------------------------------------------------------------------ */
 /*  ProcessHandle                                                      */
@@ -33,6 +34,7 @@ export class ProcessHandle extends EventEmitter {
   private _fallbackWorker: (() => HostWorker) | null;
   private _pendingInit: { msg: MainToWorker_Init; transfer: Transferable[] } | null = null;
   private _probeTimer: ReturnType<typeof setTimeout> | null = null;
+  private _readyTimer: ReturnType<typeof setTimeout> | null = null;
 
   // When > 0, "exit" is deferred — children still running, output keeps flowing
   private _exitHoldCount = 0;
@@ -89,6 +91,10 @@ export class ProcessHandle extends EventEmitter {
       transfer.push(initMsg.snapshot.data);
     }
     if (extraTransfer) transfer.push(...extraTransfer);
+    this._readyTimer = setTimeout(() => {
+      this.emit("worker-error", `Process did not become ready within ${PROCESS_READY_TIMEOUT_MS}ms`, undefined);
+      this._terminate(1);
+    }, PROCESS_READY_TIMEOUT_MS);
     if (this._fallbackWorker) {
       this._pendingInit = { msg: initMsg, transfer };
       this.worker.postMessage({ type: "probe" });
@@ -160,6 +166,10 @@ export class ProcessHandle extends EventEmitter {
     this._exitCode = exitCode;
     this._deferredExit = null;
     this._exitHoldCount = 0;
+    if (this._probeTimer) clearTimeout(this._probeTimer);
+    if (this._readyTimer) clearTimeout(this._readyTimer);
+    this._probeTimer = null;
+    this._readyTimer = null;
     try { this.worker.terminate(); } catch {
       /* ignore */
     }
@@ -185,6 +195,8 @@ export class ProcessHandle extends EventEmitter {
           break;
 
         case "ready":
+          if (this._readyTimer) clearTimeout(this._readyTimer);
+          this._readyTimer = null;
           this._state = "running";
           this.emit("ready");
           break;
@@ -200,6 +212,8 @@ export class ProcessHandle extends EventEmitter {
           break;
 
         case "exit": {
+          if (this._readyTimer) clearTimeout(this._readyTimer);
+          this._readyTimer = null;
           const stdout = msg.stdout || this._stdout;
           const stderr = msg.stderr || this._stderr;
           this._stdout = this._trim(stdout);
@@ -236,6 +250,10 @@ export class ProcessHandle extends EventEmitter {
 
         case "spawn-request":
           this.emit("spawn-request", msg);
+          break;
+
+        case "child-signal":
+          this.emit("child-signal", msg);
           break;
 
         case "fork-request":
@@ -337,12 +355,17 @@ export class ProcessHandle extends EventEmitter {
     if (this._probeTimer) clearTimeout(this._probeTimer);
     this._probeTimer = null;
     try { this.worker.terminate(); } catch { /* ignore */ }
-    this.worker = factory();
-    this._setupWorkerListeners(this.worker);
-    if (this._pendingInit) {
-      const pending = this._pendingInit;
-      this._pendingInit = null;
-      this.postMessage(pending.msg, pending.transfer);
+    try {
+      this.worker = factory();
+      this._setupWorkerListeners(this.worker);
+      if (this._pendingInit) {
+        const pending = this._pendingInit;
+        this._pendingInit = null;
+        this.postMessage(pending.msg, pending.transfer);
+      }
+    } catch (error) {
+      this.emit("worker-error", error instanceof Error ? error.message : String(error), undefined);
+      this._terminate(1);
     }
   }
 }

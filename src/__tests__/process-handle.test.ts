@@ -78,4 +78,26 @@ describe("ProcessHandle worker handshake", () => {
       { type: "init", pid: 100, cwd: "/", env: {}, snapshot: config.snapshot },
     ]);
   });
+
+  it("terminates a worker that never becomes ready", () => {
+    vi.useFakeTimers();
+    const worker = new FakeWorker();
+    const config = {
+      command: "node",
+      args: [],
+      cwd: "/",
+      env: {},
+      snapshot: { manifest: [], data: new ArrayBuffer(0) },
+    };
+    const handle = new ProcessHandle(worker as unknown as Worker, config);
+    const exited = vi.fn();
+    handle.on("exit", exited);
+
+    handle.init({ type: "init", pid: 100, cwd: "/", env: {}, snapshot: config.snapshot });
+    vi.advanceTimersByTime(30_000);
+
+    expect(worker.terminated).toBe(true);
+    expect(handle.state).toBe("exited");
+    expect(exited).toHaveBeenCalledWith(1, "", "");
+  });
 });

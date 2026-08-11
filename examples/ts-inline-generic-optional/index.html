@@ -38,7 +38,7 @@
 <body>
   <h1>nodepod — TS inline generic with <code>value?:</code></h1>
   <p>
-    Recreates the Scelar / Vite failure where loading
+    Recreates a Vite + TypeScript failure where loading
     <code>server/api/databases/cells/[rowId].[columnId].ts</code> threw
     <code>SyntaxError: Unexpected token '?'</code>.
     The old regex stripper left
@@ -90,7 +90,7 @@ export function nanoid(): string {
 }
 </script>
 
-  <!-- Same smoking-gun PATCH as Scelar; helpers are VFS-absolute for reliable resolve -->
+  <!-- Minimal PATCH repro; helpers are VFS-absolute for reliable resolution. -->
   <script id="file-cells" type="text/plain">
 import { eq, and } from "/app/fake-drizzle.ts";
 import { nanoid } from "/app/fake-nanoid.ts";

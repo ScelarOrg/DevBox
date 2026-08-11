@@ -6,6 +6,21 @@
 import type { MemoryVolume } from "../memory-volume";
 import { precompileWasm, registerCompiledModule, PRECOMPILE_THRESHOLD } from "./wasm-cache";
 
+const WASM_DEBUG_SUFFIX = ".debug.wasm";
+
+/**
+ * NAPI-RS loaders may probe an optional `<name>.debug.wasm` next to the
+ * release `<name>.wasm`. A missing debug artifact must never turn into a CDN
+ * request for that filename: published packages commonly ship only release
+ * WASM. Keep the mapping generic for every napi-rs WASI package.
+ */
+export function resolveWasmAssetPath(volume: MemoryVolume, vfsPath: string): string {
+  if (!vfsPath.endsWith(WASM_DEBUG_SUFFIX) || volume.existsSync(vfsPath)) {
+    return vfsPath;
+  }
+  return vfsPath.slice(0, -WASM_DEBUG_SUFFIX.length) + ".wasm";
+}
+
 /**
  * Map a VFS path like `/project/node_modules/@scope/pkg/file.wasm` to its
  * jsdelivr URL, using the installed package.json version when available.
@@ -16,7 +31,9 @@ export function buildCdnWasmUrl(volume: MemoryVolume, vfsPath: string): string |
   const nmIdx = vfsPath.lastIndexOf("/node_modules/");
   if (nmIdx === -1) return null;
 
-  const afterNm = vfsPath.substring(nmIdx + "/node_modules/".length);
+  const assetPath = resolveWasmAssetPath(volume, vfsPath);
+
+  const afterNm = assetPath.substring(nmIdx + "/node_modules/".length);
   const parts = afterNm.split("/");
   let pkgName: string;
   let filePath: string;
@@ -56,11 +73,12 @@ export function isRecoverableWasmPath(vfsPath: unknown): vfsPath is string {
  * warm the compile caches. Deduplicated per path; never throws.
  */
 export function prefetchWasmFromCdn(volume: MemoryVolume, vfsPath: string): Promise<boolean> {
-  const existing = _inflight.get(vfsPath);
+  const assetPath = resolveWasmAssetPath(volume, vfsPath);
+  const existing = _inflight.get(assetPath);
   if (existing) return existing;
 
   const promise = (async (): Promise<boolean> => {
-    const cdnUrl = buildCdnWasmUrl(volume, vfsPath);
+    const cdnUrl = buildCdnWasmUrl(volume, assetPath);
     if (!cdnUrl || typeof fetch === "undefined") return false;
 
     try {
@@ -86,9 +104,9 @@ export function prefetchWasmFromCdn(volume: MemoryVolume, vfsPath: string): Prom
       if (bytes.byteLength === 0) return false;
 
       try {
-        const dir = vfsPath.substring(0, vfsPath.lastIndexOf("/")) || "/";
+        const dir = assetPath.substring(0, assetPath.lastIndexOf("/")) || "/";
         volume.mkdirSync(dir, { recursive: true });
-        volume.writeFileSync(vfsPath, bytes);
+        volume.writeFileSync(assetPath, bytes);
       } catch {
         /* VFS write is best-effort; compile caches still help */
       }
@@ -106,10 +124,10 @@ export function prefetchWasmFromCdn(volume: MemoryVolume, vfsPath: string): Prom
     } catch {
       return false;
     } finally {
-      _inflight.delete(vfsPath);
+      _inflight.delete(assetPath);
     }
   })();
 
-  _inflight.set(vfsPath, promise);
+  _inflight.set(assetPath, promise);
   return promise;
 }

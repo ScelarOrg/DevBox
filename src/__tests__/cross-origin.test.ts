@@ -1,10 +1,11 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import {
   setAllowedDomains,
   setProxy,
   resolveProxyUrl,
   isDomainAllowed,
 } from "../cross-origin";
+import { RegistryClient } from "../packages/registry-client";
 
 describe("cross-origin allowlist", () => {
   beforeEach(() => {
@@ -19,6 +20,10 @@ describe("cross-origin allowlist", () => {
         this._store[k] = v;
       },
     };
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
   });
 
   it("allows subdomain of a real domain", () => {
@@ -56,4 +61,32 @@ describe("cross-origin allowlist", () => {
   it("isDomainAllowed rejects evil.localhost", () => {
     expect(isDomainAllowed("https://evil.localhost/x")).toBe(false);
   });
+
+  it("retries a registry 404 from the configured proxy directly", async () => {
+    setAllowedDomains(null);
+    setProxy("https://proxy.test/?url=");
+    const metadata = {
+      name: "react",
+      "dist-tags": { latest: "1.0.0" },
+      versions: {},
+    };
+    const fetchMock = vi.fn(async (url: string | URL) =>
+      String(url).startsWith("https://proxy.test/")
+        ? new Response("proxy unavailable", { status: 404 })
+        : new Response(JSON.stringify(metadata), {
+            headers: { "content-type": "application/json" },
+          }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = new RegistryClient({
+      endpoint: "https://registry.example.test",
+    });
+    await expect(client.fetchManifest("react")).resolves.toEqual(metadata);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(String(fetchMock.mock.calls[1][0])).toBe(
+      "https://registry.example.test/react",
+    );
+  });
+
 });

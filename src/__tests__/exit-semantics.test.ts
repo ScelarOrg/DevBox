@@ -15,7 +15,7 @@ import {
 } from "../polyfills/child_process";
 import type { ShellContext } from "../shell/shell-types";
 
-function setup(files: Record<string, string>) {
+function setup(files: Record<string, string>, opts: { cwd?: string; env?: Record<string, string> } = {}) {
   const vol = new MemoryVolume();
   for (const [path, content] of Object.entries(files)) {
     const dir = path.substring(0, path.lastIndexOf("/")) || "/";
@@ -23,7 +23,7 @@ function setup(files: Record<string, string>) {
     vol.writeFileSync(path, content);
   }
   // wires volume into child_process so executeNodeBinary works
-  initShellExec(vol, { cwd: "/" });
+  initShellExec(vol, { cwd: opts.cwd ?? "/", env: opts.env });
   const ctx: ShellContext = {
     cwd: "/",
     env: { HOME: "/home", PATH: "/usr/bin", PWD: "/" },
@@ -37,6 +37,54 @@ function setup(files: Record<string, string>) {
 const SLOP_MS = 300;
 
 describe("exit semantics - libuv-parity", () => {
+  describe("shell command composition", () => {
+    it("creates a virtual file with a heredoc and runs it through node", async () => {
+      const { vol } = setup({}, { cwd: "/workspace" });
+      const { shellExec } = await import("../polyfills/child_process");
+      const result = await new Promise<{ error: Error | null; stdout: string; stderr: string }>((resolve) => {
+        shellExec(
+          "cat > /workspace/index.js <<'EOF'\nconsole.log(\"hello world\");\nEOF\nnode /workspace/index.js",
+          {},
+          (error, stdout, stderr) => resolve({ error, stdout, stderr }),
+        );
+      });
+      expect(result.error).toBeNull();
+      expect(result.stdout).toBe("hello world\n");
+      expect(result.stderr).toBe("");
+      expect(vol.readFileSync("/workspace/index.js", "utf8")).toContain("hello world");
+    });
+
+    it("supports timeout in a normal command chain", async () => {
+      const { vol } = setup({ "/workspace/hello.js": "console.log('hello');\n" });
+      const { shellExec } = await import("../polyfills/child_process");
+      const result = await new Promise<{ error: Error | null; stdout: string; stderr: string }>((resolve) => {
+        shellExec(
+          'cd /workspace && rm -f test.txt && timeout 5 node hello.js && echo "SUCCESS"',
+          {},
+          (error, stdout, stderr) => resolve({ error, stdout, stderr }),
+        );
+      });
+      expect(result.error).toBeNull();
+      expect(result.stdout).toBe("hello\nSUCCESS\n");
+      expect(result.stderr).toBe("");
+      expect(vol.existsSync("/workspace/test.txt")).toBe(false);
+    });
+
+    it("completes the empty workspace find pipeline through shellExec", async () => {
+      const { vol } = setup({}, { cwd: "/" });
+      vol.mkdirSync("/workspace", { recursive: true });
+      const { shellExec } = await import("../polyfills/child_process");
+      const result = await new Promise<{ error: Error | null; stdout: string; stderr: string }>((resolve) => {
+        shellExec(
+          "cd /workspace && ls -la && find . -maxdepth 2 -type f | head -100",
+          {},
+          (error, stdout, stderr) => resolve({ error, stdout, stderr }),
+        );
+      });
+      expect(result).toEqual({ error: null, stdout: expect.any(String), stderr: "" });
+    });
+  });
+
   describe("exit latency", () => {
     it("empty script exits immediately (< 200 ms)", async () => {
       const { ctx } = setup({

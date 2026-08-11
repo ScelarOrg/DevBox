@@ -137,7 +137,10 @@ import {
   registerCompiledModule,
   PRECOMPILE_THRESHOLD,
 } from "./helpers/wasm-cache";
-import { buildCdnWasmUrl } from "./helpers/wasm-cdn";
+import {
+  buildCdnWasmUrl,
+  resolveWasmAssetPath,
+} from "./helpers/wasm-cdn";
 import { getRegistry } from "./helpers/event-loop";
 import * as acorn from "acorn";
 import { isTypeScriptFile, stripTypeScript } from "./strip-typescript";
@@ -206,8 +209,27 @@ function rewriteDynamicImportsRegex(source: string): string {
 }
 
 // ── ESM → CJS conversion ──
-function convertModuleSyntax(source: string, filePath: string): string {
-  return convertModuleSyntaxDetailed(source, filePath).code;
+function convertModuleSyntax(
+  source: string,
+  filePath: string,
+  moduleExportName = "module",
+): string {
+  return convertModuleSyntaxDetailed(source, filePath, moduleExportName).code;
+}
+
+// ESM can legally declare/import `module`. Pure default exports historically
+// compiled to `module.exports`, which then wrote to that user binding instead
+// of the CommonJS module record. Keep the generated binding out of the source
+// namespace and use it consistently in both the transform and wrapper.
+function pickModuleExportName(source: string): string {
+  const base = "__nodepodModule";
+  let candidate = base;
+  let suffix = 0;
+  while (source.includes(candidate)) {
+    suffix++;
+    candidate = `${base}_${suffix}`;
+  }
+  return candidate;
 }
 
 function astHasTopLevelAwait(ast: any): boolean {
@@ -247,12 +269,13 @@ function astHasTopLevelAwait(ast: any): boolean {
 function convertModuleSyntaxDetailed(
   source: string,
   filePath: string,
+  moduleExportName = "module",
 ): { code: string; hasTLA: boolean } {
   if (!/\bimport\b|\bexport\b/.test(source)) {
     return { code: source, hasTLA: hasTopLevelAwait(source) };
   }
   try {
-    return convertViaAst(source, filePath);
+    return convertViaAst(source, filePath, moduleExportName);
   } catch (astErr) {
     _nativeConsole.warn(
       "[convertModuleSyntax] AST parse failed for",
@@ -260,7 +283,7 @@ function convertModuleSyntaxDetailed(
       "falling back to regex:",
       astErr instanceof Error ? astErr.message : String(astErr),
     );
-    const code = convertViaRegex(source, filePath);
+    const code = convertViaRegex(source, filePath, moduleExportName);
     return { code, hasTLA: hasTopLevelAwait(code) };
   }
 }
@@ -268,6 +291,7 @@ function convertModuleSyntaxDetailed(
 function convertViaAst(
   source: string,
   filePath: string,
+  moduleExportName: string,
 ): { code: string; hasTLA: boolean } {
   const ast = acorn.parse(source, {
     ecmaVersion: "latest",
@@ -296,7 +320,9 @@ function convertViaAst(
 
   // collect ESM→CJS patches from the same AST (no second parse)
   if (hasImportDecl || hasExportDecl) {
-    collectEsmCjsPatches(ast, source, patches);
+    collectEsmCjsPatches(ast, source, patches, {
+      exportTarget: `${moduleExportName}.exports`,
+    });
   }
 
   // apply all patches in one pass
@@ -335,6 +361,7 @@ function buildModuleWrapper(
     includeViteVars?: boolean;
     hideBrowserGlobals?: boolean;
     wasmHelpers?: boolean;
+    moduleExportName?: string;
   } = {},
 ): string {
   const {
@@ -343,6 +370,7 @@ function buildModuleWrapper(
     includeViteVars = true,
     hideBrowserGlobals = true,
     wasmHelpers = false,
+    moduleExportName,
   } = opts;
 
   const promiseVar = useNativePromise ? "globalThis.Promise" : "$SyncPromise";
@@ -355,7 +383,7 @@ function buildModuleWrapper(
   let vars = `var exports = $exports;
 var require = $require;
 var module = $module;
-var __filename = $filename;
+${moduleExportName ? `var ${moduleExportName} = $module;\n` : ""}var __filename = $filename;
 var __dirname = $dirname;
 `;
   if (includeViteVars) {
@@ -529,7 +557,11 @@ function replaceImportMetaOutsideLiterals(
   return out;
 }
 
-function convertViaRegex(source: string, filePath: string): string {
+function convertViaRegex(
+  source: string,
+  filePath: string,
+  moduleExportName: string,
+): string {
   let output = source;
   const dir = pathPolyfill.dirname(filePath);
   output = replaceImportMetaOutsideLiterals(output, (matched) => {
@@ -546,7 +578,9 @@ function convertViaRegex(source: string, filePath: string): string {
   const hasExport =
     /\bexport\s+(?:default|const|let|var|function|class|{|\*)/m.test(source);
   if (hasImport || hasExport) {
-    output = esmToCjs(output);
+    output = esmToCjs(output, {
+      exportTarget: `${moduleExportName}.exports`,
+    });
     if (hasExport) {
       // see ESM_SENTINEL above. #56
       output = ESM_SENTINEL + output;
@@ -948,10 +982,22 @@ function toImportNamespace(loaded: unknown): Record<string, unknown> {
 
 function makeDynamicLoader(
   resolver: ResolverFn,
-): (specifier: string) => SyncThenable<unknown> {
-  return (specifier: string): SyncThenable<unknown> => {
-    const loaded = resolver(specifier);
-    return new SyncThenable(toImportNamespace(loaded));
+): (specifier: string) => SyncThenable<unknown> | Promise<unknown> {
+  return (specifier: string): SyncThenable<unknown> | Promise<unknown> => {
+    try {
+      const loaded = resolver(specifier);
+      return new SyncThenable(toImportNamespace(loaded));
+    } catch (err) {
+      if (!(err instanceof AsyncModuleInitializationRequired)) throw err;
+
+      // Dynamic imports can happen from async callbacks after the entry module
+      // has already returned. Await and retry at this boundary so those late
+      // imports cannot receive an uninitialized synchronous polyfill.
+      return err.ready.then(() => {
+        const loaded = resolver(specifier);
+        return toImportNamespace(loaded);
+      });
+    }
   };
 }
 
@@ -1197,6 +1243,16 @@ const NATIVE_PACKAGE_POLYFILLS: Record<string, unknown> = {
   lightningcss: lightningcssPolyfill,
 };
 
+class AsyncModuleInitializationRequired extends Error {
+  constructor(
+    readonly moduleId: string,
+    readonly ready: Promise<unknown>,
+  ) {
+    super(`Asynchronous initialization is required before loading '${moduleId}'`);
+    this.name = "AsyncModuleInitializationRequired";
+  }
+}
+
 // ── Console wrapper ──
 // Captured at module load time to avoid infinite recursion when globalThis.console is overridden
 const _nativeConsole = console;
@@ -1339,14 +1395,11 @@ function buildResolver(
 
     if (id.includes("\\")) id = id.replace(/\\/g, "/");
 
-    if (
-      CORE_MODULES[id] ||
-      id === "fs" ||
-      id === "process" ||
-      id === "url" ||
-      id === "querystring" ||
-      id === "util"
-    ) {
+    // Only actual Node builtins resolve to their symbolic module id. Other
+    // entries in CORE_MODULES are runtime load shims for packages such as
+    // rollup and esbuild; require.resolve() must still return their VFS path
+    // so callers can derive package metadata from it.
+    if (moduleSysPolyfill.isBuiltin(id)) {
       return id;
     }
 
@@ -1717,6 +1770,7 @@ function buildResolver(
 
     const rawSource = vol.readFileSync(resolved, "utf8");
     const dir = pathPolyfill.dirname(resolved);
+    const moduleExportName = pickModuleExportName(rawSource);
 
     const codeCacheKey = `${resolved}|${quickDigest(rawSource)}`;
     let processedCode = codeCache?.get(codeCacheKey);
@@ -1777,7 +1831,11 @@ function buildResolver(
           /* can't parse — leave untransformed */
         }
       } else {
-        const converted = convertModuleSyntaxDetailed(processedCode, resolved);
+        const converted = convertModuleSyntaxDetailed(
+          processedCode,
+          resolved,
+          moduleExportName,
+        );
         processedCode = converted.code;
         moduleHasTLA = converted.hasTLA;
       }
@@ -1812,7 +1870,7 @@ function buildResolver(
     const wrappedConsole = wrapConsole(opts.onConsole);
 
     try {
-      const wrapper = buildModuleWrapper(processedCode);
+      const wrapper = buildModuleWrapper(processedCode, { moduleExportName });
 
       let fn;
       try {
@@ -1876,6 +1934,7 @@ function buildResolver(
           includeViteVars: false,
           hideBrowserGlobals: false,
           wasmHelpers: true,
+          moduleExportName,
         });
         try {
           const asyncFn = (0, eval)(asyncWrapper);
@@ -2116,7 +2175,8 @@ function buildResolver(
             const altResolved = resolveId(alt, baseDir);
             const altRec = loadModule(altResolved, resolver._ownerRecord);
             return altRec.exports;
-          } catch {
+          } catch (altErr: any) {
+            if (altErr instanceof AsyncModuleInitializationRequired) throw altErr;
             // not installed yet
           }
         }
@@ -2157,6 +2217,7 @@ function buildResolver(
             const altRec = loadModule(altResolved, resolver._ownerRecord);
             return altRec.exports;
           } catch (altErr: any) {
+            if (altErr instanceof AsyncModuleInitializationRequired) throw altErr;
             // surface WASM alt errors so they don't silently vanish
             if (altErr?.code !== "MODULE_NOT_FOUND") {
               _nativeConsole.warn(`[wasm-fallback] ${alt}:`, altErr?.message?.slice(0, 200));
@@ -2164,11 +2225,23 @@ function buildResolver(
           }
         }
         // last resort — built-in CDN polyfill (e.g. lightningcss)
-        // if it has async init(), block via syncAwait so sync APIs work immediately after
+        // if it has async init(), signal the async module runner to await it and retry
         const polyfillFallback = NATIVE_PACKAGE_POLYFILLS[id] as any;
         if (polyfillFallback) {
           if (typeof polyfillFallback.init === "function") {
-            try { syncAwait(polyfillFallback.init()); } catch { /* best effort */ }
+            const ready = typeof polyfillFallback.isReady === "function"
+              ? polyfillFallback.isReady()
+              : false;
+            if (!ready) {
+              const initResult = polyfillFallback.init();
+              if (typeof initResult?.then === "function") {
+                const initPromise = Promise.resolve(initResult);
+                // A synchronous caller cannot observe the eventual rejection;
+                // keep it attached while async callers await the same promise.
+                initPromise.catch(() => {});
+                throw new AsyncModuleInitializationRequired(id, initPromise);
+              }
+            }
           }
           return polyfillFallback;
         }
@@ -2204,7 +2277,11 @@ function buildResolver(
   }) as ResolverFn;
 
   resolver.resolve = (id: string, options?: { paths?: string[] }): string => {
-    if (id === "fs" || id === "process" || CORE_MODULES[id]) return id;
+    // CORE_MODULES also contains non-builtin package shims (for example
+    // rollup and esbuild). Keep those in the normal VFS resolver so
+    // require.resolve("rollup") returns /.../node_modules/rollup/... rather
+    // than the bare string "rollup".
+    if (moduleSysPolyfill.isBuiltin(id)) return id;
     if (options?.paths && Array.isArray(options.paths)) {
       for (const p of options.paths) {
         try {
@@ -2360,13 +2437,17 @@ export class ScriptEngine {
               | MemoryVolume
               | undefined;
             if (v) {
+              const wasmPath =
+                vfsPath.endsWith(".wasm") && vfsPath.includes("/node_modules/")
+                  ? resolveWasmAssetPath(v, vfsPath)
+                  : vfsPath;
               try {
-                const data = v.readFileSync(vfsPath);
+                const data = v.readFileSync(wasmPath);
                 const bytes =
                   data instanceof Uint8Array
                     ? data
                     : new TextEncoder().encode(String(data));
-                const contentType = vfsPath.endsWith(".wasm")
+                const contentType = wasmPath.endsWith(".wasm")
                   ? "application/wasm"
                   : "application/octet-stream";
                 return Promise.resolve(
@@ -2383,7 +2464,7 @@ export class ScriptEngine {
                 );
               } catch {
                 // .wasm under node_modules that aren't in the VFS (big binaries that didn't extract), pull from CDN
-                const cdnUrl = buildCdnWasmUrl(v, vfsPath);
+                const cdnUrl = buildCdnWasmUrl(v, wasmPath);
                 if (cdnUrl) {
                   return origFetch(cdnUrl).then((resp) => {
                     if (resp.ok) {
@@ -2404,9 +2485,9 @@ export class ScriptEngine {
                           const bytes = new Uint8Array(await forBytes.arrayBuffer());
                           try {
                             const dir =
-                              vfsPath.substring(0, vfsPath.lastIndexOf("/")) || "/";
+                              wasmPath.substring(0, wasmPath.lastIndexOf("/")) || "/";
                             v.mkdirSync(dir, { recursive: true });
-                            v.writeFileSync(vfsPath, bytes);
+                            v.writeFileSync(wasmPath, bytes);
                           } catch { /* best-effort */ }
                           if (streaming && bytes.byteLength >= PRECOMPILE_THRESHOLD) {
                             try {
@@ -2816,6 +2897,7 @@ export class ScriptEngine {
     if (isTypeScriptFile(filename)) {
       processed = stripTypeScript(processed, filename);
     }
+    const moduleExportName = pickModuleExportName(processed);
     let fileHasTLA = false;
     if (filename.endsWith(".cjs")) {
       try {
@@ -2860,7 +2942,11 @@ export class ScriptEngine {
         /* can't parse */
       }
     } else {
-      const converted = convertModuleSyntaxDetailed(processed, filename);
+      const converted = convertModuleSyntaxDetailed(
+        processed,
+        filename,
+        moduleExportName,
+      );
       processed = converted.code;
       fileHasTLA = converted.hasTLA;
     }
@@ -2882,7 +2968,7 @@ export class ScriptEngine {
     markResolverMain(resolver, mod);
 
     try {
-      const wrapper = buildModuleWrapper(processed);
+      const wrapper = buildModuleWrapper(processed, { moduleExportName });
 
       const asyncLoader = makeDynamicLoader(resolver);
       let fn;
@@ -2932,7 +3018,24 @@ export class ScriptEngine {
   runFileSync = this.runFile;
 
   // Wraps in async IIFE when TLA is detected, falls back to sync otherwise
-  async runFileTLA(
+  async runFileTLA(filename: string): Promise<{ exports: unknown; module: ModuleRecord }> {
+    let retries = 0;
+    while (true) {
+      try {
+        return await this.runFileTLAOnce(filename);
+      } catch (err) {
+        if (!(err instanceof AsyncModuleInitializationRequired) || retries++ >= 1) {
+          throw err;
+        }
+        // Await the actual initialization failure instead of returning an
+        // unready polyfill or hiding the original CDN/import error.
+        await err.ready;
+        this.clearCache();
+      }
+    }
+  }
+
+  private async runFileTLAOnce(
     filename: string,
   ): Promise<{ exports: unknown; module: ModuleRecord }> {
     const source = this.vol.readFileSync(filename, "utf8");
@@ -2959,12 +3062,17 @@ export class ScriptEngine {
     if (isTypeScriptFile(filename)) {
       processed = stripTypeScript(processed, filename);
     }
+    const moduleExportName = pickModuleExportName(processed);
     let tla = false;
     if (filename.endsWith(".cjs")) {
       processed = rewriteDynamicImportsRegex(processed);
       processed = replaceImportMetaOutsideLiterals(processed, () => "import_meta");
     } else {
-      const converted = convertModuleSyntaxDetailed(processed, filename);
+      const converted = convertModuleSyntaxDetailed(
+        processed,
+        filename,
+        moduleExportName,
+      );
       processed = converted.code;
       tla = converted.hasTLA;
     }
@@ -2988,7 +3096,7 @@ export class ScriptEngine {
     if (!tla) {
       try {
         processed = tlaStripped;
-        const wrapper = buildModuleWrapper(processed);
+        const wrapper = buildModuleWrapper(processed, { moduleExportName });
         const asyncLoader = makeDynamicLoader(resolver);
         const fn = (0, eval)(wrapper);
 
@@ -3014,7 +3122,10 @@ export class ScriptEngine {
     }
 
     try {
-      const wrapper = buildModuleWrapper(processed, { async: true });
+      const wrapper = buildModuleWrapper(processed, {
+        async: true,
+        moduleExportName,
+      });
       const asyncLoader = makeDynamicLoader(resolver);
       const fn = (0, eval)(wrapper);
       await fn(

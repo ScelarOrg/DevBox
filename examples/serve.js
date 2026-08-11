@@ -66,5 +66,6 @@ createServer((req, res) => {
   console.log(`  Vite dev exit 1:      http://localhost:${port}/examples/vite-dev-exit-1/  (auth+sqlite repro)`);
   console.log(`  import.meta.glob:     http://localhost:${port}/examples/import-meta-glob-test/`);
   console.log(`  Terminal + preview:   http://localhost:${port}/examples/terminal/`);
+  console.log(`  Vite 8 + TS 5.9:      http://localhost:${port}/examples/vite8-ts59-terminal/`);
   console.log(`  Preview inspector:     http://localhost:${port}/examples/preview-inspector/`);
 });

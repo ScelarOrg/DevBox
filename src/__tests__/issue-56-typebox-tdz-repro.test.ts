@@ -242,4 +242,5 @@ describe("issue 56 typebox 1.x TDZ regression", () => {
     );
     expect(r.exports).toEqual({ fromNamed: "inner", fromDefault: "inner" });
   });
+
 });

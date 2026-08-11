@@ -17,6 +17,7 @@ import type {
   SnapshotOptions,
   SpawnOptions,
 } from "./types";
+import type { ShellOptions } from "../shell/shell-options";
 import { NodepodFS } from "./nodepod-fs";
 import { NodepodProcess } from "./nodepod-process";
 import { NodepodTerminal } from "./nodepod-terminal";
@@ -116,6 +117,7 @@ export class Nodepod {
   private _proxy: RequestProxy;
   private _cwd: string;
   private _env: Record<string, string>;
+  private _shellOptions: ShellOptions;
 
   private _processManager: ProcessManager;
   private _vfsBridge: VFSBridge;
@@ -146,12 +148,14 @@ export class Nodepod {
     instanceId: string,
     performanceTracker: PerformanceTracker,
     profiler: NodepodProfilerImpl,
+    shellOptions: ShellOptions | undefined,
   ) {
     this._volume = volume;
     this._packages = packages;
     this._proxy = proxy;
     this._cwd = cwd;
     this._env = env;
+    this._shellOptions = shellOptions ?? {};
     this._handler = handler;
     this._unsubscribePressure = handler.onPressure(() => {
       // only discard reproducible data; live modules, processes, servers and
@@ -311,6 +315,7 @@ export class Nodepod {
     }
 
     const packages = new DependencyInstaller(volume, {
+      cwd,
       snapshotCache,
       performanceTracker,
       profiler: profiler.enabled ? profiler : null,
@@ -338,6 +343,7 @@ export class Nodepod {
       makeInstanceId(),
       performanceTracker,
       profiler,
+      opts.shell,
     );
     nodepod._headless = headless;
     profiler.setMemoryProvider(() => nodepod.memoryStats() as unknown as Record<string, unknown>);
@@ -512,6 +518,11 @@ export class Nodepod {
       args: args ?? [],
       cwd: execCwd,
       env: combinedEnv,
+      shell: {
+        ...this._shellOptions,
+        ...(opts?.shell ?? {}),
+        limits: { ...(this._shellOptions.limits ?? {}), ...(opts?.shell?.limits ?? {}) },
+      },
     });
 
     handle.on("stdout", (data: string) => {
@@ -631,6 +642,11 @@ export class Nodepod {
         args: [],
         cwd: terminal.getCwd(),
         env: this._env,
+        shell: {
+          ...this._shellOptions,
+          ...(opts.shell ?? {}),
+          limits: { ...(this._shellOptions.limits ?? {}), ...(opts.shell?.limits ?? {}) },
+        },
       });
       shellReady = new Promise<void>((resolve) => {
         const seedSize = () => {

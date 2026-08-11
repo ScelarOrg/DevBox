@@ -10,6 +10,7 @@ import {
   MONTHS_LONG,
   DAYS_SHORT,
   DAYS_LONG,
+  waitForShellDelay,
 } from "../shell-helpers";
 
 // set by the registry so `which` and `type` can check builtins
@@ -172,13 +173,13 @@ function evalTest(args: string[], ctx: ShellContext): boolean {
     if (flag === "-s") {
       try { return ctx.volume.readFileSync(p).length > 0; } catch { return false; }
     }
-    if (flag === "-r" || flag === "-w") return ctx.volume.existsSync(p);
-    if (flag === "-x") {
-      if (ctx.volume.existsSync(p)) {
-        const ext = pathModule.extname(p);
-        return ext === ".sh" || ext === "" || p.includes("/bin/");
+    if (flag === "-r" || flag === "-w" || flag === "-x") {
+      try {
+        ctx.volume.accessSync(p, flag === "-r" ? 4 : flag === "-w" ? 2 : 1);
+        return true;
+      } catch {
+        return false;
       }
-      return false;
     }
     if (flag === "-n") return val.length > 0;
     if (flag === "-z") return val.length === 0;
@@ -330,9 +331,16 @@ const date_cmd: BuiltinFn = (args) => {
 /*  sleep                                                              */
 /* ------------------------------------------------------------------ */
 
-const sleep_cmd: BuiltinFn = async (args) => {
+const sleep_cmd: BuiltinFn = async (args, ctx) => {
   const seconds = parseFloat(args[0] || "0");
-  if (seconds > 0) await new Promise((r) => setTimeout(r, seconds * 1000));
+  if (!Number.isFinite(seconds) || seconds < 0) {
+    return fail(`sleep: invalid time interval '${args[0] ?? ""}'\n`);
+  }
+  if (seconds > 0) {
+    const signal = ctx.signal;
+    const completed = await waitForShellDelay(seconds * 1000, signal);
+    if (!completed) return { stdout: "", stderr: "", exitCode: 130 };
+  }
   return ok();
 };
 

@@ -439,5 +439,18 @@ describe("shell builtins", () => {
       expect(yes.exitCode).toBe(0);
       expect(no.exitCode).toBe(1);
     });
+
+    it("cp -r preserves symlinks and rm -r does not follow them", async () => {
+      const ctx = makeCtx({ "/target.txt": "data", "/src/file.txt": "file" });
+      ctx.volume.symlinkSync("/target.txt", "/src/link.txt");
+      const copied = await run("cp", ["-r", "/src", "/dst"], ctx);
+      expect(copied.exitCode).toBe(0);
+      expect(ctx.volume.lstatSync("/dst/link.txt").isSymbolicLink()).toBe(true);
+      expect(ctx.volume.readlinkSync("/dst/link.txt")).toBe("/target.txt");
+
+      const removed = await run("rm", ["-r", "/src"], ctx);
+      expect(removed.exitCode).toBe(0);
+      expect(ctx.volume.existsSync("/target.txt")).toBe(true);
+    });
   });
 });

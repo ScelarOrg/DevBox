@@ -1,0 +1,605 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Nodepod · Vite 8 + TypeScript 5.9</title>
+    <link rel="stylesheet" href="/node_modules/@xterm/xterm/css/xterm.css" />
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family:
+          Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+          "Segoe UI", sans-serif;
+        background: #070b14;
+        color: #e5eefb;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+      }
+
+      body {
+        display: grid;
+        grid-template-rows: auto minmax(0, 1fr);
+        overflow: hidden;
+        background:
+          radial-gradient(circle at 15% -20%, rgb(74 222 128 / 16%), transparent 34rem),
+          radial-gradient(circle at 95% 0%, rgb(96 165 250 / 12%), transparent 30rem),
+          #070b14;
+      }
+
+      header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 1rem;
+        min-height: 68px;
+        padding: 0.8rem 1.1rem;
+        border-bottom: 1px solid #223049;
+        background: rgb(7 11 20 / 86%);
+        backdrop-filter: blur(18px);
+      }
+
+      .brand,
+      .status,
+      .pane-title,
+      .badges,
+      .preview-address {
+        display: flex;
+        align-items: center;
+      }
+
+      .brand {
+        gap: 0.8rem;
+      }
+
+      .mark {
+        display: grid;
+        width: 38px;
+        height: 38px;
+        place-items: center;
+        border: 1px solid #2b4361;
+        border-radius: 12px;
+        background: linear-gradient(145deg, #17243a, #0d1525);
+        color: #5ee6a8;
+        font: 800 18px/1 ui-monospace, monospace;
+        box-shadow: inset 0 1px rgb(255 255 255 / 8%);
+      }
+
+      h1,
+      p {
+        margin: 0;
+      }
+
+      h1 {
+        font-size: 0.96rem;
+        letter-spacing: -0.01em;
+      }
+
+      .subtitle {
+        margin-top: 0.2rem;
+        color: #7f90aa;
+        font-size: 0.76rem;
+      }
+
+      .status {
+        gap: 0.55rem;
+        color: #aab8cb;
+        font: 600 0.76rem/1 ui-monospace, monospace;
+      }
+
+      .status-dot {
+        width: 9px;
+        height: 9px;
+        border-radius: 999px;
+        background: #fbbf24;
+        box-shadow: 0 0 0 4px rgb(251 191 36 / 12%);
+      }
+
+      body[data-state="running"] .status-dot {
+        background: #4ade80;
+        box-shadow: 0 0 0 4px rgb(74 222 128 / 12%);
+      }
+
+      body[data-state="failed"] .status-dot {
+        background: #fb7185;
+        box-shadow: 0 0 0 4px rgb(251 113 133 / 12%);
+      }
+
+      .workspace {
+        display: grid;
+        grid-template-columns: minmax(360px, 0.92fr) minmax(440px, 1.08fr);
+        min-height: 0;
+        padding: 0.9rem;
+        gap: 0.9rem;
+      }
+
+      .pane {
+        display: grid;
+        grid-template-rows: auto minmax(0, 1fr);
+        min-width: 0;
+        min-height: 0;
+        overflow: hidden;
+        border: 1px solid #223049;
+        border-radius: 14px;
+        background: #0a101d;
+        box-shadow: 0 20px 50px rgb(0 0 0 / 24%);
+      }
+
+      .pane-title {
+        min-height: 47px;
+        justify-content: space-between;
+        gap: 0.75rem;
+        padding: 0 0.9rem;
+        border-bottom: 1px solid #202d43;
+        color: #9dacc1;
+        font-size: 0.75rem;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      .badges {
+        gap: 0.4rem;
+      }
+
+      .badge {
+        padding: 0.28rem 0.5rem;
+        border: 1px solid #2a3b55;
+        border-radius: 999px;
+        background: #10192a;
+        color: #bdc9d9;
+        font: 600 0.66rem/1 ui-monospace, monospace;
+        letter-spacing: 0;
+        text-transform: none;
+      }
+
+      #terminal {
+        min-width: 0;
+        min-height: 0;
+        padding: 0.65rem 0.35rem 0.45rem 0.7rem;
+        background: #070b14;
+      }
+
+      #terminal .xterm,
+      #terminal .xterm-screen {
+        height: 100%;
+      }
+
+      .preview-shell {
+        display: grid;
+        grid-template-rows: auto minmax(0, 1fr);
+        min-height: 0;
+        background: #f6f8fb;
+      }
+
+      .preview-address {
+        gap: 0.55rem;
+        min-height: 43px;
+        padding: 0.55rem 0.65rem;
+        border-bottom: 1px solid #cdd7e5;
+        background: #e9eef5;
+      }
+
+      .traffic-lights {
+        display: flex;
+        gap: 5px;
+      }
+
+      .traffic-lights span {
+        width: 8px;
+        height: 8px;
+        border-radius: 99px;
+        background: #b7c2d1;
+      }
+
+      .address {
+        min-width: 0;
+        flex: 1;
+        overflow: hidden;
+        padding: 0.38rem 0.55rem;
+        border: 1px solid #cbd5e1;
+        border-radius: 7px;
+        background: #fff;
+        color: #65758b;
+        font: 0.7rem/1 ui-monospace, monospace;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      #open-preview {
+        padding: 0.38rem 0.6rem;
+        border: 1px solid #bdc8d7;
+        border-radius: 7px;
+        background: #fff;
+        color: #536277;
+        font-size: 0.7rem;
+        font-weight: 700;
+        text-decoration: none;
+      }
+
+      #open-preview[aria-disabled="true"] {
+        opacity: 0.45;
+        pointer-events: none;
+      }
+
+      #preview {
+        width: 100%;
+        height: 100%;
+        border: 0;
+        background: #f6f8fb;
+      }
+
+      @media (max-width: 850px) {
+        body {
+          overflow: auto;
+        }
+
+        .workspace {
+          grid-template-columns: 1fr;
+          grid-template-rows: 470px 520px;
+        }
+
+        header {
+          align-items: flex-start;
+        }
+      }
+    </style>
+  </head>
+  <body data-state="booting">
+    <header>
+      <div class="brand">
+        <div class="mark">N</div>
+        <div>
+          <h1>Nodepod Vite dev server</h1>
+          <p class="subtitle">A complete project running inside the browser</p>
+        </div>
+      </div>
+      <div class="status" role="status" aria-live="polite">
+        <span class="status-dot"></span>
+        <span id="status-text">Booting Nodepod…</span>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <section class="pane" aria-label="Nodepod terminal">
+        <div class="pane-title">
+          <span>Terminal · /project</span>
+          <div class="badges">
+            <span class="badge">pnpm</span>
+            <span class="badge">Nodepod</span>
+          </div>
+        </div>
+        <div id="terminal"></div>
+      </section>
+
+      <section class="pane" aria-label="Vite preview">
+        <div class="pane-title">
+          <span>Preview</span>
+          <div class="badges">
+            <span class="badge">Vite 8.2.0</span>
+            <span class="badge">TypeScript 5.9.3</span>
+          </div>
+        </div>
+        <div class="preview-shell">
+          <div class="preview-address">
+            <div class="traffic-lights" aria-hidden="true"><span></span><span></span><span></span></div>
+            <div id="preview-url" class="address">Waiting for Vite on port 5173…</div>
+            <a id="open-preview" href="#" target="_blank" rel="noreferrer" aria-disabled="true">Open</a>
+          </div>
+          <iframe
+            id="preview"
+            title="Vite application preview"
+            srcdoc="<!doctype html><html><body style='margin:0;background:#f6f8fb;color:#7b8ba1;font:14px system-ui;display:grid;place-items:center;height:100vh'><p>Installing the in-browser project…</p></body></html>"
+          ></iframe>
+        </div>
+      </section>
+    </main>
+
+    <script type="module">
+      import { Nodepod } from "/dist/index.mjs";
+      import { Terminal } from "/node_modules/@xterm/xterm/lib/xterm.mjs";
+      import { FitAddon } from "/node_modules/@xterm/addon-fit/lib/addon-fit.mjs";
+
+      const statusText = document.querySelector("#status-text");
+      const preview = document.querySelector("#preview");
+      const previewUrl = document.querySelector("#preview-url");
+      const openPreview = document.querySelector("#open-preview");
+
+      const projectFiles = {
+        "/project/package.json": JSON.stringify(
+          {
+            name: "nodepod-vite8-ts59-demo",
+            private: true,
+            version: "0.0.0",
+            type: "module",
+            scripts: {
+              dev: "vite --host 0.0.0.0 --port 5173 --strictPort",
+              build: "tsc --noEmit && vite build",
+            },
+            devDependencies: {
+              typescript: "5.9.3",
+              vite: "8.2.0",
+            },
+          },
+          null,
+          2,
+        ),
+        "/project/tsconfig.json": JSON.stringify(
+          {
+            compilerOptions: {
+              target: "ES2022",
+              useDefineForClassFields: true,
+              module: "ESNext",
+              lib: ["ES2022", "DOM", "DOM.Iterable"],
+              skipLibCheck: true,
+              moduleResolution: "Bundler",
+              allowImportingTsExtensions: true,
+              isolatedModules: true,
+              moduleDetection: "force",
+              noEmit: true,
+              strict: true,
+            },
+            include: ["src"],
+          },
+          null,
+          2,
+        ),
+        "/project/index.html": `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#0b1020" />
+    <title>Vite 8 + TypeScript 5.9 in Nodepod</title>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"><\/script>
+  </body>
+</html>
+`,
+        "/project/src/main.ts": `import "./style.css";
+
+type Stack = {
+  runtime: string;
+  vite: string;
+  typescript: string;
+};
+
+const stack = {
+  runtime: "Nodepod",
+  vite: "8.2.0",
+  typescript: "5.9.3",
+} satisfies Stack;
+
+document.querySelector<HTMLDivElement>("#app")!.innerHTML = \`
+  <main class="card">
+    <div class="eyebrow"><span></span> Running entirely in your browser</div>
+    <p class="kicker">\${stack.runtime} demo</p>
+    <h1>Vite 8 + TypeScript 5.9</h1>
+    <p class="lede">
+      This page is being served by Vite from inside Nodepod. Edit the mounted
+      files through <code>pod.fs</code> and Vite can refresh the preview.
+    </p>
+    <div class="versions">
+      <div><span>Bundler</span><strong>Vite \${stack.vite}</strong></div>
+      <div><span>Language</span><strong>TypeScript \${stack.typescript}</strong></div>
+      <div><span>Server</span><strong>localhost:5173</strong></div>
+    </div>
+    <button id="count" type="button">Count is 0</button>
+  </main>
+\`;
+
+const countButton = document.querySelector<HTMLButtonElement>("#count")!;
+let count = 0;
+countButton.addEventListener("click", () => {
+  count += 1;
+  countButton.textContent = \`Count is \${count}\`;
+});
+`,
+        "/project/src/style.css": `
+:root {
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: #172033;
+  background: #f4f7fb;
+  font-synthesis: none;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  min-width: 320px;
+  min-height: 100vh;
+  margin: 0;
+  display: grid;
+  place-items: center;
+  padding: 2rem;
+  background:
+    radial-gradient(circle at 15% 15%, rgb(74 222 128 / 24%), transparent 20rem),
+    radial-gradient(circle at 85% 15%, rgb(96 165 250 / 22%), transparent 23rem),
+    #f4f7fb;
+}
+
+.card {
+  width: min(680px, 100%);
+  padding: clamp(1.8rem, 5vw, 3.8rem);
+  border: 1px solid rgb(148 163 184 / 45%);
+  border-radius: 28px;
+  background: rgb(255 255 255 / 78%);
+  box-shadow: 0 28px 80px rgb(41 55 80 / 16%);
+  backdrop-filter: blur(18px);
+}
+
+.eyebrow {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  color: #53647b;
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
+.eyebrow span {
+  width: 9px;
+  height: 9px;
+  border-radius: 99px;
+  background: #22c55e;
+  box-shadow: 0 0 0 5px rgb(34 197 94 / 13%);
+}
+
+.kicker {
+  margin: 2.3rem 0 0.45rem;
+  color: #596a82;
+  font: 700 0.78rem/1 ui-monospace, monospace;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+h1 {
+  margin: 0;
+  color: #111827;
+  font-size: clamp(2.1rem, 7vw, 4.6rem);
+  line-height: 0.96;
+  letter-spacing: -0.065em;
+}
+
+.lede {
+  max-width: 55ch;
+  margin: 1.35rem 0 1.6rem;
+  color: #5a6a80;
+  font-size: 1rem;
+  line-height: 1.7;
+}
+
+code {
+  color: #0f766e;
+  font-weight: 700;
+}
+
+.versions {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  overflow: hidden;
+  border: 1px solid #d9e1ec;
+  border-radius: 15px;
+}
+
+.versions div {
+  display: grid;
+  gap: 0.35rem;
+  padding: 0.9rem;
+}
+
+.versions div + div { border-left: 1px solid #d9e1ec; }
+.versions span { color: #8390a3; font-size: 0.69rem; text-transform: uppercase; }
+.versions strong { color: #233047; font: 700 0.79rem/1.25 ui-monospace, monospace; }
+
+button {
+  margin-top: 1.35rem;
+  padding: 0.75rem 1rem;
+  border: 0;
+  border-radius: 10px;
+  background: #172033;
+  color: #fff;
+  font: 700 0.8rem/1 ui-monospace, monospace;
+  cursor: pointer;
+}
+
+button:hover { background: #263754; }
+
+@media (max-width: 600px) {
+  .versions { grid-template-columns: 1fr; }
+  .versions div + div { border-top: 1px solid #d9e1ec; border-left: 0; }
+}
+`,
+      };
+
+      let terminal;
+      let readyTimer;
+
+      function setState(state, text) {
+        document.body.dataset.state = state;
+        statusText.textContent = text;
+      }
+
+      function fail(error) {
+        clearTimeout(readyTimer);
+        const message = error instanceof Error ? error.message : String(error);
+        setState("failed", `Failed: ${message}`);
+        terminal?.writeln(`\r\n\x1b[31mDemo failed: ${message}\x1b[0m`);
+        console.error(error);
+      }
+
+      try {
+        const pod = await Nodepod.boot({
+          swUrl: "/__sw__.js",
+          workdir: "/project",
+          allowedFetchDomains: null,
+          watermark: false,
+          files: projectFiles,
+          onServerReady(port, url) {
+            if (port !== 5173) return;
+            clearTimeout(readyTimer);
+            previewUrl.textContent = url;
+            openPreview.href = url;
+            openPreview.setAttribute("aria-disabled", "false");
+            preview.removeAttribute("srcdoc");
+            preview.src = url;
+            setState("running", "Vite is running on port 5173");
+          },
+        });
+
+        terminal = pod.createTerminal({
+          Terminal,
+          FitAddon,
+          fontSize: 13,
+          fontFamily: "'Cascadia Code', 'JetBrains Mono', Consolas, monospace",
+          autoPrompt: false,
+          theme: {
+            background: "#070b14",
+            foreground: "#d7e0ed",
+            cursor: "#5ee6a8",
+            selectionBackground: "#253b5a",
+          },
+        });
+        terminal.attach(document.querySelector("#terminal"));
+
+        window.nodepodDemo = { pod, terminal, projectFiles };
+
+        terminal.writeln("\x1b[90mMounted Vite 8.2.0 + TypeScript 5.9.3 at /project\x1b[0m");
+        terminal.writeln("\x1b[90mInstalling project dependencies inside Nodepod…\x1b[0m");
+        setState("installing", "Installing Vite 8.2.0 and TypeScript 5.9.3…");
+
+        await pod.packages.installFromManifest("/project/package.json", {
+          withDevDeps: true,
+        });
+
+        terminal.writeln("\x1b[32mDependencies installed. Starting the dev server…\x1b[0m");
+        terminal.showPrompt();
+        setState("starting", "Typing pnpm run dev…");
+
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        terminal.input("pnpm run dev");
+        await new Promise((resolve) => setTimeout(resolve, 350));
+        terminal.input("\r");
+
+        readyTimer = setTimeout(() => {
+          if (document.body.dataset.state !== "running") {
+            fail(new Error("Vite did not bind port 5173 within 90 seconds"));
+          }
+        }, 90_000);
+      } catch (error) {
+        fail(error);
+      }
+    </script>
+  </body>
+</html>

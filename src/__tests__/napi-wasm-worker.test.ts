@@ -46,6 +46,44 @@ describe("napi WASI worker bundle", () => {
     expect(bundle).toContain('"dynamic-runtime":"/node_modules/dynamic-runtime.mjs"');
   });
 
+  it("reports entry initialization failures to the broker", () => {
+    const vol = new MemoryVolume();
+    vol.mkdirSync("/node_modules/example", { recursive: true });
+    vol.writeFileSync(
+      "/node_modules/example/wasi-worker.mjs",
+      'throw new Error("missing wasm asset");',
+    );
+    vol.writeFileSync("/node_modules/example/example.wasm", new Uint8Array());
+
+    const bundle = buildNapiWorkerBundle(
+      "/node_modules/example/wasi-worker.mjs",
+      vol,
+      () => { throw new Error("unexpected dependency"); },
+      {},
+    );
+
+    expect(bundle).toContain("__nodepod_worker_error__");
+    expect(bundle).toContain("throw e;");
+  });
+
+  it("serializes generated WASI worker async pools by default", () => {
+    const vol = new MemoryVolume();
+    vol.mkdirSync("/node_modules/example", { recursive: true });
+    vol.writeFileSync("/node_modules/example/wasi-worker.mjs", "");
+    vol.writeFileSync("/node_modules/example/example.wasm", new Uint8Array());
+
+    const bundle = buildNapiWorkerBundle(
+      "/node_modules/example/wasi-worker.mjs",
+      vol,
+      (id) => `/node_modules/${id}.mjs`,
+      {},
+    );
+
+    expect(bundle).toContain('"UV_THREADPOOL_SIZE":"1"');
+    expect(bundle).toContain('"NAPI_RS_ASYNC_WORK_POOL_SIZE":"1"');
+    expect(bundle).toContain('"EMNAPI_WORKER_POOL_SIZE":"1"');
+  });
+
   it("rejects stale fs responses and requests an explicit resize", () => {
     const staleBuffer = new SharedArrayBuffer(32);
     const stale = new Int32Array(staleBuffer, 0, 4);

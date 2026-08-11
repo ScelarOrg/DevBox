@@ -1850,15 +1850,31 @@ export function getWasiRuntimeSource(globalName = "__nodepodWasi"): string {
     _wasiSyscallErrorLogged,
   };
   const ownSource = getWasiRuntimeSource.toString();
+  const escapeRegExp = (value: string): string =>
+    value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const emittedName = (canonical: string): string => {
-    const match = ownSource.match(new RegExp(`(?:[{,])${canonical}:([A-Za-z_$][\\w$]*)`));
-    return match?.[1] ?? canonical;
+    const escaped = escapeRegExp(canonical);
+    const objectMatch = ownSource.match(
+      new RegExp(`(?:[{,])\\s*${escaped}\\s*:\\s*([A-Za-z_$][\\w$]*)`),
+    );
+    if (objectMatch?.[1]) return objectMatch[1];
+    const tupleMatch = ownSource.match(
+      new RegExp(`\\[\\s*["']${escaped}["']\\s*,\\s*([A-Za-z_$][\\w$]*)`),
+    );
+    return tupleMatch?.[1] ?? canonical;
   };
   const declarations = [
     ...Object.entries(constants).map(([name, value]) => `const ${emittedName(name)}=${value};`),
     ...Object.entries(bigintConstants).map(([name, value]) => `const ${emittedName(name)}=${value}n;`),
   ].join("");
-  const referenceName = (name: keyof typeof runtimeReferences): string => emittedName(name);
+  const referenceName = (name: keyof typeof runtimeReferences): string => {
+    // Keep the reference table observable to the bundler. Its values encode
+    // the minified aliases used inside WASI.toString(); if the table is
+    // tree-shaken, emittedName() falls back to source names and the generated
+    // worker fails with errors such as "Sl is not defined".
+    if (runtimeReferences[name] === undefined) return name;
+    return emittedName(name);
+  };
   return `${declarations}
 const FdKind={Stdin:0,Stdout:1,Stderr:2,PreopenDir:3,Directory:4,File:5};
 let ${referenceName("_wasiSyscallErrorLogged")}=false;

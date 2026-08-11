@@ -1,5 +1,6 @@
 import type { BuiltinFn } from "../shell-types";
-import { ok, fail, resolvePath, globToRegex } from "../shell-helpers";
+import type { MemoryVolume } from "../../memory-volume";
+import { ok, fail, resolvePath, globToRegex, yieldToEventLoop } from "../shell-helpers";
 import { LS_BLOCK_SIZE } from "../../constants/config";
 
 /* ------------------------------------------------------------------ */
@@ -46,156 +47,236 @@ function matchMtime(mtimeMs: number, spec: string): boolean {
 /*  Commands                                                           */
 /* ------------------------------------------------------------------ */
 
+type FindEntry = { path: string; name: string; stat: ReturnType<MemoryVolume["statSync"]> };
+type FindEval = { value: boolean; prune?: boolean; stdout: string; stderr: string };
+type FindNode =
+  | { kind: "true" | "false" }
+  | { kind: "not"; child: FindNode }
+  | { kind: "and" | "or"; left: FindNode; right: FindNode }
+  | { kind: "test"; run: (entry: FindEntry) => Promise<FindEval> };
+
 const find_cmd: BuiltinFn = async (args, ctx) => {
-  let searchDir = ctx.cwd;
-  let namePattern = "";
-  let inamePattern = "";
-  let pathPattern = "";
-  let typeFilter = "";
   let maxDepth = Infinity;
   let minDepth = 0;
-  let sizeFilter = "";
-  let mtimeFilter = "";
-  let execCmd = "";
-  let execArgs: string[] = [];
-  let deleteMode = false;
-  let print0 = false;
-  let printMode = true;
-  let emptyFilter = false;
+  let depthFirst = false;
+  const paths: string[] = [];
+  let index = 0;
+  while (index < args.length && !args[index].startsWith("-") && args[index] !== "!" && args[index] !== "(" && args[index] !== "\\(") {
+    paths.push(resolvePath(args[index++], ctx.cwd));
+  }
+  if (!paths.length) paths.push(ctx.cwd);
 
-  for (let i = 0; i < args.length; i++) {
-    const a = args[i];
-    if (a === "-name" && i + 1 < args.length) {
-      namePattern = args[++i];
-    } else if (a === "-iname" && i + 1 < args.length) {
-      inamePattern = args[++i];
-    } else if (a === "-path" || (a === "-wholename" && i + 1 < args.length)) {
-      pathPattern = args[++i];
-    } else if (a === "-type" && i + 1 < args.length) {
-      typeFilter = args[++i];
-    } else if (a === "-maxdepth" && i + 1 < args.length) {
-      maxDepth = parseInt(args[++i]);
-    } else if (a === "-mindepth" && i + 1 < args.length) {
-      minDepth = parseInt(args[++i]);
-    } else if (a === "-size" && i + 1 < args.length) {
-      sizeFilter = args[++i];
-    } else if (a === "-mtime" && i + 1 < args.length) {
-      mtimeFilter = args[++i];
-    } else if (a === "-empty") {
-      emptyFilter = true;
-    } else if (a === "-delete") {
-      deleteMode = true;
-      printMode = false;
-    } else if (a === "-print0") {
-      print0 = true;
-    } else if (a === "-print") {
-      printMode = true;
-    } else if (a === "-exec") {
-      const cmdParts: string[] = [];
-      i++;
-      while (i < args.length && args[i] !== ";") {
-        cmdParts.push(args[i]);
-        i++;
+  const expression: string[] = [];
+  while (index < args.length) {
+    const token = args[index++];
+    if (token === "-maxdepth" || token === "-mindepth") {
+      const value = args[index++];
+      const parsed = value === undefined ? NaN : Number(value);
+      if (!Number.isSafeInteger(parsed) || parsed < 0) {
+        return fail(`find: expected a non-negative integer after ${token}\n`);
       }
-      if (cmdParts.length > 0) {
-        execCmd = cmdParts[0];
-        execArgs = cmdParts.slice(1);
-        printMode = false;
-      }
-    } else if (!a.startsWith("-")) {
-      searchDir = resolvePath(a, ctx.cwd);
+      if (token === "-maxdepth") maxDepth = parsed;
+      else minDepth = parsed;
+      continue;
     }
+    if (token === "-depth") { depthFirst = true; continue; }
+    if (token === "-delete") depthFirst = true;
+    expression.push(token);
   }
 
-  const nameRe = namePattern
-    ? new RegExp("^" + globToRegex(namePattern) + "$")
-    : null;
-  const inameRe = inamePattern
-    ? new RegExp("^" + globToRegex(inamePattern) + "$", "i")
-    : null;
-  const pathRe = pathPattern ? new RegExp(globToRegex(pathPattern)) : null;
+  let hasAction = false;
+  const action = (run: (entry: FindEntry) => Promise<FindEval>): FindNode => {
+    hasAction = true;
+    return { kind: "test", run };
+  };
+  const primary = (entryTest: (entry: FindEntry) => boolean): FindNode => ({
+    kind: "test",
+    run: async (entry) => ({ value: entryTest(entry), stdout: "", stderr: "" }),
+  });
 
-  const results: string[] = [];
-  let execOut = "";
-
-  const walk = (dir: string, depth: number) => {
-    if (depth > maxDepth) return;
-    try {
-      for (const name of ctx.volume.readdirSync(dir)) {
-        const full = dir === "/" ? `/${name}` : `${dir}/${name}`;
-        try {
-          const st = ctx.volume.statSync(full);
-          const isDir = st.isDirectory();
-          const isFile = st.isFile();
-
-          if (depth >= minDepth) {
-            let match = true;
-            if (typeFilter) {
-              if (typeFilter === "f" && !isFile) match = false;
-              if (typeFilter === "d" && !isDir) match = false;
-            }
-            if (nameRe && !nameRe.test(name)) match = false;
-            if (inameRe && !inameRe.test(name)) match = false;
-            if (pathRe && !pathRe.test(full)) match = false;
-            if (sizeFilter && isFile) {
-              const fileSize = ctx.volume.readFileSync(full).length;
-              if (!matchSize(fileSize, sizeFilter)) match = false;
-            }
-            if (mtimeFilter) {
-              const mtime = st.mtimeMs || Date.now();
-              if (!matchMtime(mtime, mtimeFilter)) match = false;
-            }
-            if (emptyFilter) {
-              if (isDir) {
-                try {
-                  if (ctx.volume.readdirSync(full).length > 0) match = false;
-                } catch {
-                  match = false;
-                }
-              } else if (isFile) {
-                if (ctx.volume.readFileSync(full).length > 0) match = false;
-              } else match = false;
-            }
-            if (match) results.push(full);
-          }
-          if (isDir) walk(full, depth + 1);
-        } catch {
-          /* skip */
-        }
-      }
-    } catch {
-      /* skip */
+  let cursor = 0;
+  const recursionLimit = ctx.limits?.maxRecursionDepth ?? 64;
+  const parsePrimary = (depth = 0): FindNode => {
+    if (depth > recursionLimit) throw new Error("find: expression nesting limit " + recursionLimit + " exceeded");
+    const token = expression[cursor++];
+    if (token === undefined) throw new Error("find: expected an expression");
+    if (token === ")" || token === "\\)") throw new Error("find: unexpected ')' in expression");
+    if (token === "!" || token === "-not") return { kind: "not", child: parsePrimary(depth + 1) };
+    if (token === "(" || token === "\\(") {
+      const node = parseOr(depth + 1);
+      if (expression[cursor] !== ")" && expression[cursor] !== "\\)") throw new Error("find: missing ')' in expression");
+      cursor++;
+      return node;
     }
+    if (token === "-true") return { kind: "true" };
+    if (token === "-false") return { kind: "false" };
+    if (token === "-name" || token === "-iname") {
+      const pattern = expression[cursor++];
+      if (pattern === undefined) throw new Error("find: missing argument to '" + token + "'");
+      const re = new RegExp(`^${globToRegex(token === "-iname" ? pattern.toLowerCase() : pattern)}$`);
+      return primary((entry) => re.test(token === "-iname" ? entry.name.toLowerCase() : entry.name));
+    }
+    if (token === "-path" || token === "-wholename") {
+      const rawPattern = expression[cursor++];
+      if (rawPattern === undefined) throw new Error("find: missing argument to '" + token + "'");
+      const pattern = rawPattern.replace(/\\(.)/g, "$1");
+      const re = new RegExp(`^${globToRegex(pattern)}$`);
+      return primary((entry) => re.test(entry.path));
+    }
+    if (token === "-type") {
+      const type = expression[cursor++];
+      if (!type || !["f", "d", "l"].includes(type)) throw new Error("find: invalid argument '" + (type ?? "") + "' to '-type'");
+      return primary((entry) => type === "f" ? entry.stat.isFile() : type === "d" ? entry.stat.isDirectory() : entry.stat.isSymbolicLink());
+    }
+    if (token === "-size") {
+      const spec = expression[cursor++];
+      if (spec === undefined) throw new Error("find: missing argument to '-size'");
+      return primary((entry) => matchSize(entry.stat.size, spec));
+    }
+    if (token === "-mtime") {
+      const spec = expression[cursor++];
+      if (spec === undefined) throw new Error("find: missing argument to '-mtime'");
+      return primary((entry) => matchMtime(entry.stat.mtimeMs, spec));
+    }
+    if (token === "-empty") {
+      return primary((entry) => entry.stat.isDirectory() ? ctx.volume.readdirSync(entry.path).length === 0 : entry.stat.isFile() && entry.stat.size === 0);
+    }
+    if (token === "-prune") {
+      return { kind: "test", run: async (entry) => ({ value: true, prune: entry.stat.isDirectory(), stdout: "", stderr: "" }) };
+    }
+    if (token === "-print" || token === "-print0") {
+      const separator = token === "-print0" ? "\0" : "\n";
+      return action(async (entry) => ({ value: true, stdout: entry.path + separator, stderr: "" }));
+    }
+    if (token === "-delete") {
+      return action(async (entry) => {
+        try {
+          if (entry.stat.isDirectory()) ctx.volume.rmdirSync(entry.path);
+          else ctx.volume.unlinkSync(entry.path);
+          return { value: true, prune: true, stdout: "", stderr: "" };
+        } catch (error) {
+          return { value: false, stdout: "", stderr: `find: ${entry.path}: ${(error as Error).message}\n` };
+        }
+      });
+    }
+    if (token === "-exec" || token === "-execdir") {
+      const command: string[] = [];
+      while (cursor < expression.length && expression[cursor] !== ";" && expression[cursor] !== "+") command.push(expression[cursor++]);
+      if (expression[cursor] !== ";" && expression[cursor] !== "+") throw new Error("find: missing argument to '" + token + "'");
+      cursor++;
+      return action(async (entry) => {
+        if (!command.length) return { value: false, stdout: "", stderr: "find: missing argument to '-exec'\n" };
+        const commandArgs = command.map((part) => part === "{}" ? entry.path : part);
+        const result = await ctx.exec(commandArgs.map(shellQuote).join(" "), { cwd: ctx.cwd, env: ctx.env });
+        return { value: result.exitCode === 0, stdout: result.stdout, stderr: result.stderr };
+      });
+    }
+    throw new Error("find: unknown predicate '" + token + "'");
+  };
+  const combineBalanced = (nodes: FindNode[], kind: "and" | "or"): FindNode => {
+    while (nodes.length > 1) {
+      const next: FindNode[] = [];
+      for (let i = 0; i < nodes.length; i += 2) {
+        next.push(i + 1 < nodes.length ? { kind, left: nodes[i], right: nodes[i + 1] } : nodes[i]);
+      }
+      nodes = next;
+    }
+    return nodes[0] ?? { kind: "true" };
+  };
+  const parseAnd = (depth = 0): FindNode => {
+    const nodes = [parsePrimary(depth)];
+    while (cursor < expression.length && expression[cursor] !== "-o" && expression[cursor] !== "-or" && expression[cursor] !== ")" && expression[cursor] !== "\\)") {
+      if (expression[cursor] === "-a" || expression[cursor] === "-and") cursor++;
+      nodes.push(parsePrimary(depth));
+    }
+    return combineBalanced(nodes, "and");
+  };
+  const parseOr = (depth = 0): FindNode => {
+    const nodes = [parseAnd(depth)];
+    while (expression[cursor] === "-o" || expression[cursor] === "-or") {
+      cursor++;
+      nodes.push(parseAnd(depth));
+    }
+    return combineBalanced(nodes, "or");
+  };
+  let root: FindNode;
+  try {
+    root = expression.length ? parseOr() : { kind: "true" };
+    if (cursor !== expression.length) throw new Error("find: unexpected expression token '" + expression[cursor] + "'");
+  } catch (error) {
+    return fail((error instanceof Error ? error.message : String(error)) + "\n");
+  }
+
+  const evaluate = async (node: FindNode, entry: FindEntry, depth = 0): Promise<FindEval> => {
+    if (depth > recursionLimit) throw new Error("find: expression evaluation limit " + recursionLimit + " exceeded");
+    if (node.kind === "true") return { value: true, stdout: "", stderr: "" };
+    if (node.kind === "false") return { value: false, stdout: "", stderr: "" };
+    if (node.kind === "test") return node.run(entry);
+    if (node.kind === "not") {
+      const child = await evaluate(node.child, entry, depth + 1);
+      return { ...child, value: !child.value };
+    }
+    if (node.kind !== "and" && node.kind !== "or") return { value: false, stdout: "", stderr: "" };
+    const left = await evaluate(node.left, entry, depth + 1);
+    if (node.kind === "and" && !left.value) return left;
+    if (node.kind === "or" && left.value) return left;
+    const right = await evaluate(node.right, entry, depth + 1);
+    return { value: node.kind === "and" ? right.value : right.value, prune: left.prune || right.prune, stdout: left.stdout + right.stdout, stderr: left.stderr + right.stderr };
   };
 
-  walk(searchDir, 1);
+  const outputs: string[] = [];
+  let errors = "";
+  let collectedLength = 0;
+  const outputLimit = ctx.limits?.maxOutputBytes ?? 4 * 1024 * 1024;
+  const appendOutput = (value: string, stderr = false): void => {
+    if (!value) return;
+    collectedLength += value.length;
+    if (collectedLength > outputLimit) throw new Error("find: output limit " + outputLimit + " exceeded");
+    if (stderr) errors += value;
+    else outputs.push(value);
+  };
+  let visited = 0;
+  const limit = ctx.limits?.maxFilesystemEntries ?? 100000;
+  const walk = async (path: string, depth: number): Promise<void> => {
+    if (ctx.signal?.aborted) throw new Error("find: command cancelled");
+    if (++visited > limit) throw new Error(`find: filesystem entry limit ${limit} exceeded`);
+    let stat: ReturnType<MemoryVolume["lstatSync"]>;
+    try {
+      // find does not follow symlinks unless -L is requested. Using lstat here
+      // also prevents a workspace symlink or symlink loop from expanding the
+      // traversal beyond the requested tree.
+      stat = ctx.volume.lstatSync(path);
+    } catch { return; }
+    const name = path === "/" ? "/" : path.slice(path.lastIndexOf("/") + 1);
+    const entry = { path, name, stat };
+    const evaluateEntry = async (): Promise<FindEval> => {
+      if (depth < minDepth || depth > maxDepth) return { value: true, stdout: "", stderr: "" };
+      const result = await evaluate(root, entry);
+      if (result.value && !hasAction) appendOutput(path + "\n");
+      appendOutput(result.stdout);
+      appendOutput(result.stderr, true);
+      return result;
+    };
 
-  if (deleteMode) {
-    for (const path of results.reverse()) {
-      try {
-        const st = ctx.volume.statSync(path);
-        if (st.isDirectory()) ctx.volume.rmdirSync(path);
-        else ctx.volume.unlinkSync(path);
-      } catch {
-        /* */
-      }
+    const preOrder = depthFirst ? { value: true, stdout: "", stderr: "" } : await evaluateEntry();
+    if (!stat.isDirectory() || depth >= maxDepth || (!depthFirst && preOrder.prune)) return;
+    for (const child of ctx.volume.readdirSync(path)) {
+      if (ctx.signal?.aborted) throw new Error("find: command cancelled");
+      const childPath = path === "/" ? `/${child}` : `${path}/${child}`;
+      await walk(childPath, depth + 1);
+      if ((visited & 255) === 0) await yieldToEventLoop(ctx.signal);
     }
-    return ok();
+    if (depthFirst) await evaluateEntry();
+  };
+  try {
+    for (const path of paths) await walk(path, 0);
+  } catch (error) {
+    const message = (error instanceof Error ? error.message : String(error)) + "\n";
+    if (collectedLength + message.length <= outputLimit) errors += message;
+    else errors = "find: output limit " + outputLimit + " exceeded\n";
+    return { stdout: outputs.join(""), stderr: errors, exitCode: ctx.signal?.aborted ? 130 : 1 };
   }
-
-  if (execCmd) {
-    for (const path of results) {
-      const expandedArgs = execArgs.map((a) => (a === "{}" ? path : a));
-      const fullCmd = [execCmd, ...expandedArgs].map(shellQuote).join(" ");
-      const result = await ctx.exec(fullCmd, { cwd: ctx.cwd, env: ctx.env });
-      execOut += result.stdout;
-    }
-    return ok(execOut);
-  }
-
-  if (print0) return ok(results.join("\0"));
-  if (printMode) return ok(results.join("\n") + (results.length ? "\n" : ""));
-  return ok();
+  return { stdout: outputs.join(""), stderr: errors, exitCode: errors ? 1 : 0 };
 };
 
 const xargs_cmd: BuiltinFn = async (args, ctx, stdin) => {
@@ -207,8 +288,11 @@ const xargs_cmd: BuiltinFn = async (args, ctx, stdin) => {
   const cmdParts: string[] = [];
 
   for (let i = 0; i < args.length; i++) {
-    if (args[i] === "-n" && i + 1 < args.length)
-      maxArgs = parseInt(args[++i]) || 1;
+    if (args[i] === "-n" && i + 1 < args.length) {
+      const parsed = parseInt(args[++i], 10);
+      if (!Number.isSafeInteger(parsed) || parsed <= 0) return fail(`xargs: invalid number for -n: '${args[i]}'\n`);
+      maxArgs = parsed;
+    }
     else if (args[i] === "-I" && i + 1 < args.length) placeholder = args[++i];
     else if (args[i] === "-0" || args[i] === "--null") nullDelim = true;
     else if (args[i] === "-t") {
@@ -218,27 +302,62 @@ const xargs_cmd: BuiltinFn = async (args, ctx, stdin) => {
 
   if (cmdParts.length === 0) cmdParts.push("echo");
 
-  const delim = nullDelim ? "\0" : /\s+/;
-  const items = stdin.trim().split(delim).filter(Boolean);
+  const iterationLimit = ctx.limits?.maxLoopIterations ?? 100_000;
+  const items: string[] = [];
+  if (nullDelim) {
+    let start = 0;
+    while (start <= stdin.length) {
+      const end = stdin.indexOf("\0", start);
+      const item = stdin.slice(start, end < 0 ? stdin.length : end);
+      if (item) items.push(item);
+      if (items.length > iterationLimit) return fail(`xargs: item limit ${iterationLimit} exceeded\n`);
+      if (end < 0) break;
+      start = end + 1;
+    }
+  } else {
+    const matches = stdin.matchAll(/\S+/g);
+    for (const match of matches) {
+      items.push(match[0]);
+      if (items.length > iterationLimit) return fail(`xargs: item limit ${iterationLimit} exceeded\n`);
+    }
+  }
+  const invocationCount = placeholder
+    ? items.length
+    : maxArgs < Infinity
+      ? Math.ceil(items.length / Math.max(1, maxArgs))
+      : items.length > 0 ? 1 : 0;
+  if (!Number.isSafeInteger(invocationCount) || invocationCount > iterationLimit) {
+    return fail(`xargs: invocation limit ${iterationLimit} exceeded\n`);
+  }
   const cmd = cmdParts.map(shellQuote).join(" ");
   let out = "";
   let err = "";
   let lastCode = 0;
 
   if (placeholder) {
-    for (const item of items) {
+    for (let itemIndex = 0; itemIndex < items.length; itemIndex++) {
+      if (ctx.signal?.aborted) return fail("xargs: command cancelled\n", 130);
+      if (itemIndex > 0 && (itemIndex & 127) === 0) await yieldToEventLoop(ctx.signal);
+      const item = items[itemIndex];
       const expanded = cmdParts
         .map((part) => (part.includes(placeholder) ? part.split(placeholder).join(item) : part))
         .map(shellQuote)
         .join(" ");
+      if (expanded.length > (ctx.limits?.maxExpansionBytes ?? 1024 * 1024)) return fail("xargs: command size limit exceeded\n");
       const result = await ctx.exec(expanded, { cwd: ctx.cwd, env: ctx.env });
       out += result.stdout;
       err += result.stderr;
       lastCode = result.exitCode;
+      if (out.length + err.length > (ctx.limits?.maxOutputBytes ?? 4 * 1024 * 1024)) {
+        return fail("xargs: output limit exceeded\n");
+      }
     }
   } else if (maxArgs < Infinity) {
     for (let i = 0; i < items.length; i += maxArgs) {
+      if (ctx.signal?.aborted) return fail("xargs: command cancelled\n", 130);
+      if (i > 0 && (i & 127) === 0) await yieldToEventLoop(ctx.signal);
       const batch = items.slice(i, i + maxArgs).map(shellQuote).join(" ");
+      if (cmd.length + batch.length + 1 > (ctx.limits?.maxExpansionBytes ?? 1024 * 1024)) return fail("xargs: command size limit exceeded\n");
       const result = await ctx.exec(`${cmd} ${batch}`, {
         cwd: ctx.cwd,
         env: ctx.env,
@@ -246,15 +365,23 @@ const xargs_cmd: BuiltinFn = async (args, ctx, stdin) => {
       out += result.stdout;
       err += result.stderr;
       lastCode = result.exitCode;
+      if (out.length + err.length > (ctx.limits?.maxOutputBytes ?? 4 * 1024 * 1024)) {
+        return fail("xargs: output limit exceeded\n");
+      }
     }
   } else {
-    const result = await ctx.exec(`${cmd} ${items.map(shellQuote).join(" ")}`, {
+    const expanded = `${cmd} ${items.map(shellQuote).join(" ")}`;
+    if (expanded.length > (ctx.limits?.maxExpansionBytes ?? 1024 * 1024)) return fail("xargs: command size limit exceeded\n");
+    const result = await ctx.exec(expanded, {
       cwd: ctx.cwd,
       env: ctx.env,
     });
     out += result.stdout;
     err += result.stderr;
     lastCode = result.exitCode;
+    if (out.length + err.length > (ctx.limits?.maxOutputBytes ?? 4 * 1024 * 1024)) {
+      return fail("xargs: output limit exceeded\n");
+    }
   }
 
   return { stdout: out, stderr: err, exitCode: lastCode };

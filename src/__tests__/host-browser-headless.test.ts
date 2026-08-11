@@ -49,4 +49,22 @@ describe("browser headless Nodepod.boot", () => {
     expect(pod.port(1)).toBeNull();
     pod.teardown();
   });
+
+  it("installs SDK dependencies under the configured workdir", async () => {
+    const pod = await Nodepod.boot({
+      headless: true,
+      workdir: "/workspace",
+      packageStore: "memory",
+      files: {
+        "/workspace/package.json": JSON.stringify({
+          name: "cwd-probe",
+          version: "1.0.0",
+        }),
+      },
+    });
+    await pod.packages.installFromManifest();
+    expect(await pod.fs.exists("/workspace/node_modules/.package-lock.json")).toBe(true);
+    expect(await pod.fs.exists("/node_modules/.package-lock.json")).toBe(false);
+    pod.teardown();
+  });
 });

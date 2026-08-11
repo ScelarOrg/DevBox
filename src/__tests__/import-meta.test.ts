@@ -129,6 +129,27 @@ describe("ScriptEngine import.meta", () => {
     expect(mod.nodeBuiltin).toBe("node:path");
   });
 
+  it("resolves package-relative WASM URLs without changing the filename", async () => {
+    const eng = boot({
+      "/project/node_modules/example/package.json": JSON.stringify({
+        name: "example",
+        main: "index.mjs",
+      }),
+      "/project/node_modules/example/index.mjs": `
+        export const wasmUrl = new URL('./binding.wasm', import.meta.url).href;
+      `,
+      "/project/node_modules/example/binding.wasm": "wasm",
+      "/project/entry.mjs": `
+        import { wasmUrl } from 'example';
+        export { wasmUrl };
+      `,
+    });
+    const result = await eng.runFileTLA("/project/entry.mjs");
+    expect((result.exports as { wasmUrl: string }).wasmUrl).toBe(
+      "file:///project/node_modules/example/binding.wasm",
+    );
+  });
+
   it("regex fallback does not rewrite import.meta inside string literals", async () => {
     // Force a source that mentions the guard string Vite uses, plus a real
     // import.meta.url read. AST path preserves strings; this asserts the

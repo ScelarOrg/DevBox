@@ -12,6 +12,7 @@ import {
   GREEN,
   CYAN,
   BOLD_BLUE,
+  yieldToEventLoop,
 } from "../shell-helpers";
 import { LS_BLOCK_SIZE } from "../../constants/config";
 
@@ -54,7 +55,7 @@ function hashCode(s: string): number {
 /*  Commands                                                           */
 /* ------------------------------------------------------------------ */
 
-const ls: BuiltinFn = (args, ctx) => {
+const ls: BuiltinFn = async (args, ctx) => {
   const { flags, positional } = parseArgs(args, [
     "l",
     "a",
@@ -85,11 +86,27 @@ const ls: BuiltinFn = (args, ctx) => {
   const dir =
     positional.length > 0 ? resolvePath(positional[0], ctx.cwd) : ctx.cwd;
 
-  const lsDir = (d: string, prefix: string): string => {
+  let visited = 0;
+  const entryLimit = ctx.limits?.maxFilesystemEntries ?? 100_000;
+  const outputLimit = ctx.limits?.maxOutputBytes ?? 4 * 1024 * 1024;
+  const append = (current: string, addition: string): string => {
+    if (current.length + addition.length > outputLimit) {
+      throw new Error(`output exceeds ${outputLimit} bytes`);
+    }
+    return current + addition;
+  };
+  const visit = async (): Promise<void> => {
+    if (ctx.signal?.aborted) throw new Error("command cancelled");
+    if (++visited > entryLimit) throw new Error(`filesystem entry limit ${entryLimit} exceeded`);
+    if ((visited & 127) === 0) await yieldToEventLoop(ctx.signal);
+  };
+
+  const lsDir = async (d: string, prefix: string): Promise<string> => {
+    await visit();
     if (dirOnly) {
       const name = positional[0] || d;
       if (longForm) {
-        const st = ctx.volume.statSync(d);
+        const st = ctx.volume.lstatSync(d);
         const isDir = st.isDirectory();
         const mode = isDir
           ? `${CYAN}drwxr-xr-x${RESET}`
@@ -107,7 +124,9 @@ const ls: BuiltinFn = (args, ctx) => {
     }
 
     if (showAll) {
-      /* all */
+      // MemoryVolume's readdirSync intentionally omits the synthetic dot
+      // entries. `ls -a` must add them, while `-A` must continue to omit them.
+      entries = [".", "..", ...entries.filter((e) => e !== "." && e !== "..")];
     } else if (showAlmostAll)
       entries = entries.filter((e) => e !== "." && e !== "..");
     else entries = entries.filter((e) => !e.startsWith("."));
@@ -118,24 +137,21 @@ const ls: BuiltinFn = (args, ctx) => {
       size: number;
       mtime: number;
     }
-    const infos: EntryInfo[] = entries.map((name) => {
+    const infos: EntryInfo[] = [];
+    for (const name of entries) {
+      await visit();
       const full = d === "/" ? `/${name}` : `${d}/${name}`;
       try {
-        const st = ctx.volume.statSync(full);
+        // Do not follow child symlinks during recursive traversal. This is
+        // both Bash-compatible for `ls -R` and prevents symlink cycles.
+        const st = ctx.volume.lstatSync(full);
         const isDir = st.isDirectory();
-        let size = 0;
-        if (!isDir) {
-          try {
-            size = ctx.volume.readFileSync(full).length;
-          } catch {
-            /* */
-          }
-        }
-        return { name, isDir, size, mtime: st.mtimeMs || 0 };
+        const size = isDir ? 0 : st.size;
+        infos.push({ name, isDir, size, mtime: st.mtimeMs || 0 });
       } catch {
-        return { name, isDir: false, size: 0, mtime: 0 };
+        infos.push({ name, isDir: false, size: 0, mtime: 0 });
       }
-    });
+    }
 
     if (sortBySize) infos.sort((a, b) => b.size - a.size);
     else if (sortByTime) infos.sort((a, b) => b.mtime - a.mtime);
@@ -149,7 +165,7 @@ const ls: BuiltinFn = (args, ctx) => {
         (s, e) => s + Math.ceil(e.size / LS_BLOCK_SIZE),
         0,
       );
-      out += `total ${totalBlocks}\n`;
+      out = append(out, `total ${totalBlocks}\n`);
       for (const info of infos) {
         const mode = info.isDir
           ? `${CYAN}drwxr-xr-x${RESET}`
@@ -169,7 +185,7 @@ const ls: BuiltinFn = (args, ctx) => {
         const inode = showInode
           ? `${String(Math.abs(hashCode(d + "/" + info.name))).padStart(7)} `
           : "";
-        out += `${inode}${mode} 1 user user ${sizeStr} ${date} ${colored}${suffix}\n`;
+        out = append(out, `${inode}${mode} 1 user user ${sizeStr} ${date} ${colored}${suffix}\n`);
       }
     } else if (onePerLine) {
       for (const info of infos) {
@@ -177,21 +193,22 @@ const ls: BuiltinFn = (args, ctx) => {
           ? `${String(Math.abs(hashCode(d + "/" + info.name))).padStart(7)} `
           : "";
         const suffix = classify ? (info.isDir ? "/" : "") : "";
-        out += `${inode}${colorName(info.name, info.isDir)}${suffix}\n`;
+        out = append(out, `${inode}${colorName(info.name, info.isDir)}${suffix}\n`);
       }
     } else {
       const colored = infos.map((info) => {
         const suffix = classify ? (info.isDir ? "/" : "") : "";
         return colorName(info.name, info.isDir) + suffix;
       });
-      out += colored.join("  ") + "\n";
+      if (colored.length > 0) out = append(out, colored.join("  ") + "\n");
     }
 
     if (recursive) {
       for (const info of infos) {
+        if (info.name === "." || info.name === "..") continue;
         if (info.isDir) {
           const full = d === "/" ? `/${info.name}` : `${d}/${info.name}`;
-          out += "\n" + lsDir(full, full);
+          out = append(out, "\n" + await lsDir(full, full));
         }
       }
     }
@@ -203,12 +220,7 @@ const ls: BuiltinFn = (args, ctx) => {
     const st = ctx.volume.statSync(dir);
     if (st.isFile() && !dirOnly) {
       if (longForm) {
-        let size = 0;
-        try {
-          size = ctx.volume.readFileSync(dir).length;
-        } catch {
-          /* */
-        }
+        const size = st.size;
         const sizeStr = humanReadable
           ? humanSize(size).padStart(5)
           : String(size).padStart(6);
@@ -225,7 +237,11 @@ const ls: BuiltinFn = (args, ctx) => {
     );
   }
 
-  return ok(lsDir(dir, positional.length > 1 ? dir : ""));
+  try {
+    return ok(await lsDir(dir, positional.length > 1 ? dir : ""));
+  } catch (error) {
+    return fail(`ls: ${error instanceof Error ? error.message : String(error)}\n`, ctx.signal?.aborted ? 130 : 1);
+  }
 };
 
 const cd: BuiltinFn = (args, ctx) => {

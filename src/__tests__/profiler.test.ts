@@ -35,8 +35,10 @@ describe("Nodepod profiler", () => {
     expect(report.spans[1]?.metadata?.tarballUrl).toBeUndefined();
     expect(report.export("json")).toContain('"version": 1');
 
-    const trace = JSON.parse(report.export("chrome-trace")) as { traceEvents: unknown[] };
-    expect(trace.traceEvents).toHaveLength(2);
+    const trace = JSON.parse(report.export("chrome-trace")) as {
+      traceEvents: Array<{ ph?: string }>;
+    };
+    expect(trace.traceEvents.filter((event) => event.ph === "X")).toHaveLength(2);
     expect(Object.isFrozen(report)).toBe(true);
   });
 
@@ -56,7 +58,7 @@ describe("Nodepod profiler", () => {
 
     const report = await session.stop();
     expect(report.spans).toHaveLength(1);
-    expect(report.summary.droppedSpans).toBe(0);
+    expect(report.summary.droppedSpans).toBe(1);
     expect(report.summary.operations["workers:first"]?.count).toBe(1);
     expect(report.summary.operations["workers:second"]?.count).toBe(1);
   });
@@ -98,5 +100,33 @@ describe("Nodepod profiler", () => {
     );
     expect(report.counters["fs.writes"]).toBe(1);
     expect(report.counters["fs.reads"]).toBe(1);
+  });
+
+  it("warns on worker clock skew and exports gauges and warnings to trace", async () => {
+    const profiler = new NodepodProfilerImpl({ enabled: true });
+    const session = profiler.start("clock-skew");
+    profiler.gauge("workers.queuePeak", 3);
+    profiler.recordSpan("workers.execution", 200, 100, { category: "workers" });
+
+    const report = await session.stop();
+    expect(report.warnings.some((warning) => warning.code === "clock-skew")).toBe(true);
+    const trace = JSON.parse(report.export("chrome-trace")) as {
+      traceEvents: Array<{ ph: string; name: string }>;
+    };
+    expect(trace.traceEvents.some((event) => event.ph === "C")).toBe(true);
+    expect(trace.traceEvents.some((event) => event.name === "clock-skew")).toBe(true);
+  });
+
+  it("retains deterministic memory and reports missing browser heap APIs", async () => {
+    const profiler = new NodepodProfilerImpl({
+      enabled: true,
+      captureMemory: true,
+      memorySampleIntervalMs: 50,
+    });
+    profiler.setMemoryProvider(() => ({ vfs: { totalBytes: 12 } }));
+    const report = await profiler.start("memory").stop();
+
+    expect(report.samples.some((sample) => sample.type === "memory")).toBe(true);
+    expect(report.warnings.some((warning) => warning.code === "memory-browser-api-unsupported")).toBe(true);
   });
 });

@@ -146,6 +146,33 @@ describe("ScriptEngine", () => {
       expect(result.exports).toBe("function");
     });
 
+    it("resolves package shims to VFS paths while preserving builtins", async () => {
+      const { engine } = createEngine({
+        "/project/node_modules/rollup/package.json": JSON.stringify({
+          name: "rollup",
+          version: "4.0.0",
+          main: "dist/rollup.js",
+        }),
+        "/project/node_modules/rollup/dist/rollup.js":
+          "module.exports = {};",
+        "/project/resolve-probe.mjs": [
+          'import { createRequire } from "node:module";',
+          'import path from "node:path";',
+          "const requireFromFile = createRequire(import.meta.url);",
+          'const resolved = requireFromFile.resolve("rollup");',
+          'const builtin = requireFromFile.resolve("path");',
+          "export default { resolved, packagePath: path.resolve(resolved, \"../../package.json\"), builtin };",
+        ].join("\n"),
+      });
+
+      const result = await engine.runFileTLA("/project/resolve-probe.mjs");
+      expect(result.exports).toEqual({
+        resolved: "/project/node_modules/rollup/dist/rollup.js",
+        packagePath: "/project/node_modules/rollup/package.json",
+        builtin: "path",
+      });
+    });
+
     it("requires JSON files", () => {
       const { engine } = createEngine({
         "/project/data.json": '{"key": "value"}',
@@ -175,6 +202,23 @@ describe("ScriptEngine", () => {
         "/project/index.js",
       );
       expect(result.exports).toBe(42);
+    });
+
+    it("preserves a default export when ESM imports a binding named module", () => {
+      const { engine } = createEngine({
+        "/project/binding.js":
+          'module.exports = { marker: "binding" };',
+        "/project/get-exe-path.mjs": [
+          'import module from "./binding.js";',
+          "export default function getExePath() { return module.marker; }",
+        ].join("\n"),
+      });
+      const result = engine.execute(
+        'module.exports = require("./get-exe-path.mjs");',
+        "/project/index.js",
+      );
+      expect(typeof result.exports).toBe("function");
+      expect((result.exports as () => string)()).toBe("binding");
     });
 
     it("handles export function containing dynamic import() without corruption", () => {
