@@ -16,7 +16,7 @@ const files = {
     "# nodepod demo",
     "",
     "This project lives only in this browser tab.",
-    "Try `node hello.js`, `ls`, or `cat README.md`.",
+    "Try `node hello.js`, `ls`, `cat README.md`, or `npx cowsay hi`.",
     "",
   ].join("\n"),
   "/home/project/files.js": [
