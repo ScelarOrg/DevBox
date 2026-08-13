@@ -30,7 +30,7 @@ export default defineConfig({
     { name: "mobile", use: { ...devices["Pixel 7"] } },
   ],
   webServer: {
-    command: "corepack pnpm run preview:test",
+    command: "pnpm run preview:test",
     url: "http://127.0.0.1:4321/Nodepod/",
     reuseExistingServer: !process.env.CI,
     timeout: 120_000,
