@@ -1,0 +1,59 @@
+---
+import "@fontsource-variable/instrument-sans";
+import "@fontsource/ibm-plex-mono/400.css";
+import "../styles/global.css";
+
+interface Props {
+  title: string;
+  description: string;
+  canonicalPath?: string;
+}
+
+const { title, description, canonicalPath = "/" } = Astro.props;
+const base = import.meta.env.BASE_URL.replace(/\/$/, "");
+const canonical = new URL(`${base}${canonicalPath}`, Astro.site);
+const ogImage = new URL(`${base}/og-nodepod.png`, Astro.site);
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width" />
+    <meta name="description" content={description} />
+    <meta name="theme-color" content="#0B0B0C" />
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content={description} />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content={canonical} />
+    <meta property="og:image" content={ogImage} />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="canonical" href={canonical} />
+    <link rel="icon" type="image/png" href={`${base}/favicon.png`} />
+    <title>{title}</title>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="site-header">
+      <a class="wordmark" href={`${base}/`} aria-label="nodepod home">nodepod<span aria-hidden="true">_</span></a>
+      <nav aria-label="Primary navigation">
+        <a href={`${base}/docs/`}>Docs</a>
+        <a href="https://github.com/R1ck404/Nodepod">GitHub</a>
+        <a href={`${base}/sponsors/`}>Sponsor</a>
+      </nav>
+    </header>
+    <main id="main">
+      <slot />
+    </main>
+    <footer class="site-footer">
+      <a class="wordmark wordmark--small" href={`${base}/`}>nodepod<span aria-hidden="true">_</span></a>
+      <p>Node.js infrastructure for the browser.</p>
+      <nav aria-label="Footer navigation">
+        <a href={`${base}/docs/`}>Documentation</a>
+        <a href="https://www.npmjs.com/package/@scelar/nodepod">npm</a>
+        <a href="https://github.com/R1ck404/Nodepod/blob/main/LICENSE">License</a>
+      </nav>
+      <p class="footer-meta">Source-available under MIT + Commons Clause.</p>
+    </footer>
+  </body>
+</html>

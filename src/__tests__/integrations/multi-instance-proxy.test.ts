@@ -5,7 +5,7 @@
 // state machine: attach/detach, per-instance isolation, routing by
 // instanceId, URL shape, legacy single-tenant back-compat
 
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import { EventEmitter } from "events";
 import {
   RequestProxy,
@@ -151,6 +151,129 @@ describe("RequestProxy multi-instance", () => {
     it("legacy serverUrl(port) routes to DEFAULT_INSTANCE", () => {
       expect(proxy.serverUrl(3000)).toBe(
         `http://test.local/__virtual__/${DEFAULT_INSTANCE}/3000`,
+      );
+    });
+
+    it("exposes only resolved URLs for process-output presentation", () => {
+      proxy.attach("pod-aaa", new FakeProcessManager());
+      expect(proxy.displayServerUrl("pod-aaa", 3000)).toBeUndefined();
+
+      proxy.register("pod-aaa", makeServer("A"), 3000);
+      expect(proxy.displayServerUrl("pod-aaa", 3000)).toBe(
+        "http://test.local/__virtual__/pod-aaa/3000",
+      );
+
+      proxy.unregister("pod-aaa", 3000);
+      expect(proxy.displayServerUrl("pod-aaa", 3000)).toBeUndefined();
+    });
+
+    it("does not publish stale hostname readiness after a server stops", async () => {
+      const originalDocument = Object.getOwnPropertyDescriptor(
+        globalThis,
+        "document",
+      );
+      Object.defineProperty(globalThis, "document", {
+        configurable: true,
+        value: {},
+      });
+      try {
+        proxy.attach("pod-aaa", new FakeProcessManager());
+        proxy.configureInstance("pod-aaa", {
+          previewOrigin: "https://{instanceId}-{port}.preview.example.com",
+        });
+        (proxy as any)._swAuthToken = "test-token";
+        let finishBridge!: () => void;
+        vi.spyOn(proxy as any, "_ensurePreviewBridge").mockImplementation(
+          () => new Promise<void>((resolve) => { finishBridge = resolve; }),
+        );
+        const ready: string[] = [];
+        proxy.on("server-ready", (_port, url) => ready.push(url));
+
+        proxy.register("pod-aaa", makeServer("A"), 3000);
+        expect(proxy.displayServerUrl("pod-aaa", 3000)).toBeNull();
+        proxy.unregister("pod-aaa", 3000);
+        finishBridge();
+        await Promise.resolve();
+        await Promise.resolve();
+
+        expect(ready).toEqual([]);
+        expect(proxy.displayServerUrl("pod-aaa", 3000)).toBeUndefined();
+      } finally {
+        if (originalDocument) {
+          Object.defineProperty(globalThis, "document", originalDocument);
+        } else {
+          delete (globalThis as { document?: unknown }).document;
+        }
+      }
+    });
+
+    it("uses a configured hostname preview template", () => {
+      proxy.configureInstance("pod-aaa", {
+        previewOrigin:
+          "https://{instanceId}-{port}.preview.example.com",
+      });
+      expect(proxy.serverUrl("pod-aaa", 5173)).toBe(
+        "https://pod-aaa-5173.preview.example.com/",
+      );
+    });
+
+    it("supports a preview-origin resolver", () => {
+      proxy.configureInstance("Pod-ABC", {
+        previewOrigin: ({ instanceId, port, parentOrigin }) =>
+          `https://${instanceId.toLowerCase()}-${port}.${new URL(parentOrigin).hostname}`,
+      });
+      expect(proxy.serverUrl("Pod-ABC", 3000)).toBe(
+        "https://pod-abc-3000.test.local/",
+      );
+    });
+
+    it("auto-generates the requested .localhost hostname on local pages", () => {
+      const original = Object.getOwnPropertyDescriptor(globalThis, "location");
+      Object.defineProperty(globalThis, "location", {
+        configurable: true,
+        value: {
+          protocol: "http:",
+          host: "localhost:4173",
+          hostname: "localhost",
+          port: "4173",
+          origin: "http://localhost:4173",
+        },
+      });
+      try {
+        const localProxy = new RequestProxy();
+        localProxy.configureInstance("pod6e7bc4e9", {
+          previewOrigin: "auto",
+        });
+        expect(localProxy.serverUrl("pod6e7bc4e9", 5173)).toBe(
+          "http://pod6e7bc4e9-5173.localhost:4173/",
+        );
+      } finally {
+        if (original) {
+          Object.defineProperty(globalThis, "location", original);
+        } else {
+          delete (globalThis as { location?: unknown }).location;
+        }
+      }
+    });
+
+    it("falls back to the path URL for disabled or unsafe preview origins", () => {
+      proxy.configureInstance("pod-aaa", { previewOrigin: false });
+      expect(proxy.serverUrl("pod-aaa", 3000)).toBe(
+        "http://test.local/__virtual__/pod-aaa/3000",
+      );
+
+      proxy.configureInstance("pod-aaa", {
+        previewOrigin: "http://test.local",
+      });
+      expect(proxy.serverUrl("pod-aaa", 3000)).toBe(
+        "http://test.local/__virtual__/pod-aaa/3000",
+      );
+
+      proxy.configureInstance("pod-aaa", {
+        previewOrigin: "https://preview.example.com/not-root",
+      });
+      expect(proxy.serverUrl("pod-aaa", 3000)).toBe(
+        "http://test.local/__virtual__/pod-aaa/3000",
       );
     });
   });

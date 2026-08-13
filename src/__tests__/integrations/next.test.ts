@@ -19,6 +19,19 @@ describe.skipIf(!nextAvailable)("integrations/next", () => {
     expect(body.length).toBeGreaterThan(1000);
   });
 
+  it("exports App Router handlers for both hostname-preview bridge assets", async () => {
+    const mod = await import("../../integrations/next");
+    const html = await mod.GET_PREVIEW_BRIDGE();
+    expect(html.status).toBe(200);
+    expect(html.headers.get("content-type")).toMatch(/text\/html/i);
+    expect(await html.text()).toMatch(/__nodepod_bridge__\.js/);
+
+    const script = await mod.GET_PREVIEW_BRIDGE_SCRIPT();
+    expect(script.status).toBe(200);
+    expect(script.headers.get("content-type")).toMatch(/javascript/i);
+    expect(await script.text()).toMatch(/serviceWorker\.register/);
+  });
+
   it("nodepodProxy returns null for non-SW paths", async () => {
     const mod = await import("../../integrations/next");
     const fakeReq = {
@@ -36,6 +49,26 @@ describe.skipIf(!nextAvailable)("integrations/next", () => {
     const res = await mod.nodepodProxy(fakeReq);
     expect(res).not.toBeNull();
     expect(res!.status).toBe(200);
+  });
+
+  it("nodepodProxy serves both hostname-preview bridge assets", async () => {
+    const mod = await import("../../integrations/next");
+    expect(mod.nodepodMatchers).toEqual([
+      "/__sw__.js",
+      "/__nodepod_bridge__.html",
+      "/__nodepod_bridge__.js",
+    ]);
+
+    for (const pathname of mod.nodepodMatchers.slice(1)) {
+      const fakeReq = {
+        nextUrl: { pathname },
+      } as unknown as import("next/server").NextRequest;
+      const res = await mod.nodepodProxy(fakeReq);
+      expect(res?.status).toBe(200);
+      expect(res?.headers.get("cross-origin-resource-policy")).toBe(
+        "cross-origin",
+      );
+    }
   });
 
   // Next 16 renamed middleware.ts -> proxy.ts. Verify both names point at

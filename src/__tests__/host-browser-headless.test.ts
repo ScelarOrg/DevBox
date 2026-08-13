@@ -5,11 +5,34 @@ vi.mock("virtual:process-worker-bundle", () => ({
 }));
 
 import { Nodepod } from "../sdk/nodepod";
+import { Buffer } from "../polyfills/buffer";
 import {
   createBrowserHost,
   resetRuntimeHost,
   setRuntimeHost,
 } from "../host";
+
+class DisplayTerminal {
+  static instances: DisplayTerminal[] = [];
+  readonly writes: string[] = [];
+
+  constructor(_options: unknown) {
+    DisplayTerminal.instances.push(this);
+  }
+
+  open(): void {}
+  loadAddon(): void {}
+  focus(): void {}
+  dispose(): void {}
+
+  write(text: string): void {
+    this.writes.push(text);
+  }
+
+  onData(): { dispose(): void } {
+    return { dispose() {} };
+  }
+}
 
 describe("browser headless Nodepod.boot", () => {
   let workerWasSet = false;
@@ -65,6 +88,41 @@ describe("browser headless Nodepod.boot", () => {
     await pod.packages.installFromManifest();
     expect(await pod.fs.exists("/workspace/node_modules/.package-lock.json")).toBe(true);
     expect(await pod.fs.exists("/node_modules/.package-lock.json")).toBe(false);
+    pod.teardown();
+  });
+
+  it("rewrites an owned server URL only in terminal presentation", async () => {
+    DisplayTerminal.instances = [];
+    const pod = await Nodepod.boot({ headless: true });
+    pod.proxy.register(
+      pod.instanceId,
+      {
+        listening: true,
+        address: () => ({ port: 5173, address: "0.0.0.0", family: "IPv4" }),
+        dispatchRequest: async () => ({
+          statusCode: 200,
+          statusMessage: "OK",
+          headers: {},
+          body: Buffer.from(""),
+        }),
+      },
+      5173,
+    );
+    const previewUrl = pod.port(5173);
+    expect(previewUrl).toBeTruthy();
+
+    const terminal = pod.createTerminal({
+      Terminal: DisplayTerminal,
+      customCommands: {
+        show: () => "Local: http://localhost:5173/\n",
+      },
+    });
+    terminal.attach({} as HTMLElement);
+    await (terminal as any)._wiring.onCommand("show");
+
+    const displayed = DisplayTerminal.instances[0].writes.join("");
+    expect(displayed).toContain(`Local: ${previewUrl}/`);
+    expect(displayed).not.toContain("http://localhost:5173/");
     pod.teardown();
   });
 });

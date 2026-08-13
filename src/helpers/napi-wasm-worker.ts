@@ -14,6 +14,7 @@
 
 import type { MemoryVolume } from "../memory-volume";
 import { EventEmitter } from "../polyfills/events";
+import { PassThrough } from "../polyfills/stream";
 import { getRegistry, type Handle } from "./event-loop";
 import { esmToCjs } from "../syntax-transforms";
 import { parse } from "acorn";
@@ -288,14 +289,41 @@ export function createNapiWorkerFactory(
       onMessage: (data: unknown) => self.emit("message", data),
       onError: (err: Error) => self.emit("error", err),
       onExit: (code: number) => {
+        self.stdout?.end?.();
+        self.stdout?.push?.(null);
+        self.stderr?.end?.();
+        self.stderr?.push?.(null);
         (self._elHandle as Handle | null)?.close();
         self._elHandle = null;
         self._terminated = true;
         self.emit("exit", code);
       },
+      onStdout: (data: string) => {
+        self.stdout?.write?.(data);
+        if (!opts?.stdout) {
+          const output = (globalThis as any).process?.stdout;
+          output?.write?.(data);
+        }
+      },
+      onStderr: (data: string) => {
+        self.stderr?.write?.(data);
+        if (!opts?.stderr) {
+          const output = (globalThis as any).process?.stderr;
+          output?.write?.(data);
+        }
+      },
     });
 
     this._handle = handle;
+    if (opts?.stdin) {
+      this.stdin = new PassThrough();
+      this.stdin.on("data", (chunk: unknown) => {
+        if (!self._terminated) handle.sendStdin(String(chunk));
+      });
+      this.stdin.once("finish", () => {
+        if (!self._terminated) handle.endStdin();
+      });
+    }
     this._elHandle = getRegistry().register("Worker");
     queueMicrotask(() => {
       if (!self._terminated) self.emit("online");
@@ -357,6 +385,10 @@ function createRealWebWorker(
       (self._elHandle as Handle | null)?.close();
       self._elHandle = null;
       self._terminated = true;
+      self.stdout?.end?.();
+      self.stdout?.push?.(null);
+      self.stderr?.end?.();
+      self.stderr?.push?.(null);
       self.emit("exit", code);
     };
     const handle = brokerWorkerFn(workerBundleSource, {

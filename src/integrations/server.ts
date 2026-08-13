@@ -6,9 +6,20 @@
 
 import { Buffer } from "node:buffer";
 import { readServiceWorkerSource } from "./shared/read-sw";
-import { swResponseHeaders, DEFAULT_SW_PATH } from "./shared/headers";
+import { readPreviewBridgeSource } from "./shared/read-preview-bridge";
+import {
+  swResponseHeaders,
+  previewBridgeResponseHeaders,
+  DEFAULT_SW_PATH,
+  DEFAULT_BRIDGE_HTML_PATH,
+  DEFAULT_BRIDGE_SCRIPT_PATH,
+} from "./shared/headers";
 
-export { DEFAULT_SW_PATH };
+export {
+  DEFAULT_SW_PATH,
+  DEFAULT_BRIDGE_HTML_PATH,
+  DEFAULT_BRIDGE_SCRIPT_PATH,
+};
 
 export async function getServiceWorkerSource(): Promise<string> {
   return readServiceWorkerSource(import.meta.url);
@@ -55,6 +66,65 @@ export async function serveSWNode(): Promise<NodeServeSWResult> {
   const headers = swResponseHeaders();
   return {
     body: Buffer.from(source, "utf8"),
+    headers,
+    contentType: headers["Content-Type"],
+  };
+}
+
+export async function servePreviewBridge(req?: Request): Promise<Response> {
+  const mode = req
+    ? new URL(req.url).searchParams.get("mode")
+    : null;
+  return new Response(
+    await readPreviewBridgeSource(import.meta.url, "html"),
+    {
+      status: 200,
+      headers: previewBridgeResponseHeaders(
+        "text/html",
+        mode === "top" || mode === "parent" ? mode : null,
+      ),
+    },
+  );
+}
+
+/**
+ * Top-level bootstrap response for the root of a dedicated preview hostname.
+ * Route only preview-host requests here; the page installs the first-party
+ * worker and reconnects it to the Nodepod host tab.
+ */
+export async function servePreviewBootstrap(): Promise<Response> {
+  return new Response(
+    await readPreviewBridgeSource(import.meta.url, "html"),
+    {
+      status: 200,
+      headers: previewBridgeResponseHeaders("text/html", "top"),
+    },
+  );
+}
+
+export async function servePreviewBridgeScript(): Promise<Response> {
+  return new Response(
+    await readPreviewBridgeSource(import.meta.url, "script"),
+    {
+      status: 200,
+      headers: previewBridgeResponseHeaders("application/javascript"),
+    },
+  );
+}
+
+export async function servePreviewBridgeNode(
+  asset: "html" | "script" = "html",
+  mode?: "top" | "parent" | null,
+): Promise<NodeServeSWResult> {
+  const headers = previewBridgeResponseHeaders(
+    asset === "html" ? "text/html" : "application/javascript",
+    mode,
+  );
+  return {
+    body: Buffer.from(
+      await readPreviewBridgeSource(import.meta.url, asset),
+      "utf8",
+    ),
     headers,
     contentType: headers["Content-Type"],
   };

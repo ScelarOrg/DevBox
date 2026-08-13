@@ -68,6 +68,24 @@ export interface ProxyOptions {
   onServerReady?: (port: number, url: string) => void;
 }
 
+export interface PreviewOriginContext {
+  instanceId: string;
+  port: number;
+  parentOrigin: string;
+}
+
+export type PreviewOriginOption =
+  | "auto"
+  | false
+  | string
+  | ((context: PreviewOriginContext) => string | null);
+
+export interface InstanceProxyOptions {
+  previewOrigin?: PreviewOriginOption;
+  swUrl?: string;
+  onServerReady?: (port: number, url: string) => void;
+}
+
 export interface ServiceWorkerConfig {
   swUrl?: string;
   /**
@@ -84,6 +102,10 @@ interface InstanceState {
   previewInspectorScript: string | null;
   wsBridgeToken: string | null;
   registry: Map<number, RegisteredServer>;
+  /** Final URL reported after the hostname bridge succeeds or falls back. */
+  readyServerUrls: Map<number, string>;
+  /** Monotonic token used to discard late bridge completions after close/rebind. */
+  serverGenerations: Map<number, number>;
   workerWsConns: Map<string, { pid: number }>;
   wsConns: Map<
     string,
@@ -91,6 +113,32 @@ interface InstanceState {
   >;
   /** kept so detach() can remove it */
   wsFrameListener: ((msg: any) => void) | null;
+  proxyOptions: InstanceProxyOptions;
+}
+
+interface PreviewBridgeState {
+  key: string;
+  bridgeId: string;
+  origin: string;
+  instanceId: string;
+  serverPort: number;
+  iframe: HTMLIFrameElement;
+  requestPort: MessagePort | null;
+  relayPort: MessagePort | null;
+  ready: Promise<void>;
+  failed: boolean;
+  cleanup: () => void;
+  dispose: (reason?: string) => void;
+}
+
+interface ExternalPreviewBridgeState {
+  key: string;
+  origin: string;
+  instanceId: string;
+  serverPort: number;
+  requestPort: MessagePort;
+  relayPort: MessagePort;
+  statusPort: MessagePort | null;
 }
 
 export { CompletedResponse };
@@ -125,6 +173,11 @@ export class RequestProxy extends EventEmitter {
 
   // ── WS bridge (one BroadcastChannel for the page, messages tagged per-instance) ──
   private _wsBridge: BroadcastChannel | null = null;
+  private _previewBridges = new Map<string, PreviewBridgeState>();
+  private _externalPreviewBridges = new Map<
+    string,
+    ExternalPreviewBridgeState
+  >();
 
   /** In-memory cookie jar for virtual dev-server origins. Browsers ignore
    *  Set-Cookie on synthetic SW responses, so we replay Cookie headers here. */
@@ -168,9 +221,12 @@ export class RequestProxy extends EventEmitter {
         previewInspectorScript: null,
         wsBridgeToken: null,
         registry: new Map(),
+        readyServerUrls: new Map(),
+        serverGenerations: new Map(),
         workerWsConns: new Map(),
         wsConns: new Map(),
         wsFrameListener: null,
+        proxyOptions: {},
       };
       this._instances.set(instanceId, inst);
     }
@@ -212,6 +268,14 @@ export class RequestProxy extends EventEmitter {
     this.notifySW("claim-instance", { instanceId });
   }
 
+  configureInstance(
+    instanceId: string,
+    options: InstanceProxyOptions,
+  ): void {
+    const inst = this._getOrCreateInstance(instanceId);
+    inst.proxyOptions = { ...inst.proxyOptions, ...options };
+  }
+
   /** detach an instance, unregister all its servers and tear down its ws
    *  connections. safe on an unknown id */
   detach(instanceId: string): void {
@@ -242,6 +306,20 @@ export class RequestProxy extends EventEmitter {
       } catch {
         /* */
       }
+    }
+
+    for (const [key, bridge] of this._previewBridges) {
+      if (bridge.instanceId !== instanceId) continue;
+      try { bridge.requestPort?.postMessage({ type: "release-all" }); } catch { /* */ }
+      bridge.dispose("The Nodepod instance was disposed");
+      this._previewBridges.delete(key);
+    }
+    for (const [key, bridge] of this._externalPreviewBridges) {
+      if (bridge.instanceId !== instanceId) continue;
+      try { bridge.requestPort.close(); } catch { /* */ }
+      try { bridge.relayPort.close(); } catch { /* */ }
+      try { bridge.statusPort?.close(); } catch { /* */ }
+      this._externalPreviewBridges.delete(key);
     }
 
     this._instances.delete(instanceId);
@@ -284,12 +362,76 @@ export class RequestProxy extends EventEmitter {
     }
 
     const inst = this._getOrCreateInstance(instanceId);
+    const generation = (inst.serverGenerations.get(port) ?? 0) + 1;
+    inst.serverGenerations.set(port, generation);
+    inst.readyServerUrls.delete(port);
     inst.registry.set(port, { server, port, hostname });
-    const url = this.serverUrl(instanceId, port);
-    // flat (port, url) shape kept for back-compat with existing listeners
-    this.emit("server-ready", port, url);
-    this.opts.onServerReady?.(port, url);
     this.notifySW("server-registered", { instanceId, port, hostname });
+
+    const previewOrigin = this._resolvePreviewOrigin(instanceId, port, true);
+    if (
+      previewOrigin &&
+      typeof document !== "undefined" &&
+      this._swAuthToken
+    ) {
+      void this._ensurePreviewBridge(instanceId, port, previewOrigin)
+        .then(() =>
+          this._emitServerReady(
+            instanceId,
+            port,
+            `${previewOrigin}/`,
+            generation,
+          )
+        )
+        .catch((error) => {
+          if (!this._isCurrentServer(instanceId, port, generation)) return;
+          console.warn(
+            `[nodepod] hostname preview ${previewOrigin} unavailable; using path URL:`,
+            error,
+          );
+          this._emitServerReady(
+            instanceId,
+            port,
+            this._pathServerUrl(instanceId, port),
+            generation,
+          );
+        });
+      return;
+    }
+
+    this._emitServerReady(
+      instanceId,
+      port,
+      this._pathServerUrl(instanceId, port),
+      generation,
+    );
+  }
+
+  private _isCurrentServer(
+    instanceId: string,
+    port: number,
+    generation: number,
+  ): boolean {
+    const inst = this._instances.get(instanceId);
+    return !!inst?.registry.has(port) &&
+      inst.serverGenerations.get(port) === generation;
+  }
+
+  private _emitServerReady(
+    instanceId: string,
+    port: number,
+    url: string,
+    generation: number,
+  ): void {
+    if (!this._isCurrentServer(instanceId, port, generation)) return;
+    this._instances.get(instanceId)!.readyServerUrls.set(port, url);
+    this.emit("server-ready", port, url, instanceId);
+    const callback = this._instances.get(instanceId)?.proxyOptions.onServerReady;
+    (callback ?? this.opts.onServerReady)?.(port, url);
+  }
+
+  private _pathServerUrl(instanceId: string, port: number): string {
+    return `${this.baseUrl}/__virtual__/${instanceId}/${port}`;
   }
 
   unregister(instanceId: string, port: number): void;
@@ -307,7 +449,28 @@ export class RequestProxy extends EventEmitter {
     const inst = this._instances.get(instanceId);
     if (!inst) return;
     inst.registry.delete(port);
+    inst.readyServerUrls.delete(port);
+    inst.serverGenerations.set(
+      port,
+      (inst.serverGenerations.get(port) ?? 0) + 1,
+    );
     this.notifySW("server-unregistered", { instanceId, port });
+    this._postToPreviewBridges(instanceId, "server-unregistered", {
+      instanceId,
+      port,
+    });
+    for (const [key, bridge] of this._previewBridges) {
+      if (bridge.instanceId !== instanceId || bridge.serverPort !== port) continue;
+      bridge.dispose("The virtual server stopped before its preview was ready");
+      this._previewBridges.delete(key);
+    }
+    for (const [key, bridge] of this._externalPreviewBridges) {
+      if (bridge.instanceId !== instanceId || bridge.serverPort !== port) continue;
+      try { bridge.requestPort.close(); } catch { /* */ }
+      try { bridge.relayPort.close(); } catch { /* */ }
+      try { bridge.statusPort?.close(); } catch { /* */ }
+      this._externalPreviewBridges.delete(key);
+    }
   }
 
   private _extractSetCookie(
@@ -368,6 +531,10 @@ export class RequestProxy extends EventEmitter {
     const inst = this._getOrCreateInstance(instanceId);
     inst.previewScript = script;
     this._sendPreviewScriptToSW(instanceId);
+    this._postToPreviewBridges(instanceId, "set-preview-script", {
+      instanceId,
+      script,
+    });
   }
 
   // Reserved for SDK instrumentation. This deliberately does not share the
@@ -375,6 +542,10 @@ export class RequestProxy extends EventEmitter {
   setPreviewInspectorScript(instanceId: string, script: string | null): void {
     const inst = this._getOrCreateInstance(instanceId);
     inst.previewInspectorScript = script;
+    this._postToPreviewBridges(instanceId, "set-preview-inspector-script", {
+      instanceId,
+      script,
+    });
     if (typeof navigator === "undefined" || !navigator.serviceWorker?.controller) return;
     navigator.serviceWorker.controller.postMessage({
       type: "set-preview-inspector-script",
@@ -386,6 +557,14 @@ export class RequestProxy extends EventEmitter {
 
   setWatermark(enabled: boolean): void {
     this._watermarkEnabled = enabled;
+    for (const bridge of this._previewBridges.values()) {
+      try {
+        bridge.requestPort?.postMessage({
+          type: "set-watermark",
+          data: { enabled },
+        });
+      } catch { /* bridge is being replaced */ }
+    }
     if (
       typeof navigator !== "undefined" &&
       navigator.serviceWorker?.controller
@@ -428,14 +607,18 @@ export class RequestProxy extends EventEmitter {
   }
 
   private _sendWsTokenToSW(instanceId: string): void {
+    const inst = this._instances.get(instanceId);
+    if (!inst) return;
+    this._postToPreviewBridges(instanceId, "set-ws-token", {
+      instanceId,
+      wsToken: inst.wsBridgeToken,
+    });
     if (
       typeof navigator === "undefined" ||
       !navigator.serviceWorker?.controller
     ) {
       return;
     }
-    const inst = this._instances.get(instanceId);
-    if (!inst) return;
     navigator.serviceWorker.controller.postMessage({
       type: "set-ws-token",
       instanceId,
@@ -444,12 +627,460 @@ export class RequestProxy extends EventEmitter {
     });
   }
 
+  private _postToPreviewBridges(
+    instanceId: string,
+    type: string,
+    data: unknown,
+  ): void {
+    for (const bridge of this._previewBridges.values()) {
+      if (bridge.instanceId !== instanceId || !bridge.requestPort) continue;
+      try { bridge.requestPort.postMessage({ type, data }); } catch { /* */ }
+    }
+    for (const bridge of this._externalPreviewBridges.values()) {
+      if (bridge.instanceId !== instanceId) continue;
+      try { bridge.requestPort.postMessage({ type, data }); } catch { /* */ }
+    }
+  }
+
   serverUrl(instanceId: string, port: number): string;
   serverUrl(port: number): string;
   serverUrl(a: string | number, b?: number): string {
     const instanceId = typeof a === "string" ? a : DEFAULT_INSTANCE;
     const port = typeof a === "string" ? (b as number) : a;
+    const origin = this._resolvePreviewOrigin(instanceId, port);
+    if (origin) return `${origin}/`;
     return `${this.baseUrl}/__virtual__/${instanceId}/${port}`;
+  }
+
+  /**
+   * URL state used only for rewriting user-visible CLI output.
+   * `null` means a registered server is waiting for its preview bridge;
+   * `undefined` means the port does not belong to this instance.
+   */
+  displayServerUrl(
+    instanceId: string,
+    port: number,
+  ): string | null | undefined {
+    const inst = this._instances.get(instanceId);
+    if (!inst?.registry.has(port)) return undefined;
+    return inst.readyServerUrls.get(port) ?? null;
+  }
+
+  private _resolvePreviewOrigin(
+    instanceId: string,
+    port: number,
+    retryFailed = false,
+  ): string | null {
+    const option = this._instances.get(instanceId)?.proxyOptions.previewOrigin;
+    if (!option) return null;
+
+    const parentOrigin =
+      typeof location !== "undefined" ? location.origin : this.baseUrl;
+    let raw: string | null;
+    if (typeof option === "function") {
+      raw = option({ instanceId, port, parentOrigin });
+    } else if (option === "auto") {
+      if (typeof location === "undefined") return null;
+      const local =
+        location.hostname === "localhost" ||
+        location.hostname === "127.0.0.1" ||
+        location.hostname === "0.0.0.0" ||
+        location.hostname === "[::1]";
+      if (!local) return null;
+      const portSuffix = location.port ? `:${location.port}` : "";
+      raw = `${location.protocol}//${instanceId.toLowerCase()}-${port}.localhost${portSuffix}`;
+    } else {
+      raw = option
+        .replaceAll("{instanceId}", instanceId.toLowerCase())
+        .replaceAll("{port}", String(port));
+    }
+    if (!raw) return null;
+
+    try {
+      const url = new URL(raw);
+      if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+      if (url.pathname !== "/" || url.search || url.hash) return null;
+      if (url.origin === parentOrigin) return null;
+      const existing = this._previewBridges.get(
+        `${instanceId}\u0000${port}\u0000${url.origin}`,
+      );
+      if (existing?.failed && !retryFailed) return null;
+      return url.origin;
+    } catch {
+      return null;
+    }
+  }
+
+  private _ensurePreviewBridge(
+    instanceId: string,
+    serverPort: number,
+    origin: string,
+  ): Promise<void> {
+    const key = `${instanceId}\u0000${serverPort}\u0000${origin}`;
+    const existing = this._previewBridges.get(key);
+    if (existing && !existing.failed) return existing.ready;
+    if (existing) {
+      existing.dispose();
+      this._previewBridges.delete(key);
+    }
+
+    const bridgeId = crypto.randomUUID();
+    const iframe = document.createElement("iframe");
+    iframe.hidden = true;
+    iframe.tabIndex = -1;
+    iframe.setAttribute("aria-hidden", "true");
+    iframe.title = "Nodepod preview bridge";
+
+    let resolveReady!: () => void;
+    let rejectReady!: (error: Error) => void;
+    let settled = false;
+    let lastStage = "created";
+    let timeout: ReturnType<typeof setTimeout> | null = null;
+    let onMessage: (event: MessageEvent) => void;
+    const ready = new Promise<void>((resolve, reject) => {
+      resolveReady = resolve;
+      rejectReady = reject;
+    });
+    const cleanup = () => {
+      if (timeout !== null) clearTimeout(timeout);
+      window.removeEventListener("message", onMessage);
+      try { bridge.requestPort?.close(); } catch { /* */ }
+      try { bridge.relayPort?.close(); } catch { /* */ }
+      try { iframe.remove(); } catch { /* */ }
+    };
+    const bridge: PreviewBridgeState = {
+      key,
+      bridgeId,
+      origin,
+      instanceId,
+      serverPort,
+      iframe,
+      requestPort: null,
+      relayPort: null,
+      ready,
+      failed: false,
+      cleanup,
+      dispose: (reason?: string) => {
+        if (reason && !settled) {
+          settled = true;
+          bridge.failed = true;
+          cleanup();
+          rejectReady(new Error(reason));
+          return;
+        }
+        cleanup();
+      },
+    };
+    this._previewBridges.set(key, bridge);
+
+    const fail = (message: string) => {
+      if (settled) return;
+      bridge.dispose(message);
+    };
+
+    const connect = () => {
+      const target = iframe.contentWindow;
+      if (!target || !this._swAuthToken) {
+        fail("Preview bridge window is unavailable");
+        return;
+      }
+      try { bridge.requestPort?.close(); } catch { /* */ }
+      try { bridge.relayPort?.close(); } catch { /* */ }
+
+      const requests = new MessageChannel();
+      const relay = new MessageChannel();
+      bridge.requestPort = requests.port1;
+      bridge.relayPort = relay.port1;
+      requests.port1.onmessage = (event) => {
+        if (event.data?.type === "init-ack") {
+          lastStage = `worker-init:${JSON.stringify(event.data.data)}`;
+          // The bridge can announce that it posted init before the worker has
+          // installed its MessagePort listener. Re-seed after the explicit ack
+          // so bind-origin and server metadata cannot be lost in that race.
+          this._seedPreviewBridge(bridge);
+          return;
+        }
+        if (event.data?.type === "origin-bind-error") {
+          fail(
+            `Preview worker routing key mismatch: ${JSON.stringify(event.data.data)}`,
+          );
+          return;
+        }
+        if (
+          event.data?.type === "origin-bound" &&
+          event.data?.data?.instanceId === instanceId &&
+          event.data?.data?.port === serverPort
+        ) {
+          if (!settled) {
+            settled = true;
+            if (timeout !== null) clearTimeout(timeout);
+            // Let the worker finish publishing the origin binding before the
+            // host exposes the URL to the app. Without this scheduling gap,
+            // the first iframe navigation can race the SW's fetch routing
+            // table and remain pending indefinitely in Chromium.
+            setTimeout(resolveReady, 250);
+          }
+          return;
+        }
+        void this.onSWMessage(event, requests.port1);
+      };
+      relay.port1.onmessage = (event) => {
+        this._handleWsBridgeMessage(event.data);
+      };
+      requests.port1.start?.();
+      relay.port1.start?.();
+
+      target.postMessage(
+        {
+          type: "nodepod-bridge-connect",
+          bridgeId,
+          token: this._swAuthToken,
+          requestPort: requests.port2,
+          relayPort: relay.port2,
+        },
+        origin,
+        [requests.port2, relay.port2],
+      );
+    };
+
+    onMessage = (event: MessageEvent) => {
+      const data = event.data;
+      if (
+        event.source !== iframe.contentWindow ||
+        event.origin !== origin ||
+        !data ||
+        data.bridgeId !== bridgeId
+      ) {
+        return;
+      }
+      if (data.type === "nodepod-bridge-stage") {
+        lastStage = typeof data.stage === "string" ? data.stage : lastStage;
+        return;
+      }
+      if (
+        data.type === "nodepod-bridge-ready" ||
+        data.type === "nodepod-bridge-controllerchange" ||
+        data.type === "nodepod-bridge-reconnect"
+      ) {
+        connect();
+        return;
+      }
+      if (data.type === "nodepod-bridge-connected") {
+        this._seedPreviewBridge(bridge);
+        return;
+      }
+      if (data.type === "nodepod-bridge-error") {
+        fail(data.message || "Preview bridge failed");
+      }
+    };
+    window.addEventListener("message", onMessage);
+
+    const parentOrigin = location.origin;
+    const bridgeUrl = new URL("/__nodepod_bridge__.html", origin);
+    bridgeUrl.searchParams.set("parentOrigin", parentOrigin);
+    bridgeUrl.searchParams.set("bridgeId", bridgeId);
+    const swSetting =
+      this._instances.get(instanceId)?.proxyOptions.swUrl ?? "/__sw__.js";
+    try {
+      const resolvedSw = new URL(swSetting, parentOrigin);
+      // A service worker's global state is disposable: Chromium can stop and
+      // restart it between two navigations. Encode the dedicated origin's
+      // routing key in the registration URL so the fresh worker can recover
+      // synchronously before a directly-opened top-level request is handled.
+      resolvedSw.searchParams.set("nodepodInstanceId", instanceId);
+      resolvedSw.searchParams.set("nodepodPort", String(serverPort));
+      resolvedSw.searchParams.set("nodepodParentOrigin", parentOrigin);
+      bridgeUrl.searchParams.set("swUrl", resolvedSw.pathname + resolvedSw.search);
+    } catch {
+      bridgeUrl.searchParams.set(
+        "swUrl",
+        `/__sw__.js?nodepodInstanceId=${encodeURIComponent(instanceId)}` +
+          `&nodepodPort=${serverPort}` +
+          `&nodepodParentOrigin=${encodeURIComponent(parentOrigin)}`,
+      );
+    }
+    iframe.src = bridgeUrl.href;
+    iframe.addEventListener("load", () => {
+      if (lastStage === "created") lastStage = "iframe-loaded";
+    }, { once: true });
+    iframe.addEventListener("error", () => {
+      fail(`Failed to load preview bridge at ${origin}`);
+    }, { once: true });
+    (document.body ?? document.documentElement).appendChild(iframe);
+
+    timeout = setTimeout(() => {
+      if (!settled) {
+        const detail = lastStage === "created"
+          ? "bridge document did not load; verify /__nodepod_bridge__.html " +
+            "and its cross-origin isolation headers on the preview hostname"
+          : `last stage: ${lastStage}`;
+        fail(`Timed out connecting to ${origin} (${detail})`);
+      }
+    }, 10_000);
+
+    return ready;
+  }
+
+  private _seedPreviewBridge(bridge: PreviewBridgeState): void {
+    const inst = this._instances.get(bridge.instanceId);
+    const port = bridge.requestPort;
+    if (!inst || !port) return;
+    this._seedPreviewPort(
+      bridge.instanceId,
+      bridge.serverPort,
+      port,
+    );
+  }
+
+  private _seedPreviewPort(
+    instanceId: string,
+    serverPort: number,
+    port: MessagePort,
+  ): void {
+    const inst = this._instances.get(instanceId);
+    if (!inst) return;
+    this._ensureWsTokenForInstance(instanceId);
+    port.postMessage({
+      type: "bind-origin",
+      data: {
+        instanceId,
+        port: serverPort,
+        previewScript: inst.previewScript,
+        previewInspectorScript: inst.previewInspectorScript,
+        wsToken: inst.wsBridgeToken,
+        watermarkEnabled: this._watermarkEnabled,
+      },
+    });
+    const entry = inst.registry.get(serverPort);
+    if (entry) {
+      port.postMessage({
+        type: "server-registered",
+        data: {
+          instanceId,
+          port: serverPort,
+          hostname: entry.hostname,
+        },
+      });
+    }
+  }
+
+  private _attachExternalPreviewBridge(data: {
+    instanceId?: unknown;
+    serverPort?: unknown;
+    origin?: unknown;
+    requestPort?: unknown;
+    relayPort?: unknown;
+    statusPort?: unknown;
+  }): void {
+    const instanceId = data.instanceId;
+    const serverPort = data.serverPort;
+    const origin = data.origin;
+    const requestPort = data.requestPort;
+    const relayPort = data.relayPort;
+    const statusPort = data.statusPort;
+    const isTransferredPort = (value: unknown): value is MessagePort =>
+      typeof value === "object" &&
+      value !== null &&
+      typeof (value as MessagePort).postMessage === "function" &&
+      typeof (value as MessagePort).close === "function";
+    if (
+      typeof instanceId !== "string" ||
+      !Number.isFinite(serverPort) ||
+      typeof origin !== "string" ||
+      !isTransferredPort(requestPort) ||
+      !isTransferredPort(relayPort) ||
+      !isTransferredPort(statusPort)
+    ) {
+      console.warn("[Nodepod] Ignored an invalid top-level preview bridge");
+      return;
+    }
+    const numericPort = Number(serverPort);
+    const expectedOrigin = this._resolvePreviewOrigin(instanceId, numericPort);
+    if (
+      expectedOrigin !== origin ||
+      !this._instances.get(instanceId)?.registry.has(numericPort)
+    ) {
+      console.warn(
+        `[Nodepod] Rejected a top-level preview bridge for ${origin}`,
+      );
+      try {
+        statusPort.postMessage({
+          type: "nodepod-origin-bind-error",
+          message: "The requested preview is no longer running",
+        });
+      } catch { /* */ }
+      try { requestPort.close(); } catch { /* */ }
+      try { relayPort.close(); } catch { /* */ }
+      try { statusPort.close(); } catch { /* */ }
+      return;
+    }
+
+    const key = `${instanceId}\u0000${numericPort}\u0000${origin}`;
+    const previous = this._externalPreviewBridges.get(key);
+    try { previous?.requestPort.close(); } catch { /* */ }
+    try { previous?.relayPort.close(); } catch { /* */ }
+    try { previous?.statusPort?.close(); } catch { /* */ }
+
+    const bridge: ExternalPreviewBridgeState = {
+      key,
+      origin,
+      instanceId,
+      serverPort: numericPort,
+      requestPort,
+      relayPort,
+      statusPort,
+    };
+    this._externalPreviewBridges.set(key, bridge);
+    requestPort.onmessage = (event) => {
+      if (event.data?.type === "init-ack") {
+        // A transferred port can already have the worker's acknowledgement
+        // queued when it reaches this realm. Seed again after that explicit
+        // readiness signal so no browser scheduling order can lose the bind.
+        this._seedPreviewPort(instanceId, numericPort, requestPort);
+        return;
+      }
+      if (event.data?.type === "origin-bind-error") {
+        console.warn(
+          `[Nodepod] Top-level preview worker rejected ${origin}`,
+          event.data.data,
+        );
+        try {
+          bridge.statusPort?.postMessage({
+            type: "nodepod-origin-bind-error",
+            message: "The preview worker rejected its routing key",
+          });
+          bridge.statusPort?.close();
+        } catch { /* */ }
+        bridge.statusPort = null;
+        return;
+      }
+      if (
+        event.data?.type === "origin-bound" &&
+        event.data?.data?.instanceId === instanceId &&
+        event.data?.data?.port === numericPort
+      ) {
+        try {
+          bridge.statusPort?.postMessage({
+            type: "nodepod-origin-bound",
+            instanceId,
+            port: numericPort,
+          });
+          bridge.statusPort?.close();
+        } catch { /* */ }
+        bridge.statusPort = null;
+        return;
+      }
+      void this.onSWMessage(event, requestPort);
+    };
+    relayPort.onmessage = (event) => {
+      this._handleWsBridgeMessage(event.data);
+    };
+    requestPort.start?.();
+    relayPort.start?.();
+    try {
+      statusPort.postMessage({ type: "nodepod-bridge-attached" });
+    } catch { /* */ }
+    this._seedPreviewPort(instanceId, numericPort, requestPort);
   }
 
   /** ports registered with the given instance. no arg returns the union
@@ -643,10 +1274,13 @@ export class RequestProxy extends EventEmitter {
     this._swAuthToken = crypto.randomUUID();
 
     this.channel = new MessageChannel();
-    this.channel.port1.onmessage = this.onSWMessage.bind(this);
+    const initialChannel = this.channel;
+    initialChannel.port1.onmessage = (event) => {
+      void this.onSWMessage(event, initialChannel.port1);
+    };
     sw.postMessage(
-      { type: "init", port: this.channel.port2, token: this._swAuthToken },
-      [this.channel.port2],
+      { type: "init", port: initialChannel.port2, token: this._swAuthToken },
+      [initialChannel.port2],
     );
 
     // claim every instance attached before the SW was ready. bypassing
@@ -665,10 +1299,13 @@ export class RequestProxy extends EventEmitter {
     const reinit = () => {
       if (!navigator.serviceWorker.controller) return;
       this.channel = new MessageChannel();
-      this.channel.port1.onmessage = this.onSWMessage.bind(this);
+      const nextChannel = this.channel;
+      nextChannel.port1.onmessage = (event) => {
+        void this.onSWMessage(event, nextChannel.port1);
+      };
       navigator.serviceWorker.controller.postMessage(
-        { type: "init", port: this.channel.port2, token: this._swAuthToken },
-        [this.channel.port2],
+        { type: "init", port: nextChannel.port2, token: this._swAuthToken },
+        [nextChannel.port2],
       );
       for (const id of this._instances.keys()) {
         this.notifySW("claim-instance", { instanceId: id });
@@ -689,7 +1326,20 @@ export class RequestProxy extends EventEmitter {
     };
     navigator.serviceWorker.addEventListener("controllerchange", reinit);
     navigator.serviceWorker.addEventListener("message", (ev) => {
-      if (ev.data?.type === "sw-needs-init") reinit();
+      if (ev.data?.type === "sw-needs-init") {
+        reinit();
+        return;
+      }
+      if (ev.data?.type === "attach-preview-bridge") {
+        this._attachExternalPreviewBridge({
+          instanceId: ev.data.instanceId,
+          serverPort: ev.data.serverPort,
+          origin: ev.data.origin,
+          requestPort: ev.data.requestPort,
+          relayPort: ev.data.relayPort,
+          statusPort: ev.data.statusPort,
+        });
+      }
     });
 
     // tell the SW to drop this tab's port + instance claims when the page
@@ -760,10 +1410,23 @@ export class RequestProxy extends EventEmitter {
     return url;
   }
 
-  private async onSWMessage(event: MessageEvent): Promise<void> {
+  private async onSWMessage(
+    event: MessageEvent,
+    replyPort: MessagePort,
+  ): Promise<void> {
     const { type, id, data } = event.data;
     RequestProxy.DEBUG &&
       console.log("[RequestProxy] SW:", type, id, data?.url);
+
+    if (type === "attach-preview-bridge") {
+      this._attachExternalPreviewBridge({
+        ...data,
+        requestPort: event.data.requestPort,
+        relayPort: event.data.relayPort,
+        statusPort: event.data.statusPort,
+      });
+      return;
+    }
 
     if (type === "request") {
       const {
@@ -786,6 +1449,7 @@ export class RequestProxy extends EventEmitter {
       try {
         if (streaming) {
           await this.handleStreaming(
+            replyPort,
             instanceId,
             id,
             port,
@@ -813,7 +1477,12 @@ export class RequestProxy extends EventEmitter {
               const isLocalhost = origUrl.hostname === "localhost" ||
                 origUrl.hostname === "127.0.0.1" ||
                 origUrl.hostname === "0.0.0.0";
-              if (!isLocalhost) {
+              const isPreviewOrigin = [...this._previewBridges.values()].some(
+                (bridge) => bridge.origin === origUrl.origin,
+              ) || [...this._externalPreviewBridges.values()].some(
+                (bridge) => bridge.origin === origUrl.origin,
+              );
+              if (!isLocalhost && !isPreviewOrigin) {
                 const fallbackResp = await fetch(originalUrl);
                 const fallbackBody = await fallbackResp.arrayBuffer();
                 const fallbackHeaders: Record<string, string> = {};
@@ -823,7 +1492,7 @@ export class RequestProxy extends EventEmitter {
                 const fallbackB64 = fallbackBody.byteLength > 0
                   ? bytesToBase64(new Uint8Array(fallbackBody))
                   : "";
-                this.channel?.port1.postMessage({
+                replyPort.postMessage({
                   type: "response",
                   id,
                   data: {
@@ -846,7 +1515,7 @@ export class RequestProxy extends EventEmitter {
               resp.body instanceof Uint8Array ? resp.body : new Uint8Array(0);
             bodyB64 = bytesToBase64(bytes);
           }
-          this.channel?.port1.postMessage({
+          replyPort.postMessage({
             type: "response",
             id,
             data: {
@@ -858,7 +1527,7 @@ export class RequestProxy extends EventEmitter {
           });
         }
       } catch (err) {
-        this.channel?.port1.postMessage({
+        replyPort.postMessage({
           type: "response",
           id,
           error: err instanceof Error ? err.message : "Unknown error",
@@ -868,6 +1537,7 @@ export class RequestProxy extends EventEmitter {
   }
 
   private async handleStreaming(
+    replyPort: MessagePort,
     instanceId: string,
     id: number,
     port: number,
@@ -879,7 +1549,7 @@ export class RequestProxy extends EventEmitter {
     const inst = this._instances.get(instanceId);
     const entry = inst?.registry.get(port);
     if (!entry) {
-      this.channel?.port1.postMessage({
+      replyPort.postMessage({
         type: "stream-start",
         id,
         data: {
@@ -888,7 +1558,7 @@ export class RequestProxy extends EventEmitter {
           headers: {},
         },
       });
-      this.channel?.port1.postMessage({ type: "stream-end", id });
+      replyPort.postMessage({ type: "stream-end", id });
       return;
     }
 
@@ -906,7 +1576,7 @@ export class RequestProxy extends EventEmitter {
           h: Record<string, string | string[]>,
         ) => {
           this._storeResponseCookies(instanceId, port, h);
-          this.channel?.port1.postMessage({
+          replyPort.postMessage({
             type: "stream-start",
             id,
             data: { statusCode, statusMessage, headers: h },
@@ -914,14 +1584,14 @@ export class RequestProxy extends EventEmitter {
         },
         (chunk: string | Uint8Array) => {
           const bytes = typeof chunk === "string" ? _enc.encode(chunk) : chunk;
-          this.channel?.port1.postMessage({
+          replyPort.postMessage({
             type: "stream-chunk",
             id,
             data: { chunkBase64: bytesToBase64(bytes) },
           });
         },
         () => {
-          this.channel?.port1.postMessage({ type: "stream-end", id });
+          replyPort.postMessage({ type: "stream-end", id });
         },
       );
     } else {
@@ -933,7 +1603,7 @@ export class RequestProxy extends EventEmitter {
         buf,
       );
       this._storeResponseCookies(instanceId, port, resp.headers);
-      this.channel?.port1.postMessage({
+      replyPort.postMessage({
         type: "stream-start",
         id,
         data: {
@@ -945,13 +1615,13 @@ export class RequestProxy extends EventEmitter {
       if (method?.toUpperCase() !== "HEAD" && resp.body?.length) {
         const bytes =
           resp.body instanceof Uint8Array ? resp.body : new Uint8Array(0);
-        this.channel?.port1.postMessage({
+        replyPort.postMessage({
           type: "stream-chunk",
           id,
           data: { chunkBase64: bytesToBase64(bytes) },
         });
       }
-      this.channel?.port1.postMessage({ type: "stream-end", id });
+      replyPort.postMessage({ type: "stream-end", id });
     }
   }
 
@@ -973,23 +1643,36 @@ export class RequestProxy extends EventEmitter {
 
     this._wsBridge = new BroadcastChannel("nodepod-ws");
     this._wsBridge.onmessage = (ev: MessageEvent) => {
-      const d = ev.data;
-      if (!d || !d.kind) return;
-
-      // validate against the instance-specific token
-      const instanceId: string = d.instanceId || DEFAULT_INSTANCE;
-      const inst = this._instances.get(instanceId);
-      if (!inst) return;
-      if (inst.wsBridgeToken && d.token !== inst.wsBridgeToken) return;
-
-      if (d.kind === "ws-connect") {
-        this._handleWsConnect(instanceId, d.uid, d.port, d.path, d.protocols);
-      } else if (d.kind === "ws-send") {
-        this._handleWsSend(instanceId, d.uid, d.data, d.type);
-      } else if (d.kind === "ws-close") {
-        this._handleWsClose(instanceId, d.uid, d.code, d.reason);
-      }
+      this._handleWsBridgeMessage(ev.data);
     };
+  }
+
+  private _handleWsBridgeMessage(d: any): void {
+    if (!d || !d.kind) return;
+    const instanceId: string = d.instanceId || DEFAULT_INSTANCE;
+    const inst = this._instances.get(instanceId);
+    if (!inst) return;
+    if (inst.wsBridgeToken && d.token !== inst.wsBridgeToken) return;
+
+    if (d.kind === "ws-connect") {
+      this._handleWsConnect(instanceId, d.uid, d.port, d.path, d.protocols);
+    } else if (d.kind === "ws-send") {
+      this._handleWsSend(instanceId, d.uid, d.data, d.type);
+    } else if (d.kind === "ws-close") {
+      this._handleWsClose(instanceId, d.uid, d.code, d.reason);
+    }
+  }
+
+  private _broadcastWs(instanceId: string, message: Record<string, unknown>): void {
+    this._wsBridge?.postMessage(message);
+    for (const bridge of this._previewBridges.values()) {
+      if (bridge.instanceId !== instanceId || !bridge.relayPort) continue;
+      try { bridge.relayPort.postMessage(message); } catch { /* */ }
+    }
+    for (const bridge of this._externalPreviewBridges.values()) {
+      if (bridge.instanceId !== instanceId) continue;
+      try { bridge.relayPort.postMessage(message); } catch { /* */ }
+    }
   }
 
   private _handleWsConnect(
@@ -1039,7 +1722,7 @@ export class RequestProxy extends EventEmitter {
           return;
         }
       }
-      this._wsBridge?.postMessage({
+      this._broadcastWs(instanceId, {
         kind: "ws-error",
         instanceId,
         uid,
@@ -1050,7 +1733,6 @@ export class RequestProxy extends EventEmitter {
     }
 
     const { socket } = server.dispatchUpgrade(path || "/", headers);
-    const bridge = this._wsBridge!;
     const token = inst.wsBridgeToken;
 
     let outboundBuf = new Uint8Array(0);
@@ -1070,7 +1752,7 @@ export class RequestProxy extends EventEmitter {
         const text = new TextDecoder().decode(raw);
         if (text.startsWith("HTTP/1.1 101")) {
           handshakeDone = true;
-          bridge.postMessage({ kind: "ws-open", instanceId, uid, token });
+          this._broadcastWs(instanceId, { kind: "ws-open", instanceId, uid, token });
           if (fn) queueMicrotask(() => fn(null));
           return true;
         }
@@ -1089,7 +1771,7 @@ export class RequestProxy extends EventEmitter {
         switch (frame.op) {
           case WS_OPCODE.TEXT: {
             const text = new TextDecoder().decode(frame.data);
-            bridge.postMessage({
+            this._broadcastWs(instanceId, {
               kind: "ws-message",
               instanceId,
               uid,
@@ -1100,7 +1782,7 @@ export class RequestProxy extends EventEmitter {
             break;
           }
           case WS_OPCODE.BINARY:
-            bridge.postMessage({
+            this._broadcastWs(instanceId, {
               kind: "ws-message",
               instanceId,
               uid,
@@ -1114,7 +1796,7 @@ export class RequestProxy extends EventEmitter {
               frame.data.length >= 2
                 ? (frame.data[0] << 8) | frame.data[1]
                 : 1000;
-            bridge.postMessage({
+            this._broadcastWs(instanceId, {
               kind: "ws-closed",
               instanceId,
               uid,
@@ -1143,8 +1825,6 @@ export class RequestProxy extends EventEmitter {
   }
 
   private _handleWorkerWsFrame(instanceId: string, msg: any): void {
-    const bridge = this._wsBridge;
-    if (!bridge) return;
     const inst = this._instances.get(instanceId);
     if (!inst) return;
     const uid = msg.uid;
@@ -1152,10 +1832,10 @@ export class RequestProxy extends EventEmitter {
 
     switch (msg.kind) {
       case "open":
-        bridge.postMessage({ kind: "ws-open", instanceId, uid, token });
+        this._broadcastWs(instanceId, { kind: "ws-open", instanceId, uid, token });
         break;
       case "text":
-        bridge.postMessage({
+        this._broadcastWs(instanceId, {
           kind: "ws-message",
           instanceId,
           uid,
@@ -1165,7 +1845,7 @@ export class RequestProxy extends EventEmitter {
         });
         break;
       case "binary":
-        bridge.postMessage({
+        this._broadcastWs(instanceId, {
           kind: "ws-message",
           instanceId,
           uid,
@@ -1175,7 +1855,7 @@ export class RequestProxy extends EventEmitter {
         });
         break;
       case "close":
-        bridge.postMessage({
+        this._broadcastWs(instanceId, {
           kind: "ws-closed",
           instanceId,
           uid,
@@ -1185,7 +1865,7 @@ export class RequestProxy extends EventEmitter {
         inst.workerWsConns.delete(uid);
         break;
       case "error":
-        bridge.postMessage({
+        this._broadcastWs(instanceId, {
           kind: "ws-error",
           instanceId,
           uid,

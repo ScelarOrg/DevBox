@@ -3,6 +3,7 @@
 
 
 import { EventEmitter } from "./events";
+import { PassThrough } from "./stream";
 import { getRegistry, type Handle } from "../helpers/event-loop";
 
 // shared defaults for main thread; child workers get per-engine overrides via buildResolver
@@ -29,6 +30,8 @@ export type WorkerThreadForkFn = (
   },
 ) => {
   postMessage: (data: unknown) => void;
+  sendStdin: (data: string) => void;
+  endStdin: () => void;
   terminate: () => void;
   requestId: number;
 };
@@ -92,6 +95,65 @@ MessagePort.prototype.ref = function ref(this: any): void {
 };
 MessagePort.prototype.unref = function unref(this: any): void {
   (this._elHandle as Handle | null)?.unref();
+};
+
+// Node starts delivering and refs a MessagePort when a message listener is
+// attached. Keeping that reference listener-aware lets one-shot workers exit,
+// while workers waiting for parent messages remain alive.
+MessagePort.prototype.addListener = function addListener(
+  this: any,
+  name: string,
+  handler: (...args: any[]) => void,
+): any {
+  EventEmitter.prototype.addListener.call(this, name, handler);
+  if (name === "message") this.ref();
+  return this;
+};
+MessagePort.prototype.on = MessagePort.prototype.addListener;
+MessagePort.prototype.once = function once(
+  this: any,
+  name: string,
+  handler: (...args: any[]) => void,
+): any {
+  EventEmitter.prototype.once.call(this, name, handler);
+  if (name === "message") this.ref();
+  return this;
+};
+MessagePort.prototype.removeListener = function removeListener(
+  this: any,
+  name: string,
+  handler: (...args: any[]) => void,
+): any {
+  EventEmitter.prototype.removeListener.call(this, name, handler);
+  if (name === "message" && this.listenerCount("message") === 0) this.unref();
+  return this;
+};
+MessagePort.prototype.off = MessagePort.prototype.removeListener;
+MessagePort.prototype.removeAllListeners = function removeAllListeners(
+  this: any,
+  name?: string,
+): any {
+  EventEmitter.prototype.removeAllListeners.call(this, name);
+  if (name === undefined || name === "message") this.unref();
+  return this;
+};
+MessagePort.prototype.prependListener = function prependListener(
+  this: any,
+  name: string,
+  handler: (...args: any[]) => void,
+): any {
+  EventEmitter.prototype.prependListener.call(this, name, handler);
+  if (name === "message") this.ref();
+  return this;
+};
+MessagePort.prototype.prependOnceListener = function prependOnceListener(
+  this: any,
+  name: string,
+  handler: (...args: any[]) => void,
+): any {
+  EventEmitter.prototype.prependOnceListener.call(this, name, handler);
+  if (name === "message") this.ref();
+  return this;
 };
 
 // emnapi (@emnapi/runtime) keeps Node alive during napi async work /
@@ -178,6 +240,9 @@ export interface Worker extends EventEmitter {
   _handle: ReturnType<WorkerThreadForkFn> | null;
   _terminated: boolean;
   _elHandle: Handle | null;
+  stdin: InstanceType<typeof PassThrough> | null;
+  stdout: InstanceType<typeof PassThrough>;
+  stderr: InstanceType<typeof PassThrough>;
   postMessage(value: unknown, _transferListOrOptions?: unknown): void;
   terminate(): Promise<number>;
   ref(): this;
@@ -197,6 +262,9 @@ interface WorkerConstructor {
       resourceLimits?: Record<string, number>;
       name?: string;
       transferList?: unknown[];
+      stdin?: boolean;
+      stdout?: boolean;
+      stderr?: boolean;
     },
   ): Worker;
   (this: any, script: string | URL, opts?: any): void;
@@ -215,6 +283,9 @@ export const Worker = function Worker(
     resourceLimits?: Record<string, number>;
     name?: string;
     transferList?: unknown[];
+    stdin?: boolean;
+    stdout?: boolean;
+    stderr?: boolean;
   },
 ) {
   if (!this) return;
@@ -225,6 +296,9 @@ export const Worker = function Worker(
   this._handle = null;
   this._terminated = false;
   this._elHandle = null;
+  this.stdin = null;
+  this.stdout = new PassThrough();
+  this.stderr = new PassThrough();
 
   // if override is installed (napi-rs WASI worker factory), delegate — it handles both WASI workers and fork-based fallback
   if (_workerConstructorOverride) {
@@ -269,22 +343,42 @@ export const Worker = function Worker(
       self.emit("error", err);
     },
     onExit: (code: number) => {
+      self.stdout.end();
+      self.stdout.push(null);
+      self.stderr.end();
+      self.stderr.push(null);
       self._elHandle?.close();
       self._elHandle = null;
       self._terminated = true;
       self.emit("exit", code);
     },
     onStdout: (data: string) => {
+      self.stdout.write(data);
+      if (!opts?.stdout) {
         const sink = (globalThis as any).process?.stdout?.write;
-      if (typeof sink === "function") sink.call((globalThis as any).process.stdout, data);
+        if (typeof sink === "function") sink.call((globalThis as any).process.stdout, data);
+      }
     },
     onStderr: (data: string) => {
-      const sink = (globalThis as any).process?.stderr?.write;
-      if (typeof sink === "function") sink.call((globalThis as any).process.stderr, data);
+      self.stderr.write(data);
+      if (!opts?.stderr) {
+        const sink = (globalThis as any).process?.stderr?.write;
+        if (typeof sink === "function") sink.call((globalThis as any).process.stderr, data);
+      }
     },
   });
 
   this._handle = handle;
+
+  if (opts?.stdin) {
+    this.stdin = new PassThrough();
+    this.stdin.on("data", (chunk: unknown) => {
+      if (!self._terminated) handle.sendStdin(String(chunk));
+    });
+    this.stdin.once("finish", () => {
+      if (!self._terminated) handle.endStdin();
+    });
+  }
 
   // workers are refed by default in node, keeps parent alive
   this._elHandle = getRegistry().register("Worker");
@@ -308,6 +402,11 @@ Worker.prototype.terminate = function terminate(this: any): Promise<number> {
     this._elHandle = null;
     this._terminated = true;
     this._handle.terminate();
+    this.stdin?.end?.();
+    this.stdout.end();
+    this.stdout.push(null);
+    this.stderr.end();
+    this.stderr.push(null);
   }
   return Promise.resolve(0);
 };

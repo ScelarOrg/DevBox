@@ -57,6 +57,15 @@ describe("ScriptEngine", () => {
       expect(result.exports).toBe("linux");
     });
 
+    it("exposes the Console constructor from node:console", () => {
+      const { engine } = createEngine();
+      const result = engine.execute(
+        'const { Console } = require("node:console"); module.exports = typeof Console;',
+        "/index.js",
+      );
+      expect(result.exports).toBe("function");
+    });
+
     it("handles syntax errors by throwing", () => {
       const { engine } = createEngine();
       expect(() => engine.execute("const {", "/bad.js")).toThrow();

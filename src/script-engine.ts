@@ -1263,6 +1263,9 @@ function wrapConsole(
   // Route through onConsole callback exclusively when provided, else fall back to browser console
   const nc = _nativeConsole;
   const wrapped = {
+    // require("node:console") returns the same callable Console constructor as
+    // the core-module namespace, in addition to the process console methods.
+    Console: consolePolyfill.Console,
     log: (...args: unknown[]) => {
       if (onConsole) onConsole("log", args);
       else nc.log(...args);

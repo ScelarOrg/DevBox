@@ -1,0 +1,42 @@
+---
+title: Nodepod documentation
+description: Run Node.js programs, filesystems, packages, and servers inside the browser.
+sidebar:
+  order: 1
+---
+
+import { Card, CardGrid, LinkButton } from '@astrojs/starlight/components';
+
+Nodepod is a browser-native Node.js runtime for products that need real filesystem, shell, package, process, and HTTP primitives without sending every action to a backend.
+
+```bash
+npm install @scelar/nodepod
+```
+
+<LinkButton href="/Nodepod/docs/getting-started/first-program/">Run your first program</LinkButton>
+
+## Choose a path
+
+<CardGrid>
+  <Card title="Embed a runtime" icon="puzzle">
+    Boot Nodepod, seed files, spawn a Node.js process, and stream its output.
+  </Card>
+  <Card title="Add a terminal" icon="seti:shell">
+    Connect xterm.js to Nodepod's persistent shell and virtual filesystem.
+  </Card>
+  <Card title="Run a server" icon="rocket">
+    Start a Node-compatible HTTP server and call it programmatically or through an isolated preview.
+  </Card>
+  <Card title="Use headless mode" icon="setting">
+    Run the same core runtime in a browser, Node.js, or Bun without terminal or preview UI.
+  </Card>
+</CardGrid>
+
+## Integration requirements
+
+- Nodepod supports current evergreen browsers with WebAssembly and Web Workers.
+- Full synchronous and threaded behaviour requires cross-origin isolation and `SharedArrayBuffer`.
+- Preview URLs require Nodepod's service-worker and preview-bridge assets. Programmatic runtime and HTTP access can run with `serviceWorker: false`.
+- Nodepod is source-available under MIT + Commons Clause. The repository [`LICENSE`](https://github.com/R1ck404/Nodepod/blob/main/LICENSE) is authoritative.
+
+Read [compatibility and browser requirements](/Nodepod/docs/concepts/compatibility/) before choosing a deployment mode.

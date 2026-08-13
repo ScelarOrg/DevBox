@@ -1,0 +1,132 @@
+---
+import SiteLayout from "../layouts/SiteLayout.astro";
+import TerminalDemo from "../components/TerminalDemo.astro";
+
+const base = import.meta.env.BASE_URL.replace(/\/$/, "");
+const nativeProof = [
+  ["vite@8", "the real CLI"],
+  ["next", "the real framework"],
+  ["npm packages", "resolved normally"],
+  ["node scripts", "executed directly"],
+];
+const primitives = [
+  ["Filesystem", "A writable, watchable POSIX-style project filesystem."],
+  ["Processes", "Scripts, CLIs, child processes, and worker threads."],
+  ["Packages", "npm resolution, CommonJS, ESM, and native-feeling imports."],
+  ["Servers", "Node-compatible HTTP servers connected back to the host app."],
+];
+---
+
+<SiteLayout
+  title="nodepod | Node.js, inside the browser"
+  description="Filesystem, shell, npm packages, and HTTP servers. No backend required."
+>
+  <section class="hero">
+    <p class="hero-eyebrow">Browser-native Node.js runtime</p>
+    <h1>Node.js, inside<br />{" "}the browser<span aria-hidden="true">.</span></h1>
+    <p class="hero-copy">Filesystem, shell, npm packages, and HTTP servers. No backend required.</p>
+    <p class="hero-thesis">Real Node.js programs. Real npm packages. No framework-specific simulation.</p>
+
+    <div class="hero-actions">
+      <a class="button button--coral" href={`${base}/docs/`}>Get started</a>
+      <a class="text-link" href="https://github.com/R1ck404/Nodepod">View on GitHub <span aria-hidden="true">↗</span></a>
+    </div>
+
+    <div class="install-command" data-copy-block>
+      <span aria-hidden="true">$</span>
+      <code>npm install @scelar/nodepod</code>
+      <button type="button" data-copy-command aria-label="Copy install command">Copy</button>
+    </div>
+  </section>
+
+  <section class="native-story ruled" aria-labelledby="native-title">
+    <div class="section-kicker">01 / The surprising part</div>
+    <h2 id="native-title">Nodepod doesn’t know<br />what Vite is.</h2>
+
+    <div class="native-intro">
+      <p class="native-lede">That is exactly why it matters.</p>
+      <div>
+        <p>There is no Vite emulation layer inside the runtime, no Next.js compatibility mode, and no list of blessed frameworks. Nodepod implements the Node primitives they expect: files, processes, modules, packages, workers, and HTTP.</p>
+        <p>When Vite 8 or a Next.js app boots, it is their code executing inside Nodepod. The framework is not recreated or hardcoded into the runtime. It simply runs.</p>
+      </div>
+    </div>
+
+    <div class="native-proof brutal-frame">
+      <div class="proof-toolbar">
+        <span>real-packages.sh</span>
+        <span>browser / nodepod</span>
+      </div>
+      <div class="proof-body">
+        <pre aria-label="Representative Vite command output"><code><span class="prompt">$</span> npm install vite@8
+<span class="prompt">$</span> npx vite --host 0.0.0.0
+
+  <span class="coral">VITE v8</span>  ready
+  Local: http://localhost:5173/</code></pre>
+        <ul aria-label="Examples of software that runs natively in Nodepod">
+          {nativeProof.map(([name, note]) => (
+            <li><strong>{name}</strong><span>{note}</span></li>
+          ))}
+        </ul>
+      </div>
+      <p class="proof-note">Representative hosted workflow. The live Pages demo below is intentionally offline and does not expose HTTP preview.</p>
+    </div>
+  </section>
+
+  <TerminalDemo />
+
+  <section class="primitives ruled" aria-labelledby="primitives-title">
+    <div class="section-kicker">03 / One runtime</div>
+    <h2 id="primitives-title">Enough Node.js for tools<br />to be themselves.</h2>
+    <div class="primitive-list">
+      {primitives.map(([title, detail], index) => (
+        <article>
+          <span>{String(index + 1).padStart(2, "0")}</span>
+          <h3>{title}</h3>
+          <p>{detail}</p>
+        </article>
+      ))}
+    </div>
+    <p class="use-line"><span>Made for</span> browser IDEs, coding playgrounds, interactive documentation, technical interviews, and local-first developer tools.</p>
+  </section>
+
+  <section class="architecture ruled" aria-labelledby="architecture-title">
+    <div class="section-kicker">04 / How it works</div>
+    <h2 id="architecture-title">The browser becomes<br />the machine.</h2>
+    <div class="architecture-grid">
+      <div class="architecture-copy">
+        <p>A host application boots Nodepod. Workers execute programs against an in-memory filesystem. Node-compatible modules provide the environment existing tools already understand.</p>
+        <a class="text-link" href={`${base}/docs/concepts/how-nodepod-works/`}>Read how it works <span aria-hidden="true">→</span></a>
+      </div>
+      <ol class="architecture-flow" aria-label="Nodepod architecture flow">
+        <li><span>your app</span><b>boots</b></li>
+        <li><span>nodepod</span><b>coordinates</b></li>
+        <li><span>workers + vfs</span><b>execute</b></li>
+        <li><span>terminal + preview</span><b>return</b></li>
+      </ol>
+    </div>
+  </section>
+
+  <section class="closing ruled" aria-label="Project and sponsorship">
+    <div class="closing-item">
+      <div class="section-kicker">05 / Source available</div>
+      <h2>Read the code.<br />Understand the machine.</h2>
+      <p>Nodepod is source-available under the MIT License with the Commons Clause. The <a href="https://github.com/R1ck404/Nodepod/blob/main/LICENSE">LICENSE</a> file is authoritative.</p>
+    </div>
+    <div class="closing-item">
+      <div class="section-kicker">06 / Sustain the work</div>
+      <h2>Help move Node.js<br />into the browser.</h2>
+      <p>Sponsorship will support compatibility work, documentation, and the long tail of Node APIs.</p>
+      <a class="text-link" href={`${base}/sponsors/`}>Sponsorship details <span aria-hidden="true">→</span></a>
+    </div>
+  </section>
+</SiteLayout>
+
+<script>
+  const button = document.querySelector<HTMLButtonElement>("[data-copy-command]");
+  button?.addEventListener("click", async () => {
+    const command = "npm install @scelar/nodepod";
+    await navigator.clipboard.writeText(command);
+    button.textContent = "Copied";
+    window.setTimeout(() => { button.textContent = "Copy"; }, 1600);
+  });
+</script>

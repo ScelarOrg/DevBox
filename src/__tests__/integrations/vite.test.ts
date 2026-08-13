@@ -23,7 +23,7 @@ describe("integrations/vite", () => {
     expect(plugin.name).toBe("nodepod");
   });
 
-  it("emits __sw__.js as an asset during generateBundle", async () => {
+  it("emits the SW and hostname-preview bridge assets during generateBundle", async () => {
     const plugin = nodepod();
     const emitted: Array<{ fileName: string; source: string }> = [];
     const ctx = {
@@ -44,6 +44,15 @@ describe("integrations/vite", () => {
     const sw = emitted.find((a) => a.fileName === "__sw__.js");
     expect(sw).toBeDefined();
     expect(sw!.source.length).toBeGreaterThan(1000);
+
+    const bridgeHtml = emitted.find(
+      (a) => a.fileName === "__nodepod_bridge__.html",
+    );
+    const bridgeScript = emitted.find(
+      (a) => a.fileName === "__nodepod_bridge__.js",
+    );
+    expect(bridgeHtml?.source).toMatch(/__nodepod_bridge__\.js/);
+    expect(bridgeScript?.source).toMatch(/serviceWorker\.register/);
 
     const worker = emitted.find((a) => a.fileName === "__worker__.js");
     if (workerAssetBuilt) {
@@ -106,6 +115,93 @@ describe("integrations/vite", () => {
       });
       expect(res.statusCode).toBe(200);
     }
+
+    for (const [path, contentType] of [
+      ["/__nodepod_bridge__.html", /text\/html/i],
+      ["/__nodepod_bridge__.js", /javascript/i],
+    ] as const) {
+      const res = new MockRes();
+      await mw({ url: path }, res, () => {
+        throw new Error(`next() should not be called for ${path}`);
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.headers["Content-Type"]).toMatch(contentType);
+      expect(res.headers["Cross-Origin-Resource-Policy"]).toBe("cross-origin");
+      expect(res.body.length).toBeGreaterThan(100);
+    }
+
+    // A first top-level visit has no unpartitioned preview SW yet. On the
+    // reserved local hostname, Vite serves the connection bootstrap for any
+    // document navigation, including client-router deep links.
+    {
+      const res = new MockRes();
+      await mw(
+        {
+          url: "/",
+          headers: { host: "podabc-5173.localhost:4173" },
+        } as any,
+        res,
+        () => {
+          throw new Error("next() should not run for a preview-host root");
+        },
+      );
+      expect(res.statusCode).toBe(200);
+      expect(res.headers["Content-Type"]).toMatch(/text\/html/i);
+      expect(res.headers["Cross-Origin-Opener-Policy"]).toBe(
+        "same-origin-allow-popups",
+      );
+      expect(res.body).toMatch(/__nodepod_bridge__\.js/);
+    }
+
+    {
+      const res = new MockRes();
+      await mw(
+        {
+          url: "/docs/getting-started?tab=api",
+          headers: {
+            host: "podabc-5173.localhost:4173",
+            accept: "text/html,application/xhtml+xml",
+            "sec-fetch-mode": "navigate",
+          },
+        } as any,
+        res,
+        () => {
+          throw new Error("next() should not run for a preview deep link");
+        },
+      );
+      expect(res.statusCode).toBe(200);
+      expect(res.body).toMatch(/__nodepod_bridge__\.js/);
+    }
+
+    {
+      const res = new MockRes();
+      let nextCalled = false;
+      await mw(
+        {
+          url: "/assets/app.css",
+          headers: {
+            host: "podabc-5173.localhost:4173",
+            accept: "text/css,*/*;q=0.1",
+            "sec-fetch-mode": "no-cors",
+          },
+        } as any,
+        res,
+        () => { nextCalled = true; },
+      );
+      expect(nextCalled).toBe(true);
+    }
+
+    {
+      const res = new MockRes();
+      await mw(
+        { url: "/__nodepod_bridge__.html?mode=parent" },
+        res,
+        () => {
+          throw new Error("next() should not run for parent bridge");
+        },
+      );
+      expect(res.headers["Cross-Origin-Opener-Policy"]).toBe("unsafe-none");
+    }
   });
 });
 
@@ -129,7 +225,7 @@ class MockRes {
 
 // End-to-end: spin up a real Vite dev server, hit /__sw__.js over HTTP.
 describe("integrations/vite end-to-end", () => {
-  it("dev server serves /__sw__.js with real HTTP fetch", async () => {
+  it("dev server serves the SW and preview bridge with real HTTP fetch", async () => {
     const server = await createServer({
       configFile: false,
       root: process.cwd(),
@@ -156,6 +252,23 @@ describe("integrations/vite end-to-end", () => {
       // Cache-buster query the SDK appends on register().
       const res2 = await fetch(`${url}?v=${Date.now()}`);
       expect(res2.status).toBe(200);
+
+      const origin = `http://127.0.0.1:${addr.port}`;
+      const bridgeHtml = await fetch(`${origin}/__nodepod_bridge__.html`);
+      expect(bridgeHtml.status).toBe(200);
+      expect(bridgeHtml.headers.get("content-type")).toMatch(/text\/html/i);
+      expect(bridgeHtml.headers.get("cross-origin-resource-policy")).toBe(
+        "cross-origin",
+      );
+      expect(await bridgeHtml.text()).toMatch(/__nodepod_bridge__\.js/);
+
+      const bridgeScript = await fetch(`${origin}/__nodepod_bridge__.js`);
+      expect(bridgeScript.status).toBe(200);
+      expect(bridgeScript.headers.get("content-type")).toMatch(/javascript/i);
+      const bridgeScriptText = await bridgeScript.text();
+      expect(bridgeScriptText).toMatch(/serviceWorker\.register/);
+      expect(bridgeScriptText).toMatch(/nodepod-bridge-stage/);
+      expect(bridgeScriptText).toMatch(/nodepod-bridge-reconnect/);
     } finally {
       await server.close();
     }
@@ -205,6 +318,19 @@ describe("integrations/vite end-to-end", () => {
         );
         expect(worker).toBeDefined();
       }
+
+      expect(
+        assets.find(
+          (a) =>
+            a.type === "asset" && a.fileName === "__nodepod_bridge__.html",
+        ),
+      ).toBeDefined();
+      expect(
+        assets.find(
+          (a) =>
+            a.type === "asset" && a.fileName === "__nodepod_bridge__.js",
+        ),
+      ).toBeDefined();
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
