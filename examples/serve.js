@@ -7,7 +7,7 @@ import { join, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
-const port = 3333;
+const port = Number(process.env.PORT || 3333);
 
 const types = {
   '.html': 'text/html',
@@ -21,10 +21,28 @@ const types = {
 };
 
 createServer((req, res) => {
-  let url = req.url.split('?')[0];
+  const requestUrl = new URL(req.url, 'http://nodepod.local');
+  let url = requestUrl.pathname;
+  const hostname = String(req.headers.host || '').replace(/:\d+$/, '');
+  const isPreviewHost =
+    /^.+-\d+\.localhost$/i.test(hostname) ||
+    /^.+-\d+\.preview\..+$/i.test(hostname);
+  const isInternalPreviewAsset =
+    url === '/__sw__.js' ||
+    url === '/__nodepod_bridge__.html' ||
+    url === '/__nodepod_bridge__.js' ||
+    url === '/__worker__.js';
+  const isPreviewBootstrap = isPreviewHost && !isInternalPreviewAsset && (
+    url === '/' ||
+    req.headers['sec-fetch-mode'] === 'navigate' ||
+    String(req.headers.accept || '').includes('text/html')
+  );
   if (url.endsWith('/')) url += 'index.html';
   // Serve SW from root path so its scope can cover "/"
-  const file = url === '/__sw__.js' ? '/dist/__sw__.js'
+  const file = isPreviewBootstrap ? '/dist/__nodepod_bridge__.html'
+    : url === '/__sw__.js' ? '/dist/__sw__.js'
+    : url === '/__nodepod_bridge__.html' ? '/dist/__nodepod_bridge__.html'
+    : url === '/__nodepod_bridge__.js' ? '/dist/__nodepod_bridge__.js'
     : url === '/index.html' ? '/examples/basic/index.html' : url;
   try {
     const content = readFileSync(join(root, file));
@@ -34,8 +52,26 @@ createServer((req, res) => {
       'Cross-Origin-Embedder-Policy': 'credentialless',
       'Cache-Control': 'no-store',
     };
+    if (
+      isPreviewBootstrap ||
+      (url === '/__nodepod_bridge__.html' && requestUrl.searchParams.get('mode') === 'top')
+    ) {
+      // The top-level preview must be able to open its first-party connection
+      // popup. The actual Vite response becomes COOP same-origin again.
+      headers['Cross-Origin-Opener-Policy'] = 'same-origin-allow-popups';
+      delete headers['Cross-Origin-Embedder-Policy'];
+    }
+    if (url === '/__nodepod_bridge__.html' && requestUrl.searchParams.get('mode') === 'parent') {
+      // This tiny first-party popup must retain its preview-origin opener long
+      // enough to transfer the two MessagePorts into the host service worker.
+      headers['Cross-Origin-Opener-Policy'] = 'unsafe-none';
+      delete headers['Cross-Origin-Embedder-Policy'];
+    }
     // Allow SW to control root scope even when served from /dist/
     if (url === '/__sw__.js') headers['Service-Worker-Allowed'] = '/';
+    if (url === '/__nodepod_bridge__.html' || url === '/__nodepod_bridge__.js') {
+      headers['Cross-Origin-Resource-Policy'] = 'cross-origin';
+    }
     res.writeHead(200, headers);
     res.end(content);
   } catch {

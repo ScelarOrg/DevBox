@@ -1,6 +1,7 @@
 import type { VolumeSnapshot } from "../engine-types";
 import type { MemoryHandlerOptions } from "../memory-handler";
 import type { ShellOptions } from "../shell/shell-options";
+import type { PreviewOriginOption } from "../request-proxy";
 export type { ShellLimits, ShellOptions } from "../shell/shell-options";
 export type { PerformanceStats, PerformanceTiming } from "../performance-tracker";
 export type {
@@ -52,6 +53,23 @@ export interface NodepodOptions {
    * requires auth on assets, or otherwise trips the check.
    */
   skipSWPreflight?: boolean;
+  /**
+   * Hostname used for virtual server previews. The default, `"auto"`, uses
+   * `http(s)://{instanceId}-{port}.localhost:<host-port>` on local loopback
+   * pages and falls back to `/__virtual__/...` elsewhere.
+   *
+   * Production hosts can provide a template such as
+   * `https://{instanceId}-{port}.preview.example.com`. Set `false` to always
+   * use path URLs.
+   */
+  previewOrigin?: PreviewOriginOption;
+  /**
+   * Visually rewrite loopback URLs in Nodepod-owned terminals to their real
+   * preview URLs. Raw process stdout/stderr remain unchanged. Defaults to
+   * `true`.
+   */
+  rewriteTerminalUrls?: boolean;
+  /** Called after a server's reported preview URL is ready to navigate to. */
   onServerReady?: (port: number, url: string) => void;
   /** Show a small "nodepod" watermark link in preview iframes. Defaults to true. */
   watermark?: boolean;

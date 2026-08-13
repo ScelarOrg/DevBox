@@ -1,0 +1,51 @@
+name: Sponsor listing
+description: Request an optional public listing after an active GitHub sponsorship is verified.
+title: "Sponsor listing: "
+labels:
+  - sponsorship
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This public form is for active $25 Backer and $100 Company sponsor listings. Do not include private contact information. Maintainers verify active GitHub Sponsors status before adding or retaining a listing.
+  - type: dropdown
+    id: tier
+    attributes:
+      label: Active tier
+      options:
+        - $25 Backer
+        - $100 Company sponsor
+    validations:
+      required: true
+  - type: input
+    id: github
+    attributes:
+      label: Sponsoring GitHub account
+      description: The public account whose active sponsorship should be verified.
+      placeholder: R1ck404
+    validations:
+      required: true
+  - type: input
+    id: display-name
+    attributes:
+      label: Public display name
+      description: Name to show on the sponsor page.
+    validations:
+      required: true
+  - type: input
+    id: public-url
+    attributes:
+      label: Public link
+      description: Optional HTTPS URL for the listing.
+  - type: input
+    id: logo
+    attributes:
+      label: Company logo path or pull request
+      description: Company sponsors may link a repository-hosted raster logo or a pull request that adds it. Do not paste private file-sharing links.
+  - type: checkboxes
+    id: consent
+    attributes:
+      label: Public listing consent
+      options:
+        - label: I confirm these details are intended to be public and contain no private email address or other private contact information.
+          required: true

@@ -1,0 +1,110 @@
+---
+const shortcuts = ["node hello.js", "ls", "cat README.md"];
+---
+
+<section class="terminal-section ruled" id="terminal" aria-labelledby="terminal-title">
+  <div class="section-kicker">02 / Try it</div>
+  <div class="terminal-intro">
+    <div>
+      <h2 id="terminal-title">A real runtime,<br />right here.</h2>
+    </div>
+    <div class="terminal-copy">
+      <p>Start an ephemeral Node.js project in this tab. Nothing is uploaded, saved, or installed on your machine.</p>
+      <p class="terminal-limit">This Pages demo runs without a service worker or shared memory. HTTP preview and the complete hosted feature set are intentionally disabled.</p>
+    </div>
+  </div>
+
+  <div class="terminal-shell" data-terminal-demo data-state="idle">
+    <div class="terminal-bar">
+      <span class="terminal-label">/home/project</span>
+      <span class="terminal-status" data-terminal-status>not started</span>
+    </div>
+    <div class="terminal-stage">
+      <div class="terminal-placeholder" data-terminal-placeholder>
+        <p><span aria-hidden="true">›</span> Runtime code loads only when you ask for it.</p>
+        <button class="button button--coral" type="button" data-terminal-start>Start terminal</button>
+      </div>
+      <div class="terminal-mount" data-terminal-mount aria-label="Interactive Nodepod terminal"></div>
+      <div class="terminal-error" data-terminal-error hidden>
+        <p data-terminal-error-message>Nodepod could not start in this browser.</p>
+        <button class="text-button" type="button" data-terminal-retry>Try again</button>
+      </div>
+    </div>
+    <div class="terminal-controls" data-terminal-controls hidden>
+      <div class="shortcut-list" aria-label="Sample terminal commands">
+        {shortcuts.map((command) => <button type="button" class="command-chip" data-command={command}>{command}</button>)}
+      </div>
+      <button class="text-button" type="button" data-terminal-reset>Reset runtime</button>
+    </div>
+  </div>
+</section>
+
+<script>
+  const root = document.querySelector<HTMLElement>("[data-terminal-demo]");
+  if (root) {
+    const start = root.querySelector<HTMLButtonElement>("[data-terminal-start]");
+    const retry = root.querySelector<HTMLButtonElement>("[data-terminal-retry]");
+    const reset = root.querySelector<HTMLButtonElement>("[data-terminal-reset]");
+    const status = root.querySelector<HTMLElement>("[data-terminal-status]");
+    const controls = root.querySelector<HTMLElement>("[data-terminal-controls]");
+    const placeholder = root.querySelector<HTMLElement>("[data-terminal-placeholder]");
+    const error = root.querySelector<HTMLElement>("[data-terminal-error]");
+    const errorMessage = root.querySelector<HTMLElement>("[data-terminal-error-message]");
+    let session: { run(command: string): void; teardown(): void } | null = null;
+
+    const setState = (state: string, label: string) => {
+      root.dataset.state = state;
+      if (status) status.textContent = label;
+    };
+
+    const boot = async () => {
+      if (typeof Worker === "undefined" || typeof WebAssembly === "undefined") {
+        setState("unsupported", "unsupported browser");
+        placeholder?.setAttribute("hidden", "");
+        if (error) error.hidden = false;
+        if (errorMessage) errorMessage.textContent = "This demo needs a browser with Web Workers and WebAssembly support.";
+        return;
+      }
+
+      start?.setAttribute("disabled", "");
+      placeholder?.setAttribute("hidden", "");
+      if (error) error.hidden = true;
+      if (controls) controls.hidden = true;
+      setState("booting", "booting runtime…");
+
+      try {
+        const { createTerminalSession } = await import("../lib/terminal-client");
+        session = await createTerminalSession(root);
+        setState("ready", "ready");
+        if (controls) controls.hidden = false;
+      } catch (cause) {
+        console.error("Nodepod demo failed to start", cause);
+        setState("failed", "start failed");
+        if (error) error.hidden = false;
+        if (errorMessage) errorMessage.textContent = cause instanceof Error ? cause.message : "Nodepod could not start in this browser.";
+      } finally {
+        start?.removeAttribute("disabled");
+      }
+    };
+
+    const teardown = () => {
+      session?.teardown();
+      session = null;
+    };
+
+    start?.addEventListener("click", boot);
+    retry?.addEventListener("click", () => {
+      teardown();
+      void boot();
+    });
+    reset?.addEventListener("click", () => {
+      teardown();
+      void boot();
+    });
+    root.querySelectorAll<HTMLButtonElement>("[data-command]").forEach((button) => {
+      button.addEventListener("click", () => session?.run(button.dataset.command ?? ""));
+    });
+    document.addEventListener("astro:before-swap", teardown, { once: true });
+    window.addEventListener("pagehide", teardown, { once: true });
+  }
+</script>

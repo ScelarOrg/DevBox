@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Nodepod clean preview regression</title>
+  </head>
+  <body>
+    <p id="status">Booting</p>
+    <a id="open" href="#" target="_blank" rel="noreferrer">Open preview</a>
+    <iframe id="preview" title="Clean preview"></iframe>
+    <script type="module">
+      import { Nodepod } from "/dist/index.mjs";
+
+      const status = document.querySelector("#status");
+      const open = document.querySelector("#open");
+      const preview = document.querySelector("#preview");
+      const pod = await Nodepod.boot({
+        swUrl: "/__sw__.js",
+        watermark: false,
+        workdir: "/app",
+        files: {
+          "/app/server.cjs": `
+            const http = require("http");
+            http.createServer((req, res) => {
+              res.setHeader("content-type", "text/html; charset=utf-8");
+              res.end('<!doctype html><title>Clean preview ready</title>' +
+                '<h1>Clean preview ready</h1><p id="request-path">' + req.url + '</p>');
+            }).listen(3000);
+          `,
+        },
+        onServerReady(port, url) {
+          if (port !== 3000) return;
+          status.textContent = url;
+          status.dataset.ready = "true";
+          open.href = url;
+          preview.src = url;
+        },
+      });
+      window.nodepodPreviewTest = { pod };
+      await pod.spawn("node", ["server.cjs"], { cwd: "/app" });
+    </script>
+  </body>
+</html>

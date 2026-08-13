@@ -138,4 +138,47 @@ describe("node headless host", () => {
     expect(result.stdout.trim()).toBe("/workspace");
     pod.teardown();
   }, 60_000);
+
+  it("keeps active-server URLs byte-for-byte unchanged in spawn output", async () => {
+    setRuntimeHost(
+      createNodeHost({
+        workerPath,
+        httpHost: "127.0.0.1",
+        httpPort: 0,
+      }),
+    );
+
+    const stdout = "Local: http://localhost:5173/\n";
+    const stderr = "HMR: ws://localhost:5173/socket\n";
+    const pod = await Nodepod.boot({
+      packageStore: "memory",
+      enableSnapshotCache: false,
+      files: {
+        "/url-output.js": `
+          const http = require("http");
+          const server = http.createServer((_req, res) => res.end("ok"));
+          server.listen(5173, "127.0.0.1", () => {
+            setTimeout(() => {
+              process.stdout.write(${JSON.stringify(stdout)});
+              process.stderr.write(${JSON.stringify(stderr)});
+              server.close();
+            }, 20);
+          });
+        `,
+      },
+    });
+
+    const child = await pod.spawn("node", ["/url-output.js"]);
+    const stdoutChunks: string[] = [];
+    const stderrChunks: string[] = [];
+    child.on("output", (chunk) => stdoutChunks.push(chunk));
+    child.on("error", (chunk) => stderrChunks.push(chunk));
+
+    const result = await child.completion;
+    expect(result).toEqual({ stdout, stderr, exitCode: 0 });
+    expect(stdoutChunks.join("")).toBe(stdout);
+    expect(stderrChunks.join("")).toBe(stderr);
+    expect(pod.port(5173)).toBeNull();
+    pod.teardown();
+  }, 60_000);
 });

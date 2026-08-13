@@ -1,0 +1,40 @@
+@import "@fontsource-variable/instrument-sans";
+@import "@fontsource/ibm-plex-mono/400.css";
+
+:root {
+  --sl-font: "Instrument Sans Variable", system-ui, sans-serif;
+  --sl-font-mono: "IBM Plex Mono", monospace;
+  --sl-color-accent-low: #ffe0dc;
+  --sl-color-accent: #d9302b;
+  --sl-color-accent-high: #670c0a;
+  --sl-color-white: #0b0b0c;
+  --sl-color-gray-1: #1d1c1c;
+  --sl-color-gray-2: #3f3c39;
+  --sl-color-gray-3: #6c6761;
+  --sl-color-gray-4: #aaa49a;
+  --sl-color-gray-5: #d6d0c6;
+  --sl-color-gray-6: #ebe6dd;
+  --sl-color-black: #f6f2ea;
+}
+
+:root[data-theme="dark"] {
+  --sl-color-accent-low: #4b1412;
+  --sl-color-accent: #ff6257;
+  --sl-color-accent-high: #ffd7d2;
+  --sl-color-white: #f6f2ea;
+  --sl-color-gray-1: #e5dfd6;
+  --sl-color-gray-2: #b9b2a8;
+  --sl-color-gray-3: #8c867e;
+  --sl-color-gray-4: #57534f;
+  --sl-color-gray-5: #2b2928;
+  --sl-color-gray-6: #191818;
+  --sl-color-black: #0b0b0c;
+}
+
+header.header { border-bottom: 1px solid color-mix(in srgb, var(--sl-color-gray-3) 30%, transparent); }
+.site-title { letter-spacing: -.055em; font-weight: 750; }
+.content-panel + .content-panel { border-top: 1px solid color-mix(in srgb, var(--sl-color-gray-3) 30%, transparent); }
+.sl-markdown-content h1, .sl-markdown-content h2, .sl-markdown-content h3 { letter-spacing: -.035em; }
+.sl-markdown-content h1 { font-size: clamp(2.8rem, 6vw, 5rem); line-height: .95; }
+.sl-markdown-content code { border-radius: 0; }
+.sl-link-button { border-radius: 0; }

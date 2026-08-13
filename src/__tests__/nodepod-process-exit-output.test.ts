@@ -27,4 +27,19 @@ describe("NodepodProcess exit output merge", () => {
       expect(r.stdout).toBe("hello\nworld\n");
     });
   });
+
+  it("preserves URL text and streaming chunks exactly", async () => {
+    const proc = new NodepodProcess();
+    const chunks: string[] = [];
+    proc.on("output", (chunk) => chunks.push(chunk));
+
+    proc._pushStdout("Local: http://local");
+    proc._pushStdout("host:5173/\n");
+    proc._finish(0);
+
+    expect(chunks).toEqual(["Local: http://local", "host:5173/\n"]);
+    expect((await proc.completion).stdout).toBe(
+      "Local: http://localhost:5173/\n",
+    );
+  });
 });

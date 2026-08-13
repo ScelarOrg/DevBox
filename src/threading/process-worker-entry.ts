@@ -46,6 +46,10 @@ let _shellMod: typeof import("../polyfills/child_process") | null = null;
 let _syncChannelWorker: SyncChannelWorker | null = null;
 let _sabEnabled = true;
 let _ipcMessageHandler: ((data: unknown) => void) | null = null;
+// Parent IPC may arrive immediately after a worker is spawned, before the
+// shell/child_process module has finished loading and installed its receiver.
+// Node buffers this traffic; preserve it here and replay after initialization.
+let _earlyIpcMessages: unknown[] = [];
 let _cols = 80;
 let _rows = 24;
 
@@ -164,7 +168,7 @@ self.addEventListener("message", (ev: MessageEvent) => {
       handleExec(msg);
       break;
     case "stdin":
-      handleStdin(msg.data);
+      handleStdin(msg.data, msg.end);
       break;
     case "signal":
       handleSignal(msg);
@@ -471,7 +475,16 @@ function handleIPCMessage(data: unknown): void {
     _shellMod.handleIPCFromParent(data);
   } else if (_ipcMessageHandler) {
     _ipcMessageHandler(data);
+  } else {
+    _earlyIpcMessages.push(data);
   }
+}
+
+function replayEarlyIPC(): void {
+  if (_earlyIpcMessages.length === 0) return;
+  const queued = _earlyIpcMessages;
+  _earlyIpcMessages = [];
+  for (const data of queued) handleIPCMessage(data);
 }
 
 // file execution (node script.js)
@@ -499,12 +512,57 @@ async function handleFileExec(msg: MainToWorker_Exec): Promise<void> {
     if (msg.isWorkerThread) {
       const { MessagePort } = await import("../polyfills/worker_threads");
       const pp = new MessagePort();
+      const pendingParentMessages: unknown[] = [];
+      const flushParentMessages = () => {
+        if (pp.listenerCount("message") === 0) return;
+        for (const data of pendingParentMessages.splice(0)) {
+          pp.emit("message", data);
+        }
+      };
+      // Preserve eager Worker.postMessage() calls until user code attaches
+      // its listener. MessagePort itself refs the loop only while listened to,
+      // so finite workers without a parentPort listener can still exit.
+      const addListener = pp.addListener.bind(pp);
+      pp.addListener = ((name: string, handler: (...args: any[]) => void) => {
+        addListener(name, handler);
+        if (name === "message") flushParentMessages();
+        return pp;
+      }) as typeof pp.addListener;
+      pp.on = pp.addListener;
+      const once = pp.once.bind(pp);
+      pp.once = ((name: string, handler: (...args: any[]) => void) => {
+        once(name, handler);
+        if (name === "message") flushParentMessages();
+        return pp;
+      }) as typeof pp.once;
+      const prependListener = pp.prependListener.bind(pp);
+      pp.prependListener = ((
+        name: string,
+        handler: (...args: any[]) => void,
+      ) => {
+        prependListener(name, handler);
+        if (name === "message") flushParentMessages();
+        return pp;
+      }) as typeof pp.prependListener;
+      const prependOnceListener = pp.prependOnceListener.bind(pp);
+      pp.prependOnceListener = ((
+        name: string,
+        handler: (...args: any[]) => void,
+      ) => {
+        prependOnceListener(name, handler);
+        if (name === "message") flushParentMessages();
+        return pp;
+      }) as typeof pp.prependOnceListener;
       pp.postMessage = (data: unknown) => {
         post({ type: "ipc-message", data });
       };
 
       shell.setIPCReceiveHandler((data: unknown) => {
-        pp.emit("message", data);
+        if (pp.listenerCount("message") === 0) {
+          pendingParentMessages.push(data);
+        } else {
+          pp.emit("message", data);
+        }
       });
 
       workerThreadsOverride = {
@@ -514,6 +572,10 @@ async function handleFileExec(msg: MainToWorker_Exec): Promise<void> {
         threadId: msg.threadId ?? 0,
       };
     }
+
+    // Reaches child_process.handleIPCFromParent now that its own receiver (or
+    // queue) exists. This is required for eager Worker.postMessage callers.
+    replayEarlyIPC();
 
     shell.setStreamingCallbacks({
       onStdout: postStdout,
@@ -557,10 +619,11 @@ async function handleFileExec(msg: MainToWorker_Exec): Promise<void> {
   }
 }
 
-function handleStdin(data: string): void {
+function handleStdin(data: string, end = false): void {
   if (!_shellMod) return;
   try {
-    _shellMod.sendStdin(data);
+    if (end) _shellMod.endStdin();
+    else _shellMod.sendStdin(data);
   } catch {
     /* ignore */
   }
@@ -941,7 +1004,13 @@ function workerThreadFork(
     onStdout?: (data: string) => void;
     onStderr?: (data: string) => void;
   },
-): { postMessage: (data: unknown) => void; terminate: () => void; requestId: number } {
+): {
+  postMessage: (data: unknown) => void;
+  sendStdin: (data: string) => void;
+  endStdin: () => void;
+  terminate: () => void;
+  requestId: number;
+} {
   const requestId = _nextRequestId++;
 
   _ipcCallbacks.set(requestId, (data: unknown) => {
@@ -1008,8 +1077,18 @@ function workerThreadFork(
         data,
       });
     },
+    sendStdin: (data: string) => {
+      post({ type: "child-stdin", requestId, data });
+    },
+    endStdin: () => {
+      post({ type: "child-stdin", requestId, data: "", end: true });
+    },
     terminate: () => {
-      if (opts.rawWasi) post({ type: "wasiworker-terminate", requestId } as any);
+      if (opts.rawWasi) {
+        post({ type: "wasiworker-terminate", requestId } as any);
+      } else {
+        post({ type: "child-signal", requestId, signal: "SIGTERM" });
+      }
       _ipcCallbacks.delete(requestId);
       _childOutputCallbacks.delete(requestId);
       _childExitCallbacks.delete(requestId);

@@ -57,7 +57,13 @@ export type { InstallFlags, InstallOutcome, WorkspaceInstallOutcome } from "./pa
 export { discoverWorkspaces, readWorkspacePatterns } from "./packages/workspace";
 export type { WorkspaceGraph, WorkspacePackage } from "./packages/workspace";
 export { RequestProxy, getProxyInstance, resetProxy, NodepodSWSetupError } from "./request-proxy";
-export type { ProxyOptions, ServiceWorkerConfig, NodepodSWFrameworkHint } from "./request-proxy";
+export type {
+  ProxyOptions,
+  ServiceWorkerConfig,
+  NodepodSWFrameworkHint,
+  PreviewOriginContext,
+  PreviewOriginOption,
+} from "./request-proxy";
 export {
   setProxy as setCorsProxy,
   getProxy as getCorsProxy,

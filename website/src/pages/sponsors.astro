@@ -1,0 +1,43 @@
+---
+import SiteLayout from "../layouts/SiteLayout.astro";
+
+const tiers = [
+  ["$5", "Supporter", "Acknowledgement and project updates through GitHub Sponsors."],
+  ["$25", "Backer", "An optional linked name on this page while sponsorship is active."],
+  ["$100", "Company sponsor", "An optional logo and link on this page while sponsorship is active."],
+];
+---
+
+<SiteLayout title="Sponsor nodepod" description="Support the maintenance and documentation of nodepod." canonicalPath="/sponsors/">
+  <section class="page-hero">
+    <div class="section-kicker">Sponsorship</div>
+    <h1>Fund the runtime,<br />not a support queue.</h1>
+    <p>Nodepod is maintained independently. Sponsorship helps pay for sustained engineering, browser compatibility work, documentation, and infrastructure.</p>
+    <div class="notice" role="status"><strong>Pre-launch:</strong> the GitHub Sponsors profile is not active yet. No funding links will be published in npm or GitHub until it is approved.</div>
+  </section>
+
+  <section class="tier-list ruled" aria-labelledby="tiers-title">
+    <div class="section-kicker">Proposed monthly tiers</div>
+    <h2 id="tiers-title">Simple, public acknowledgement.</h2>
+    {tiers.map(([amount, name, detail]) => (
+      <article>
+        <strong>{amount}</strong>
+        <h3>{name}</h3>
+        <p>{detail}</p>
+      </article>
+    ))}
+    <p class="tier-note">GitHub’s custom one-time amount will also be available after profile approval.</p>
+  </section>
+
+  <section class="sponsor-policy ruled" aria-labelledby="policy-title">
+    <div class="section-kicker">Policy</div>
+    <div class="two-column">
+      <h2 id="policy-title">What sponsorship does and does not buy.</h2>
+      <div>
+        <p>Sponsorship does not include an SLA, priority issue handling, private support, or early access to a private repository.</p>
+        <p>Backer and company listings are optional. Once Sponsors is active, listing details will be collected through a public issue or pull request and active status will be verified before publication.</p>
+        <p>No sponsor wall appears until there is a verified active sponsor.</p>
+      </div>
+    </div>
+  </section>
+</SiteLayout>

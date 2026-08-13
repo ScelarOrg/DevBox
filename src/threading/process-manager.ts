@@ -887,10 +887,16 @@ export class ProcessManager extends EventEmitter {
           pid: childHandle.pid,
         });
 
-        // bare `node` invocations go through as direct execution
+        // A plain `node file.js` can go through direct execution. Invocations
+        // beginning with Node flags (tsx uses --require and --import) must go
+        // through the shell's node argv parser first so preload arguments are
+        // not mistaken for the entry module.
         const isNodeBin = /(?:^|\/)node$/.test(msg.command);
+        const isDirectNodeFile = isNodeBin
+          && msg.args.length > 0
+          && !msg.args[0].startsWith("-");
         const sendExec = () => {
-          if (isNodeBin && msg.args.length > 0) {
+          if (isDirectNodeFile) {
             childHandle.exec({
               type: "exec",
               filePath: msg.args[0],
@@ -1073,6 +1079,15 @@ export class ProcessManager extends EventEmitter {
         };
         handle.on("ipc-message", relayIpcToChild);
 
+        const relayStdinToChild = (
+          stdinMsg: { requestId: number; data: string; end?: boolean },
+        ) => {
+          if (stdinMsg.requestId !== msg.requestId || childHandle.state === "exited") return;
+          if (stdinMsg.end) childHandle.endStdin();
+          else childHandle.sendStdin(stdinMsg.data);
+        };
+        handle.on("child-stdin", relayStdinToChild);
+
         const relayChildSignal = (signalMsg: { requestId: number; signal: string }) => {
           if (signalMsg.requestId === msg.requestId && childHandle.state !== "exited") {
             this._killWithFallback(childHandle, signalMsg.signal);
@@ -1082,6 +1097,7 @@ export class ProcessManager extends EventEmitter {
 
         childHandle.on("exit", (exitCode: number) => {
           handle.removeListener("ipc-message", relayIpcToChild);
+          handle.removeListener("child-stdin", relayStdinToChild);
           handle.removeListener("child-signal", relayChildSignal);
           if (!handle.workerExited) {
             handle.postMessage({

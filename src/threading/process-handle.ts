@@ -118,6 +118,12 @@ export class ProcessHandle extends EventEmitter {
     }
   }
 
+  endStdin(): void {
+    if (!this.workerExited && !this.syncBlocked) {
+      this.postMessage({ type: "stdin", data: "", end: true });
+    }
+  }
+
   kill(signal: string = "SIGTERM"): void {
     this.postMessage({ type: "signal", signal });
     this.emit("signal", signal);
@@ -254,6 +260,10 @@ export class ProcessHandle extends EventEmitter {
 
         case "child-signal":
           this.emit("child-signal", msg);
+          break;
+
+        case "child-stdin":
+          this.emit("child-stdin", msg);
           break;
 
         case "fork-request":

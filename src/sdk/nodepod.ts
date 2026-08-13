@@ -57,6 +57,7 @@ import {
 } from "../performance-tracker";
 import { NodepodProfilerImpl } from "../profiling/profiler";
 import { PreviewInspector } from "./preview-inspector";
+import { TerminalServerUrlOutputStream } from "./server-url-output";
 
 let activeNodepodCount = 0;
 
@@ -133,6 +134,13 @@ export class Nodepod {
   private _instrumentationProfiler: NodepodProfilerImpl | null;
   private _httpIngress: HttpIngress | null = null;
   private _headless = false;
+  private _rewriteTerminalUrls: boolean;
+  private _terminalUrlOutputStreams = new Set<TerminalServerUrlOutputStream>();
+  private _serverReadyOutputListener: (
+    port: number,
+    url: string,
+    instanceId?: string,
+  ) => void;
 
   /* ---- Construction (use Nodepod.boot()) ---- */
 
@@ -149,6 +157,7 @@ export class Nodepod {
     performanceTracker: PerformanceTracker,
     profiler: NodepodProfilerImpl,
     shellOptions: ShellOptions | undefined,
+    rewriteTerminalUrls: boolean,
   ) {
     this._volume = volume;
     this._packages = packages;
@@ -168,6 +177,16 @@ export class Nodepod {
     this._sharedVFSBufferSize =
       sharedVFSBufferSize ?? DEFAULT_RUNTIME_SHARED_VFS_BUFFER_SIZE;
     this.instanceId = instanceId;
+    this._rewriteTerminalUrls = rewriteTerminalUrls;
+    this._serverReadyOutputListener = (_port, _url, readyInstanceId) => {
+      if (readyInstanceId !== this.instanceId) return;
+      for (const stream of this._terminalUrlOutputStreams) {
+        stream.notifyResolution();
+      }
+    };
+    if (this._rewriteTerminalUrls) {
+      this._proxy.on("server-ready", this._serverReadyOutputListener);
+    }
     this.inspect = new PreviewInspector(proxy, instanceId, () => this._assertActive());
     this._performance = performanceTracker;
     this.profiler = profiler;
@@ -344,6 +363,7 @@ export class Nodepod {
       performanceTracker,
       profiler,
       opts.shell,
+      opts.rewriteTerminalUrls !== false,
     );
     nodepod._headless = headless;
     profiler.setMemoryProvider(() => nodepod.memoryStats() as unknown as Record<string, unknown>);
@@ -390,6 +410,12 @@ export class Nodepod {
       (swDefaultOff ? opts.serviceWorker === true : opts.serviceWorker !== false) &&
       typeof navigator !== "undefined" &&
       "serviceWorker" in navigator;
+
+    proxy.configureInstance(nodepod.instanceId, {
+      previewOrigin: swEnabled ? (opts.previewOrigin ?? "auto") : false,
+      swUrl: opts.swUrl,
+      onServerReady: opts.onServerReady,
+    });
 
     if (headless && opts.watermark !== true) {
       proxy.setWatermark(false);
@@ -601,6 +627,27 @@ export class Nodepod {
     return proc;
   }
 
+  private _createTerminalUrlOutput(
+    emit: (text: string) => void,
+  ): TerminalServerUrlOutputStream {
+    const stream = new TerminalServerUrlOutputStream(
+      this._rewriteTerminalUrls
+        ? (port) => this._proxy.displayServerUrl(this.instanceId, port)
+        : () => undefined,
+      emit,
+      this._rewriteTerminalUrls,
+    );
+    if (this._rewriteTerminalUrls) {
+      this._terminalUrlOutputStreams.add(stream);
+    }
+    return stream;
+  }
+
+  private _finishTerminalUrlOutput(stream: TerminalServerUrlOutputStream): void {
+    stream.end();
+    this._terminalUrlOutputStreams.delete(stream);
+  }
+
   private _resolveCommand(cmd: string, args?: string[]): string {
     if (cmd === "node" && args?.length) {
       const filePath = args[0];
@@ -718,6 +765,12 @@ export class Nodepod {
 
         const simpleCommand = parseSimpleCommand(cmd, this._env);
         if (simpleCommand && customCommands[simpleCommand.name]) {
+          const stdoutOutput = this._createTerminalUrlOutput((data) => {
+            terminal._writeOutput(data);
+          });
+          const stderrOutput = this._createTerminalUrlOutput((data) => {
+            terminal._writeOutput(data, true);
+          });
           try {
             const output = customCommands[simpleCommand.name](
               terminal.getCwd(),
@@ -725,13 +778,15 @@ export class Nodepod {
             );
             if (output) {
               ensureNewline();
-              terminal._writeOutput(output);
+              stdoutOutput.push(output);
             }
           } catch (err) {
             ensureNewline();
             const message = err instanceof Error ? err.message : String(err);
-            terminal._writeOutput(`${simpleCommand.name}: ${message}\n`, true);
+            stderrOutput.push(`${simpleCommand.name}: ${message}\n`);
           } finally {
+            this._finishTerminalUrlOutput(stdoutOutput);
+            this._finishTerminalUrlOutput(stderrOutput);
             if (activeAbort === myAbort) activeAbort = null;
             currentSendStdin = null;
             if (!wroteNewline) terminal.write("\r\n");
@@ -747,19 +802,25 @@ export class Nodepod {
 
         // Ignore output from previous commands or before exec is sent (stale child output)
         let execSent = false;
+        const stdoutOutput = this._createTerminalUrlOutput((data) => {
+          terminal._writeOutput(data);
+        });
+        const stderrOutput = this._createTerminalUrlOutput((data) => {
+          terminal._writeOutput(data, true);
+        });
         const onStdout = (data: string) => {
           if (myCommandId !== activeCommandId) return;
           if (!execSent) return;
           streamed = true;
           ensureNewline();
-          terminal._writeOutput(data);
+          stdoutOutput.push(data);
         };
         const onStderr = (data: string) => {
           if (myCommandId !== activeCommandId) return;
           if (!execSent) return;
           streamed = true;
           ensureNewline();
-          terminal._writeOutput(data, true);
+          stderrOutput.push(data);
         };
 
         handle.on("stdout", onStdout);
@@ -808,9 +869,12 @@ export class Nodepod {
               const outStr = String(stdout ?? "");
               const errStr = String(stderr ?? "");
               if (outStr || errStr) ensureNewline();
-              if (outStr) terminal._writeOutput(outStr);
-              if (errStr) terminal._writeOutput(errStr, true);
+              if (outStr) stdoutOutput.push(outStr);
+              if (errStr) stderrOutput.push(errStr);
             }
+
+            this._finishTerminalUrlOutput(stdoutOutput);
+            this._finishTerminalUrlOutput(stderrOutput);
 
             if (activeAbort === myAbort) activeAbort = null;
 
@@ -831,9 +895,11 @@ export class Nodepod {
               const outStr = String(stdout ?? "");
               const errStr = String(stderr ?? "");
               if (outStr || errStr) ensureNewline();
-              if (outStr) terminal._writeOutput(outStr);
-              if (errStr) terminal._writeOutput(errStr, true);
+              if (outStr) stdoutOutput.push(outStr);
+              if (errStr) stderrOutput.push(errStr);
             }
+            this._finishTerminalUrlOutput(stdoutOutput);
+            this._finishTerminalUrlOutput(stderrOutput);
             if (activeAbort === myAbort) activeAbort = null;
             if (!aborted && !isStale) {
               if (!wroteNewline) terminal.write("\r\n");
@@ -885,10 +951,8 @@ export class Nodepod {
   // multiple Nodepods on one page don't collide
   port(num: number): string | null {
     this._assertActive();
-    if (this._proxy.activePorts(this.instanceId).includes(num)) {
-      return this._proxy.serverUrl(this.instanceId, num);
-    }
-    return null;
+    const readyUrl = this._proxy.displayServerUrl(this.instanceId, num);
+    return typeof readyUrl === "string" ? readyUrl : null;
   }
 
   /* ---- snapshot / restore ---- */
@@ -929,6 +993,14 @@ export class Nodepod {
   teardown(): void {
     if (this._disposed) return;
     this._disposed = true;
+    if (this._rewriteTerminalUrls) {
+      this._proxy.removeListener(
+        "server-ready",
+        this._serverReadyOutputListener,
+      );
+    }
+    for (const stream of this._terminalUrlOutputStreams) stream.end();
+    this._terminalUrlOutputStreams.clear();
     this.inspect.dispose();
     if (this._unwatchVFS) {
       this._unwatchVFS();

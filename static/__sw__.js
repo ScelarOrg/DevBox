@@ -23,14 +23,20 @@
  * tab's port and you'd get "No server on {instanceId}/{port}" 503s.
  */
 
-const SW_VERSION = 14;
+const SW_VERSION = 20;
 const DEFAULT_INSTANCE = "default";
+const INTERNAL_BRIDGE_PATHS = new Set([
+  "/__nodepod_bridge__.html",
+  "/__nodepod_bridge__.js",
+  "/__sw__.js",
+]);
 
 let nextId = 1;
 // id -> { resolve, reject, port }
 const pending = new Map();
 
-// one entry per connected tab. MessagePort -> { token, instances: Set<string> }
+// one entry per connected tab. MessagePort ->
+// { token, instances: Set<string>, relayPort?: MessagePort }
 const ports = new Map();
 
 // routing table for fetches. instanceId -> MessagePort
@@ -54,6 +60,65 @@ const instanceServers = new Map();
 // most recent pod a preview document navigated to or claimed. tie-breaker
 // when path claims from multiple servers of the same app overlap.
 let lastActivePod = null;
+
+// A hostname preview has one dedicated origin per virtual server. Its bridge
+// registers this worker with the pod identity in the script URL. Unlike a
+// mutable global, self.location survives browser-driven worker termination and
+// restart, so a directly opened top-level URL always has a routing key.
+function getRegisteredOriginPod() {
+  try {
+    const params = new URL(self.location.href).searchParams;
+    const instanceId = params.get("nodepodInstanceId");
+    const serverPort = Number(params.get("nodepodPort"));
+    if (
+      instanceId &&
+      Number.isInteger(serverPort) &&
+      serverPort > 0 &&
+      serverPort <= 65535
+    ) {
+      return { instanceId, serverPort };
+    }
+  } catch {
+    // The normal host-origin registration intentionally has no pod binding.
+  }
+  return null;
+}
+
+const registeredOriginPod = getRegisteredOriginPod();
+let originPod = registeredOriginPod;
+let registeredParentOrigin = null;
+try {
+  const rawParentOrigin = new URL(self.location.href).searchParams.get(
+    "nodepodParentOrigin",
+  );
+  if (rawParentOrigin) {
+    const parsedParentOrigin = new URL(rawParentOrigin);
+    if (
+      parsedParentOrigin.protocol === "http:" ||
+      parsedParentOrigin.protocol === "https:"
+    ) {
+      registeredParentOrigin = parsedParentOrigin.origin;
+    }
+  }
+} catch {}
+
+// Preview WebSockets use BroadcastChannel inside the preview's storage
+// partition. Keeping the relay endpoint in the worker lets a top-level bridge
+// navigate away to the real app without losing its connection to RequestProxy.
+const previewWsChannel =
+  typeof BroadcastChannel === "function"
+    ? new BroadcastChannel("nodepod-ws")
+    : null;
+if (previewWsChannel) {
+  previewWsChannel.onmessage = (event) => {
+    const data = event.data;
+    if (!data || !data.kind) return;
+    const instanceId = data.instanceId || DEFAULT_INSTANCE;
+    const mp = getPortForInstance(instanceId);
+    const relayPort = mp ? ports.get(mp)?.relayPort : null;
+    if (relayPort) relayPort.postMessage(data);
+  };
+}
 
 function adoptPreviewClient(clientId, pod) {
   if (clientId) previewClients.set(clientId, pod);
@@ -357,6 +422,13 @@ function releaseInstance(mp, instanceId) {
     previewScripts.delete(instanceId);
     previewInspectorScripts.delete(instanceId);
     wsTokens.delete(instanceId);
+    if (
+      !registeredOriginPod &&
+      originPod &&
+      originPod.instanceId === instanceId
+    ) {
+      originPod = null;
+    }
   }
   const info = ports.get(mp);
   if (info) info.instances.delete(instanceId);
@@ -372,8 +444,16 @@ function cleanupPort(mp) {
         previewScripts.delete(id);
         previewInspectorScripts.delete(id);
         wsTokens.delete(id);
+        if (
+          !registeredOriginPod &&
+          originPod &&
+          originPod.instanceId === id
+        ) {
+          originPod = null;
+        }
       }
     }
+    try { info.relayPort && info.relayPort.close(); } catch {}
   }
   ports.delete(mp);
 }
@@ -521,8 +601,25 @@ self.addEventListener("message", (event) => {
         }
       }
     }
-    ports.set(mp, { token, instances: new Set() });
+    const relayPort = data.relayPort || null;
+    ports.set(mp, {
+      token,
+      instances: new Set(),
+      relayPort,
+      clientId: event.source && event.source.id || null,
+    });
     mp.onmessage = (ev) => onPortMessage(ev, mp);
+    mp.start && mp.start();
+    mp.postMessage({
+      type: "init-ack",
+      data: { registeredOriginPod },
+    });
+    if (relayPort) {
+      relayPort.onmessage = (ev) => {
+        if (previewWsChannel) previewWsChannel.postMessage(ev.data);
+      };
+      relayPort.start && relayPort.start();
+    }
 
     // claim uncontrolled clients now. the activate event's clients.claim()
     // only covers fresh install, it does NOT cover hard refresh (Ctrl+Shift+R)
@@ -535,6 +632,95 @@ self.addEventListener("message", (event) => {
     } else {
       self.clients.claim();
     }
+    return;
+  }
+
+  // A first-party popup on the host origin can bridge a top-level preview's
+  // MessagePorts into the already-connected RequestProxy. The source URL check
+  // keeps arbitrary same-origin pages from attaching unprompted channels.
+  if (
+    data.type === "attach-preview-bridge" &&
+    data.requestPort &&
+    data.relayPort &&
+    data.statusPort &&
+    typeof data.instanceId === "string" &&
+    Number.isFinite(data.serverPort)
+  ) {
+    let sourceAllowed = false;
+    try {
+      const sourceUrl = new URL(event.source && event.source.url);
+      sourceAllowed =
+        sourceUrl.origin === self.location.origin &&
+        sourceUrl.pathname === "/__nodepod_bridge__.html" &&
+        sourceUrl.searchParams.get("mode") === "parent";
+    } catch {}
+    const source = event.source;
+    const deliver = async () => {
+      if (!sourceAllowed) {
+        throw new Error("The Nodepod connection tab is invalid");
+      }
+      let targetPort = getPortForInstance(data.instanceId);
+      let targetClientId = targetPort
+        ? ports.get(targetPort)?.clientId
+        : null;
+      if (!targetPort || !targetClientId) {
+        const clients = await self.clients.matchAll({
+          type: "window",
+          includeUncontrolled: true,
+        });
+        for (const client of clients) {
+          client.postMessage({ type: "sw-needs-init" });
+        }
+        const deadline = Date.now() + 5_000;
+        while (Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 25));
+          targetPort = getPortForInstance(data.instanceId);
+          targetClientId = targetPort
+            ? ports.get(targetPort)?.clientId
+            : null;
+          if (targetPort && targetClientId) break;
+        }
+      }
+      if (!targetPort || !targetClientId) {
+        throw new Error("The Nodepod host tab is unavailable");
+      }
+      const targetClient = await self.clients.get(targetClientId);
+      if (!targetClient) {
+        throw new Error("The Nodepod host tab is unavailable");
+      }
+      // Deliver transferred ports to the owning WindowClient. Forwarding a
+      // transferred port through another MessagePort is inconsistently
+      // implemented across Chromium versions; Client.postMessage is the
+      // service-worker-native handoff and preserves all three entanglements.
+      targetClient.postMessage(
+        {
+          type: "attach-preview-bridge",
+          instanceId: data.instanceId,
+          serverPort: data.serverPort,
+          origin: data.origin,
+          requestPort: data.requestPort,
+          relayPort: data.relayPort,
+          statusPort: data.statusPort,
+        },
+        [data.requestPort, data.relayPort, data.statusPort],
+      );
+      try {
+        source && source.postMessage({
+          type: "nodepod-parent-bridge-accepted",
+        });
+      } catch {}
+    };
+    const delivery = deliver().catch((error) => {
+      try {
+        source && source.postMessage({
+          type: "nodepod-parent-bridge-error",
+          message: error instanceof Error
+            ? error.message
+            : "The Nodepod host tab is unavailable",
+        });
+      } catch {}
+    });
+    event.waitUntil(delivery);
     return;
   }
 
@@ -650,6 +836,91 @@ function onPortMessage(event, mp) {
     return;
   }
 
+  if (msg.type === "bind-origin" && msg.data) {
+    const data = msg.data;
+    if (
+      typeof data.instanceId !== "string" ||
+      !Number.isFinite(data.port)
+    ) {
+      return;
+    }
+    // A query-bound worker belongs permanently to this dedicated origin.
+    // Ignore an accidental cross-pod bind rather than silently rerouting it.
+    if (
+      registeredOriginPod &&
+      (registeredOriginPod.instanceId !== data.instanceId ||
+        registeredOriginPod.serverPort !== data.port)
+    ) {
+      mp.postMessage({
+        type: "origin-bind-error",
+        data: {
+          registered: registeredOriginPod,
+          requested: { instanceId: data.instanceId, serverPort: data.port },
+        },
+      });
+      return;
+    }
+    claimInstance(mp, data.instanceId);
+    originPod = registeredOriginPod || {
+      instanceId: data.instanceId,
+      serverPort: data.port,
+    };
+    trackInstanceServer(data.instanceId, data.port);
+    if (data.previewScript == null) previewScripts.delete(data.instanceId);
+    else previewScripts.set(data.instanceId, data.previewScript);
+    if (data.previewInspectorScript == null) {
+      previewInspectorScripts.delete(data.instanceId);
+    } else {
+      previewInspectorScripts.set(data.instanceId, data.previewInspectorScript);
+    }
+    if (data.wsToken == null) wsTokens.delete(data.instanceId);
+    else wsTokens.set(data.instanceId, data.wsToken);
+    if (typeof data.watermarkEnabled === "boolean") {
+      watermarkEnabled = data.watermarkEnabled;
+    }
+    mp.postMessage({
+      type: "origin-bound",
+      data: { instanceId: data.instanceId, port: data.port },
+    });
+    self.clients.matchAll({ type: "window", includeUncontrolled: true })
+      .then((clients) => {
+        for (const client of clients) {
+          client.postMessage({
+            type: "nodepod-origin-bound",
+            instanceId: data.instanceId,
+            port: data.port,
+          });
+        }
+      });
+    return;
+  }
+
+  if (msg.type === "set-preview-script" && msg.data) {
+    const data = msg.data;
+    if (instancePorts.get(data.instanceId) !== mp) return;
+    if (data.script == null) previewScripts.delete(data.instanceId);
+    else previewScripts.set(data.instanceId, data.script);
+    return;
+  }
+  if (msg.type === "set-preview-inspector-script" && msg.data) {
+    const data = msg.data;
+    if (instancePorts.get(data.instanceId) !== mp) return;
+    if (data.script == null) previewInspectorScripts.delete(data.instanceId);
+    else previewInspectorScripts.set(data.instanceId, data.script);
+    return;
+  }
+  if (msg.type === "set-ws-token" && msg.data) {
+    const data = msg.data;
+    if (instancePorts.get(data.instanceId) !== mp) return;
+    if (data.wsToken == null) wsTokens.delete(data.instanceId);
+    else wsTokens.set(data.instanceId, data.wsToken);
+    return;
+  }
+  if (msg.type === "set-watermark" && msg.data) {
+    watermarkEnabled = !!msg.data.enabled;
+    return;
+  }
+
   // server-registered implicitly claims the instance so legacy callers that
   // never sent claim-instance still route correctly
   if (msg.type === "server-registered" && msg.data && msg.data.instanceId) {
@@ -689,6 +960,38 @@ self.addEventListener("fetch", (event) => {
   // resultingClientId is only valid during the synchronous handler turn.
   const resultingClientId = event.resultingClientId;
   const clientId = event.clientId;
+
+  // The bridge document and its assets must always come from the physical
+  // host. In particular, the bridge must survive SW updates so it can reconnect
+  // the parent tab to the fresh worker.
+  if (
+    url.origin === self.location.origin &&
+    INTERNAL_BRIDGE_PATHS.has(url.pathname)
+  ) {
+    return;
+  }
+
+  // Dedicated hostname preview: the origin itself is the routing key, so all
+  // same-origin app traffic can go straight to its bound virtual server.
+  if (originPod && url.origin === self.location.origin) {
+    if (request.mode === "navigate") {
+      registerPreviewNavigation(
+        resultingClientId,
+        originPod,
+        normalizeClaimPath(url.pathname),
+      );
+    }
+    event.respondWith(
+      proxyToVirtualServer(
+        request,
+        originPod.instanceId,
+        originPod.serverPort,
+        url.pathname + url.search,
+        request,
+      ),
+    );
+    return;
+  }
 
   // 1. explicit prefix
   const explicitHit =
@@ -867,9 +1170,10 @@ function getWsShimScript(instanceId, serverPort) {
     try { parsed = new URL(url, location.href); } catch(e) {
       return new NativeWS(url, protocols);
     }
-    // Only intercept localhost connections
+    // Intercept localhost connections and connections back to a dedicated
+    // hostname preview origin. External WebSockets remain native.
     var host = parsed.hostname;
-    if (host !== "localhost" && host !== "127.0.0.1" && host !== "0.0.0.0") {
+    if (host !== location.hostname && host !== "localhost" && host !== "127.0.0.1" && host !== "0.0.0.0") {
       return new NativeWS(url, protocols);
     }
     var self = this;
@@ -1124,6 +1428,29 @@ function getLocationPatchScript(instanceId, serverPort) {
 
   if (navigator.serviceWorker) {
     navigator.serviceWorker.addEventListener('controllerchange', claimPath);
+    // A dedicated preview worker can be terminated by the browser even while
+    // its tab remains open. Its MessagePorts are disposable worker-global
+    // state, so recover through the bootstrap on the next request instead of
+    // leaving the running app stuck behind repeated synthetic 503 responses.
+    var reconnecting = false;
+    navigator.serviceWorker.addEventListener('message', function(event) {
+      if (
+        !PREFIX &&
+        !reconnecting &&
+        event.data &&
+        event.data.type === 'sw-needs-init'
+      ) {
+        reconnecting = true;
+        setTimeout(function() { location.reload(); }, 0);
+      }
+    });
+  }
+
+  // A hostname preview already has a clean URL and its SW is explicitly bound
+  // to one pod. Leave native history, links, and forms completely untouched.
+  if (!PREFIX) {
+    claimPath();
+    return;
   }
 
   // swap the visible URL to the stripped form. same document, just history.
@@ -1325,9 +1652,39 @@ async function proxyToVirtualServer(request, instanceId, serverPort, path, origi
     for (const client of clients) {
       client.postMessage({ type: "sw-needs-init" });
     }
-    await new Promise((r) => setTimeout(r, 200));
-    targetPort = getPortForInstance(instanceId);
+    // The clean-origin bridge relays sw-needs-init cross-origin to its parent.
+    // Give that handshake a short bounded window instead of assuming a single
+    // 200 ms scheduling turn is always enough on a busy tab.
+    const reconnectDeadline = Date.now() + 1000;
+    while (!targetPort && Date.now() < reconnectDeadline) {
+      await new Promise((r) => setTimeout(r, 25));
+      targetPort = getPortForInstance(instanceId);
+    }
     if (!targetPort) {
+      if (
+        registeredOriginPod &&
+        registeredParentOrigin &&
+        request.mode === "navigate"
+      ) {
+        const reconnectUrl = new URL(
+          "/__nodepod_bridge__.html",
+          self.location.origin,
+        );
+        reconnectUrl.searchParams.set("mode", "top");
+        reconnectUrl.searchParams.set(
+          "instanceId",
+          registeredOriginPod.instanceId,
+        );
+        reconnectUrl.searchParams.set(
+          "port",
+          String(registeredOriginPod.serverPort),
+        );
+        reconnectUrl.searchParams.set(
+          "parentOrigin",
+          registeredParentOrigin,
+        );
+        return fetch(reconnectUrl.href, { cache: "no-store" });
+      }
       return errorPage(503, "Service Unavailable", "The Nodepod service worker is still initializing. Please refresh the page.");
     }
   }

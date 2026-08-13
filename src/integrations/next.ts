@@ -21,10 +21,22 @@
 
 import type { NextRequest, NextResponse as NextResponseType } from "next/server";
 import { readServiceWorkerSource } from "./shared/read-sw";
-import { swResponseHeaders, DEFAULT_SW_PATH } from "./shared/headers";
+import { readPreviewBridgeSource } from "./shared/read-preview-bridge";
+import {
+  swResponseHeaders,
+  previewBridgeResponseHeaders,
+  DEFAULT_SW_PATH,
+  DEFAULT_BRIDGE_HTML_PATH,
+  DEFAULT_BRIDGE_SCRIPT_PATH,
+} from "./shared/headers";
 
 /** Drop-in matcher for `export const config = { matcher: nodepodMatcher }`. */
 export const nodepodMatcher = DEFAULT_SW_PATH;
+export const nodepodMatchers = [
+  DEFAULT_SW_PATH,
+  DEFAULT_BRIDGE_HTML_PATH,
+  DEFAULT_BRIDGE_SCRIPT_PATH,
+] as const;
 
 async function buildResponse(): Promise<NextResponseType> {
   const { NextResponse } = await import("next/server");
@@ -33,6 +45,23 @@ async function buildResponse(): Promise<NextResponseType> {
     status: 200,
     headers: swResponseHeaders(),
   });
+}
+
+async function buildBridgeResponse(
+  asset: "html" | "script",
+  mode?: "top" | "parent" | null,
+): Promise<NextResponseType> {
+  const { NextResponse } = await import("next/server");
+  return new NextResponse(
+    await readPreviewBridgeSource(import.meta.url, asset),
+    {
+      status: 200,
+      headers: previewBridgeResponseHeaders(
+        asset === "html" ? "text/html" : "application/javascript",
+        mode,
+      ),
+    },
+  );
 }
 
 /**
@@ -46,6 +75,22 @@ export async function GET(): Promise<NextResponseType> {
   return buildResponse();
 }
 
+/** Route handler for `app/__nodepod_bridge__.html/route.ts`. */
+export async function GET_PREVIEW_BRIDGE(
+  req?: NextRequest,
+): Promise<NextResponseType> {
+  const mode = req?.nextUrl.searchParams?.get("mode");
+  return buildBridgeResponse(
+    "html",
+    mode === "top" || mode === "parent" ? mode : null,
+  );
+}
+
+/** Route handler for `app/__nodepod_bridge__.js/route.ts`. */
+export async function GET_PREVIEW_BRIDGE_SCRIPT(): Promise<NextResponseType> {
+  return buildBridgeResponse("script");
+}
+
 /**
  * Composable handler for Next 16's `proxy.ts` or Next <=15's `middleware.ts`.
  * Returns a response for the SW path, or `null` so the caller's own logic
@@ -56,8 +101,18 @@ export async function GET(): Promise<NextResponseType> {
 export async function nodepodProxy(
   req: NextRequest,
 ): Promise<NextResponseType | null> {
-  if (req.nextUrl.pathname !== DEFAULT_SW_PATH) return null;
-  return buildResponse();
+  if (req.nextUrl.pathname === DEFAULT_SW_PATH) return buildResponse();
+  if (req.nextUrl.pathname === DEFAULT_BRIDGE_HTML_PATH) {
+    const mode = req.nextUrl.searchParams?.get("mode");
+    return buildBridgeResponse(
+      "html",
+      mode === "top" || mode === "parent" ? mode : null,
+    );
+  }
+  if (req.nextUrl.pathname === DEFAULT_BRIDGE_SCRIPT_PATH) {
+    return buildBridgeResponse("script");
+  }
+  return null;
 }
 
 /** Alias of {@link nodepodProxy} for Next <=15 (`middleware.ts`). */

@@ -69,6 +69,7 @@ export interface MainToWorker_Exec {
 export interface MainToWorker_Stdin {
   type: "stdin";
   data: string;
+  end?: boolean;
 }
 
 export interface MainToWorker_Signal {
@@ -269,6 +270,13 @@ export interface WorkerToMain_ChildSignal {
   signal: string;
 }
 
+export interface WorkerToMain_ChildStdin {
+  type: "child-stdin";
+  requestId: number;
+  data: string;
+  end?: boolean;
+}
+
 export interface WorkerToMain_ForkRequest {
   type: "fork-request";
   requestId: number;
@@ -418,6 +426,7 @@ export type WorkerToMainMessage =
   | WorkerToMain_VFSSnapshot
   | WorkerToMain_SpawnRequest
   | WorkerToMain_ChildSignal
+  | WorkerToMain_ChildStdin
   | WorkerToMain_ForkRequest
   | WorkerToMain_WorkerThreadRequest
   | WorkerToMain_WasiWorkerRequest

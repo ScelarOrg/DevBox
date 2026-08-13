@@ -2,6 +2,8 @@
 // the generic server handler can't drift apart.
 
 export const DEFAULT_SW_PATH = "/__sw__.js";
+export const DEFAULT_BRIDGE_HTML_PATH = "/__nodepod_bridge__.html";
+export const DEFAULT_BRIDGE_SCRIPT_PATH = "/__nodepod_bridge__.js";
 
 /**
  * Headers for the nodepod service worker response.
@@ -22,4 +24,21 @@ export function swResponseHeaders(): Record<string, string> {
     "Service-Worker-Allowed": "/",
     "Cache-Control": "no-cache",
   };
+}
+
+export function previewBridgeResponseHeaders(
+  contentType: string,
+  mode?: "top" | "parent" | null,
+): Record<string, string> {
+  const headers: Record<string, string> = {
+    "Content-Type": `${contentType}; charset=utf-8`,
+    "Cross-Origin-Resource-Policy": "cross-origin",
+    "Cache-Control": "no-store",
+  };
+  if (mode === "top") {
+    headers["Cross-Origin-Opener-Policy"] = "same-origin-allow-popups";
+  } else if (mode === "parent") {
+    headers["Cross-Origin-Opener-Policy"] = "unsafe-none";
+  }
+  return headers;
 }

@@ -207,6 +207,15 @@ export default defineConfig({
         try { window.parent.postMessage({ source: 'hmr-probe', kind, detail }, '*'); }
         catch (e) { /* ignore */ }
       }
+      var originalConsoleError = console.error;
+      console.error = function () {
+        var args = Array.prototype.map.call(arguments, function (value) {
+          if (value && value.stack) return String(value.stack);
+          try { return String(value); } catch (_) { return '<unprintable>'; }
+        });
+        send('console:error', { args: args });
+        return originalConsoleError.apply(console, arguments);
+      };
       send('probe-installed', {
         href: location.href,
         hasShim: !!window.__nodepodWsShim,
@@ -456,6 +465,8 @@ export default App;
           log(`[ws] ERROR (${d.detail.url})`, 'fail');
         } else if (d.kind === 'ws:message') {
           log(`[ws] msg: ${d.detail.summary}`, 'dim');
+        } else if (d.kind === 'console:error') {
+          log(`[iframe error] ${d.detail.args.join(' | ')}`, 'fail');
         }
         return;
       }
@@ -512,12 +523,18 @@ export default App;
 
         let resolveServerReady;
         const serverReadyPromise = new Promise((r) => { resolveServerReady = r; });
+        // Test-only switch used to exercise the cross-origin bridge against a
+        // second local examples server (`PORT=3334 node examples/serve.js`).
+        const previewOrigin = new URLSearchParams(location.search).get('alternateOrigin') === '1'
+          ? `${location.protocol}//localhost:3334`
+          : null;
 
         log('booting nodepod (workdir=/app) ...', 'info');
         pod = await Nodepod.boot({
           watermark: false,
           workdir: '/app',
           allowedFetchDomains: null,
+          ...(previewOrigin ? { previewOrigin } : {}),
           onServerReady: (port, url) => {
             log(`[onServerReady] port=${port} url=${url}`, 'info');
             resolveServerReady(url);
@@ -575,15 +592,17 @@ export default App;
         log(`\nonServerReady -> ${url}. probing index ...`, 'info');
         setStatus('probing ...', 'warn');
 
-        // sanity probe before pointing the iframe at it. if this fails its
-        // a different bug than hmr (probably regression on the tailwind v4 fix)
+        // Sanity probe the virtual server directly. A hostname preview is a
+        // different origin, so parent-page fetch() correctly follows CORS;
+        // pod.request() tests reachability without changing the guest app's
+        // response headers.
         let ok = false;
         const probeStart = performance.now();
         while (performance.now() - probeStart < 30000) {
           try {
-            const res = await fetch(url, { cache: 'no-store' });
-            if (res.ok) { ok = true; break; }
-            log(`  -> ${res.status} ${res.statusText}`, res.status >= 500 ? 'fail' : 'warn');
+            const res = await pod.request(5173, { path: '/' });
+            if (res.statusCode >= 200 && res.statusCode < 400) { ok = true; break; }
+            log(`  -> ${res.statusCode} ${res.statusMessage || ''}`, res.statusCode >= 500 ? 'fail' : 'warn');
           } catch (e) {
             log(`  -> fetch threw: ${e.message}`, 'fail');
           }

@@ -35,6 +35,13 @@ export { discoverWorkspaces, readWorkspacePatterns } from "./packages/workspace"
 export type { WorkspaceGraph, WorkspacePackage } from "./packages/workspace";
 export { RequestProxy, getProxyInstance, resetProxy, NodepodSWSetupError } from "./request-proxy";
 export type {
+  ProxyOptions,
+  ServiceWorkerConfig,
+  NodepodSWFrameworkHint,
+  PreviewOriginContext,
+  PreviewOriginOption,
+} from "./request-proxy";
+export type {
   NodepodOptions,
   NodepodRequestOptions,
   Snapshot,

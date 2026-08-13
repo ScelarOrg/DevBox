@@ -324,6 +324,10 @@ export function sendStdin(text: string): void {
   stdin.emit("data", text);
 }
 
+export function endStdin(): void {
+  getLiveStdin()?.emit("end");
+}
+
 export function initShellExec(volume: MemoryVolume, opts?: { cwd?: string; env?: Record<string, string>; shell?: ShellOptions }): void {
   _vol = volume;
 

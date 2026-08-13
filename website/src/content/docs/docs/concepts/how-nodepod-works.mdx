@@ -1,0 +1,133 @@
+---
+title: How Nodepod works
+description: A tour of Nodepod's runtime architecture, execution model, filesystem, packages, workers, and preview bridge.
+sidebar:
+  order: 1
+---
+
+Nodepod recreates useful Node.js development primitives with browser-native building blocks. It is not a port of the Node.js executable and it does not boot a virtual machine. The runtime coordinates JavaScript execution, a virtual filesystem, package transforms, worker-backed processes, and virtual networking inside the host environment.
+
+## Start at the SDK
+
+The browser entry exports `Nodepod` from [`src/index.ts`](https://github.com/R1ck404/Nodepod/blob/main/src/index.ts). A host application creates an instance and owns its lifecycle:
+
+```ts
+import { Nodepod } from '@scelar/nodepod';
+
+const pod = await Nodepod.boot({
+  files: {
+    '/home/project/index.js': 'console.log("hello")',
+  },
+  workdir: '/home/project',
+});
+
+const process = await pod.spawn('node', ['index.js']);
+await process.completion;
+
+pod.teardown();
+```
+
+[`src/sdk/nodepod.ts`](https://github.com/R1ck404/Nodepod/blob/main/src/sdk/nodepod.ts) is the coordinator. It initializes the engine and host adapters, exposes public subsystems, tracks workers and virtual servers, and releases them during teardown. [`src/sdk/nodepod-fs.ts`](https://github.com/R1ck404/Nodepod/blob/main/src/sdk/nodepod-fs.ts), [`src/sdk/nodepod-process.ts`](https://github.com/R1ck404/Nodepod/blob/main/src/sdk/nodepod-process.ts), and [`src/sdk/nodepod-terminal.ts`](https://github.com/R1ck404/Nodepod/blob/main/src/sdk/nodepod-terminal.ts) provide the focused filesystem, process, and terminal surfaces.
+
+## Runtime map
+
+```text
+Host application
+      |
+      v
+Nodepod SDK and lifecycle
+      |
+      +----------+-----------+------------+
+      |          |           |            |
+      v          v           v            v
+Virtual FS   Packages    Processes    Virtual HTTP
+      |          |           |            |
+      +----------+----- worker/host -------+
+                         adapters
+```
+
+The boundaries are deliberate:
+
+- The **SDK** owns public lifecycle and orchestration.
+- The **host layer** adapts browser workers, Node.js worker threads, storage, and HTTP ingress.
+- The **engine** evaluates modules against Node-compatible globals and polyfills.
+- The **virtual filesystem** stores project state and synchronizes the data processes need.
+- The **package system** resolves registries, extracts archives, and transforms modules.
+- The **request proxy** connects virtual listening ports to programmatic requests and browser previews.
+
+## Virtual filesystem
+
+[`src/memory-volume.ts`](https://github.com/R1ck404/Nodepod/blob/main/src/memory-volume.ts) implements the in-memory POSIX-style tree used by the SDK and polyfills. Files and directories carry metadata, and mutation events support watchers and worker synchronization.
+
+The `fs` polyfill in [`src/polyfills/fs.ts`](https://github.com/R1ck404/Nodepod/blob/main/src/polyfills/fs.ts) adapts that volume to common Node.js call shapes. SDK calls such as `pod.fs.writeFile()` use the same underlying project state that code inside a spawned process sees.
+
+Snapshots serialize this filesystem boundary. A shallow snapshot can omit reinstallable package data, while a full snapshot carries more of the current tree. Snapshots are application data, not a security boundary.
+
+## Module execution and Node compatibility
+
+[`src/script-engine.ts`](https://github.com/R1ck404/Nodepod/blob/main/src/script-engine.ts) resolves and executes modules. It provides CommonJS wrapping, module caching, package export resolution, JSON and Wasm handling, and Node-shaped globals such as `process`, `Buffer`, and timers.
+
+Modern packages frequently ship ESM syntax even when a consumer needs CommonJS-like execution. [`src/syntax-transforms.ts`](https://github.com/R1ck404/Nodepod/blob/main/src/syntax-transforms.ts) and [`src/module-transformer.ts`](https://github.com/R1ck404/Nodepod/blob/main/src/module-transformer.ts) handle syntax conversion and package-level transforms. Nodepod can initialize esbuild-wasm only when a workflow needs it or preload it during boot.
+
+Polyfills under [`src/polyfills/`](https://github.com/R1ck404/Nodepod/tree/main/src/polyfills) implement compatible portions of Node's built-in modules. Compatibility is practical rather than absolute: a package can still depend on native add-ons, kernel behaviour, binaries, or unimplemented edges that a browser cannot provide.
+
+## Packages
+
+The package pipeline lives under [`src/packages/`](https://github.com/R1ck404/Nodepod/tree/main/src/packages). It resolves versions and exports, downloads package archives, extracts them into the virtual filesystem, and coordinates transformations.
+
+Package content may be cached in browser storage across boots. Runtime project state still belongs to the Nodepod instance, and package fetches remain subject to CORS and the configured domain policy. Setting `allowedFetchDomains: null` broadens the network trust boundary and should be intentional.
+
+## Processes, workers, and shared state
+
+The process system under [`src/threading/`](https://github.com/R1ck404/Nodepod/tree/main/src/threading) maps spawned commands to Web Workers in the browser. [`src/threading/process-manager.ts`](https://github.com/R1ck404/Nodepod/blob/main/src/threading/process-manager.ts) coordinates process creation, output, input, signals, resize events, virtual server messages, and completion. [`src/threading/process-handle.ts`](https://github.com/R1ck404/Nodepod/blob/main/src/threading/process-handle.ts) exposes that lifecycle to the SDK.
+
+Workers begin with a filesystem snapshot and receive changes through the VFS bridge. When cross-origin isolation makes `SharedArrayBuffer` available, Nodepod can use shared filesystem data and atomics for synchronous cross-worker operations. Without it, the runtime uses asynchronous message passing and full snapshots where possible. APIs that fundamentally require synchronous cross-worker behaviour throw rather than pretending to be reliable.
+
+The same process protocol can run through Node.js worker threads. The host abstraction in [`src/host/`](https://github.com/R1ck404/Nodepod/tree/main/src/host) selects browser or Node implementations without requiring the public SDK to fork into unrelated designs.
+
+## Shell and terminal
+
+[`src/shell/`](https://github.com/R1ck404/Nodepod/tree/main/src/shell) parses shell input and implements built-ins against the virtual filesystem and process manager. A Nodepod terminal is a UI adapter around that shell; xterm.js is passed in by the host application and is not embedded into the runtime package.
+
+`createTerminal()` maintains a persistent shell worker so commands share the current directory, environment, and filesystem state. Raw `spawn()` output stays unchanged. Terminal-owned output can visually rewrite loopback server URLs to the actual preview URL through `rewriteTerminalUrls`.
+
+## Virtual HTTP and previews
+
+Node-compatible servers register listening ports in the runtime. Application code can call a server directly with `pod.request()` or `pod.proxy.handleRequest()` without any service worker. This is the portable path for headless tests and reduced static-host deployments.
+
+Navigable previews add two browser layers:
+
+1. [`src/request-proxy.ts`](https://github.com/R1ck404/Nodepod/blob/main/src/request-proxy.ts) routes browser requests and server events.
+2. The service worker and preview bridge connect a browser navigation to the correct Nodepod instance and virtual port.
+
+On local loopback hosts, `previewOrigin: 'auto'` can use isolated localhost subdomains. In production, a wildcard-domain template such as `https://{instanceId}-{port}.preview.example.com` gives each preview a dedicated origin. The preview hostname must route to the same deployment so it can load the bootstrap bridge before control transfers to the virtual server.
+
+Setting `previewOrigin: false` retains path-based URLs. Setting `serviceWorker: false` disables navigable previews entirely but leaves programmatic requests available.
+
+## Headless execution
+
+Headless mode is the same core runtime with UI-oriented defaults turned off:
+
+```ts
+// Browser: Web Workers, service worker off by default.
+import { Nodepod } from '@scelar/nodepod';
+const browserPod = await Nodepod.boot({ headless: true });
+
+// Node.js or Bun: worker threads and loopback HTTP ingress.
+import { Nodepod as HeadlessNodepod } from '@scelar/nodepod/headless';
+const hostPod = await HeadlessNodepod.boot();
+```
+
+[`src/headless.ts`](https://github.com/R1ck404/Nodepod/blob/main/src/headless.ts) selects headless defaults and host adapters. In Node.js or Bun, `pod.port()` can return a loopback ingress URL. In the browser, `pod.request()` is the direct way to reach a virtual server when no preview service worker exists.
+
+## Profiling and inspection
+
+Profiling code under [`src/profiling/`](https://github.com/R1ck404/Nodepod/tree/main/src/profiling) can collect runtime spans, counters, timings, memory samples, long-task samples, and trace exports. It is disabled by default to avoid paying diagnostic overhead in every session.
+
+Preview inspection in [`src/sdk/preview-inspector.ts`](https://github.com/R1ck404/Nodepod/blob/main/src/sdk/preview-inspector.ts) uses the preview bridge to query an attached document, console output, errors, navigation, accessibility summaries, interactions, and best-effort screenshots. It follows the browser messaging and origin model; it is not a mechanism for inspecting arbitrary pages.
+
+## Security boundary
+
+Workers, preview origins, and browser storage are useful isolation mechanisms, but Nodepod is not a hardened sandbox. A product embedding adversarial code must enforce its own limits and should use a purpose-built server-side isolation system when its threat model requires stronger guarantees.
+
+Continue with [Security model](/Nodepod/docs/concepts/security/) and [Compatibility and browser requirements](/Nodepod/docs/concepts/compatibility/) before deploying user-controlled runtimes.

@@ -4,6 +4,9 @@ node_modules/
 
 # Build output (included in npm via "files" field, but not tracked in git)
 dist/
+website/dist/
+website/.astro/
+website/src/content/docs/docs/reference/api/
 
 # Environment variables
 .env
@@ -40,3 +43,6 @@ coverage/
 memory/
 test-results/
 playwright-report/
+website/playwright-report/
+website/test-results/
+website/review/
