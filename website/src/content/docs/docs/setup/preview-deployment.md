@@ -131,10 +131,20 @@ app.get('/__sw__.js', async (_req, res) => {
   res.status(200).send(body);
 });
 
-// Mount these the same way at /__nodepod_bridge__.html and
-// /__nodepod_bridge__.js, passing "html" or "script" respectively:
-await servePreviewBridgeNode('html');
-await servePreviewBridgeNode('script');
+app.get('/__nodepod_bridge__.html', async (req, res) => {
+  const mode = req.query.mode === 'top' || req.query.mode === 'parent'
+    ? req.query.mode
+    : null;
+  const { body, headers } = await servePreviewBridgeNode('html', mode);
+  for (const [k, v] of Object.entries(headers)) res.setHeader(k, v);
+  res.status(200).send(body);
+});
+
+app.get('/__nodepod_bridge__.js', async (_req, res) => {
+  const { body, headers } = await servePreviewBridgeNode('script');
+  for (const [k, v] of Object.entries(headers)) res.setHeader(k, v);
+  res.status(200).send(body);
+});
 ```
 
 ### Static host (copy once)
@@ -187,8 +197,8 @@ await Nodepod.boot({
 ```
 
 With `serviceWorker: false` you keep the rest of Nodepod (filesystem,
-spawn, packages) but preview iframes and `nodepod.request()` to virtual
-ports won't work.
+spawn, packages, and programmatic `nodepod.request()` calls). Only navigable
+preview iframes and preview URLs are unavailable.
 
 ## Customising the URL
 
@@ -281,6 +291,6 @@ network behavior remain unchanged. Pass `rewriteTerminalUrls: false` to
 | `NodepodSWSetupError: HTTP 404` | No handler mounted | Add the plugin / route for your framework above |
 | `NodepodSWSetupError: wrong Content-Type (text/html)` | SPA fallback catching `/__sw__.js` | Ensure your router serves the SW *before* the fallback |
 | `NodepodSWSetupError: could not be reached` | CORS, network error, or timeout | Check devtools → Network; make sure the URL is same-origin |
-| SW registers but preview iframes are blank | Nodepod's `Cross-Origin-*` headers missing | Set `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: credentialless` on HTML responses |
+| SW registers but preview iframes are blank | Nodepod's `Cross-Origin-*` headers missing | Set `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: credentialless` (or the stricter `require-corp`) on HTML responses |
 | Hostname preview falls back and says the bridge document did not load | Bridge assets are missing, stale, or lack required headers on the preview hostname | Serve all three Nodepod assets on every preview hostname and restart stale dev servers after adding the routes |
 | A clean URL opened in a new tab shows the host site's root | The preview-host root is not routed to Nodepod's top-level bootstrap | Use the Vite integration or route preview-host `/` to `servePreviewBootstrap()`; keep the Nodepod host tab open and allow the one-time connection popup |

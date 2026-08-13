@@ -6,12 +6,15 @@ sidebar:
 ---
 
 ```ts
-const snapshot = await nodepod.snapshot();
+const snapshot = nodepod.snapshot();
 
 // Store the serializable snapshot in application-controlled storage.
 
 await nodepod.restore(snapshot);
 ```
+
+`snapshot()` is synchronous. `restore()` is asynchronous because it can
+reinstall dependencies from `package.json`.
 
 Snapshots capture project filesystem state. Shallow snapshots exclude reinstallable package data by default to reduce size. Restoring can reinstall dependencies from `package.json` when that option is enabled.
 

@@ -98,8 +98,9 @@ their own trust boundary, resource limits, network policy, and cleanup strategy.
 - [Troubleshooting](https://r1ck404.github.io/Nodepod/docs/troubleshooting/)
 
 The documentation website is maintained in the private `website/` workspace in
-this repository. Its GitHub Pages deployment remains manual until the rendered
-site has been reviewed and explicitly approved.
+this repository. It is live at [r1ck404.github.io/Nodepod](https://r1ck404.github.io/Nodepod/).
+GitHub Pages deployment is currently manual, so updates are published after
+review.
 
 ## Development
 

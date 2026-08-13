@@ -38,6 +38,9 @@ app.get('/__sw__.js', async (_request, response) => {
 });
 ```
 
-Route the HTML and script bridge paths in the same way with `servePreviewBridgeNode('html')` and `servePreviewBridgeNode('script')`.
+The bridge helpers return the response body and headers, so mount both paths
+using the same response-writing pattern. For the HTML bridge, forward a
+`mode=top` or `mode=parent` query when your preview host uses the top-level
+bootstrap handoff. The complete Express example is in [Preview deployment](/Nodepod/docs/setup/preview-deployment/).
 
 Only route the documented Nodepod paths to these handlers. Your application remains responsible for authentication, caching policy outside those paths, and wildcard preview-host routing.

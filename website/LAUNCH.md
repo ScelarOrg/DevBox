@@ -1,15 +1,15 @@
 # Documentation launch checklist
 
-The website is intentionally private until the owner reviews the local production build and explicitly approves publication.
+The Nodepod documentation site is live at
+`https://r1ck404.github.io/Nodepod/`. The repository uses GitHub Pages with a
+manual `workflow_dispatch` deployment while website changes remain under
+review.
 
-Do not enable GitHub Pages or run `.github/workflows/docs-pages.yml` before that approval.
+## Current state
 
-## Before approval
-
-- Run `pnpm run docs:check` under Node.js 22.12 or newer.
-- Run `pnpm run docs:test` and review the Playwright report and production screenshots.
-- Confirm the landing page, documentation search, generated API source links, reduced terminal demo, mobile layout, light/dark modes, and reduced motion.
-- Confirm the current runtime and preview-origin changes have been committed so generated source links target the intended revision.
+- Landing page, Starlight docs, generated API reference, and reduced terminal demo are public.
+- Generated API source links are recreated during every docs build and pinned to the build revision.
+- The Sponsors profile is still pending GitHub approval. Do not publish funding metadata until it is active.
 
 ## Sponsors launch gate
 
@@ -20,12 +20,11 @@ Do not enable GitHub Pages or run `.github/workflows/docs-pages.yml` before that
 - Only then add `.github/FUNDING.yml` and the root package `funding` field.
 - Do not add an empty sponsor logo wall.
 
-## After explicit approval
+## Release checklist
 
-1. Update the root package `homepage` to `https://r1ck404.github.io/Nodepod/`.
-2. Add the verified GitHub Sponsors funding metadata.
-3. Enable GitHub Pages with GitHub Actions as its source.
-4. Manually run the Documentation Pages workflow.
-5. Verify the canonical site, docs search, API pages, terminal demo, metadata, and sponsor links.
-6. Update GitHub About to the canonical URL and describe Nodepod as source-available under MIT + Commons Clause.
-7. Follow up with an automatic deployment trigger limited to website, docs, API source, and dependency changes on `main`.
+1. Run `pnpm run docs:check` under Node.js 22.12 or newer.
+2. Run `pnpm run docs:test` and review the Playwright report and screenshots.
+3. Review the landing page, docs search, API source links, terminal demo, mobile layout, light/dark modes, and reduced motion.
+4. Manually run `.github/workflows/docs-pages.yml` from `main`.
+5. Verify the canonical site, docs search, API pages, terminal demo, metadata, and sponsor status.
+6. Enable an automatic deployment trigger only after the manual workflow is stable and the desired change paths are agreed.

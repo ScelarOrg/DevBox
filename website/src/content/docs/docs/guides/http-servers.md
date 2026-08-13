@@ -6,6 +6,13 @@ sidebar:
 ---
 
 ```ts
+import { Nodepod } from '@scelar/nodepod';
+
+let markServerReady: (() => void) | undefined;
+const serverReady = new Promise<void>((resolve) => {
+  markServerReady = resolve;
+});
+
 const nodepod = await Nodepod.boot({
   files: {
     '/server.js': `
@@ -15,10 +22,18 @@ const nodepod = await Nodepod.boot({
       }).listen(3000);
     `,
   },
+  onServerReady: (port) => {
+    if (port === 3000) markServerReady?.();
+  },
 });
 
 await nodepod.spawn('node', ['server.js']);
+await serverReady;
 ```
+
+`spawn()` waits for the process worker to be ready, not for an HTTP server
+inside that process to finish listening. Use `onServerReady` (as above) before
+calling `request()` or `port()`.
 
 Call the server without a service worker:
 

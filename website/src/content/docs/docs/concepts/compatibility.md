@@ -11,12 +11,15 @@ Nodepod targets current evergreen browsers with WebAssembly, Web Workers, module
 
 ## Shared memory
 
-Cross-origin isolation enables `SharedArrayBuffer`, synchronous child-process APIs, lean worker filesystem snapshots, and threaded WASI modules. Configure these response headers on the host page:
+Cross-origin isolation enables `SharedArrayBuffer`, synchronous child-process APIs, lean worker filesystem snapshots, and threaded WASI modules. Configure these response headers on the host page. `require-corp` is stricter; `credentialless` is often easier when third-party assets do not send CORP headers. Nodepod's preview responses use `credentialless`.
 
 ```http
 Cross-Origin-Opener-Policy: same-origin
 Cross-Origin-Embedder-Policy: require-corp
 ```
+
+You can use `Cross-Origin-Embedder-Policy: credentialless` instead when that
+better fits the host's third-party assets.
 
 Without isolation, set `enableSharedArrayBuffer: false` or let feature detection choose the reduced path. `execSync()` and `spawnSync()` throw, lean worker snapshots fall back to full snapshots, and threaded packages such as native-style bundler toolchains may refuse to load.
 
