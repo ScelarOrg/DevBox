@@ -13,7 +13,8 @@ Nodepod's browser entry requires Node 20 or newer in your build tooling.
 npm install @scelar/nodepod
 ```
 
-For pnpm or Yarn, use the equivalent add command. Nodepod is an ESM package.
+For pnpm or Yarn, use the equivalent add command. Nodepod publishes both ESM
+and CommonJS builds; the examples here use ESM syntax.
 
 ## Boot and run
 

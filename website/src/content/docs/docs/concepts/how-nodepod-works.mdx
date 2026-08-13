@@ -75,7 +75,7 @@ Polyfills under [`src/polyfills/`](https://github.com/R1ck404/Nodepod/tree/main/
 
 The package pipeline lives under [`src/packages/`](https://github.com/R1ck404/Nodepod/tree/main/src/packages). It resolves versions and exports, downloads package archives, extracts them into the virtual filesystem, and coordinates transformations.
 
-Package content may be cached in browser storage across boots. Runtime project state still belongs to the Nodepod instance, and package fetches remain subject to CORS and the configured domain policy. Setting `allowedFetchDomains: null` broadens the network trust boundary and should be intentional.
+Package content may be cached in browser storage across boots. Runtime project state still belongs to the Nodepod instance, and package fetches remain subject to browser CORS. When you configure Nodepod's optional CORS proxy, `allowedFetchDomains` controls its destination allowlist; setting it to `null` disables that check and should be intentional.
 
 ## Processes, workers, and shared state
 
