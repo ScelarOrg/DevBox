@@ -9,11 +9,11 @@
   },
   "scripts": {
     "api": "node scripts/generate-api.mjs",
-    "dev": "corepack pnpm run api && astro dev",
+    "dev": "pnpm run api && astro dev",
     "build:site": "astro build",
     "links": "node scripts/check-links.mjs",
-    "build": "corepack pnpm run api && corepack pnpm run build:site && corepack pnpm run links",
-    "check": "corepack pnpm run api && astro check && corepack pnpm run build:site && corepack pnpm run links && node scripts/check-api-sources.mjs",
+    "build": "pnpm run api && pnpm run build:site && pnpm run links",
+    "check": "pnpm run api && astro check && pnpm run build:site && pnpm run links && node scripts/check-api-sources.mjs",
     "preview": "astro preview",
     "preview:test": "astro preview --host 127.0.0.1 --port 4321",
     "test": "playwright test"
