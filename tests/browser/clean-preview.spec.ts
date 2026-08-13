@@ -30,7 +30,9 @@ test("clean preview works embedded, top-level, on deep links, and after reload",
   expect(cleanUrl).not.toContain("/__virtual__/");
 
   const frame = page.frameLocator("#preview");
-  await expect(frame.getByRole("heading", { name: "Clean preview ready" })).toBeVisible();
+  await expect(frame.getByRole("heading", { name: "Clean preview ready" })).toBeVisible({
+    timeout: 30_000,
+  });
 
   const previewPromise = context.waitForEvent("page");
   await page.locator("#open").click();

@@ -814,7 +814,11 @@ export class RequestProxy extends EventEmitter {
           if (!settled) {
             settled = true;
             if (timeout !== null) clearTimeout(timeout);
-            resolveReady();
+            // Let the worker finish publishing the origin binding before the
+            // host exposes the URL to the app. Without this scheduling gap,
+            // the first iframe navigation can race the SW's fetch routing
+            // table and remain pending indefinitely in Chromium.
+            setTimeout(resolveReady, 250);
           }
           return;
         }
