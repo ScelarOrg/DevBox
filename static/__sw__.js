@@ -944,7 +944,6 @@ function onPortMessage(event, mp) {
   if (msg.type === "keepalive") return;
 }
 
-// ── Fetch interception ──
 // Worker globals are lost when the browser suspends this service worker.
 // Ask the requesting preview for its baked-in identity instead of guessing
 // from a stripped path shared by several frames or falling through to the host.
@@ -985,6 +984,8 @@ function recoverPreviewClient(client) {
     }
   });
 }
+
+// ── Fetch interception ──
 //
 // only proxy when we can positively attribute a request to a pod:
 //   1. explicit /__virtual__/ or /__preview__/ prefix
