@@ -944,6 +944,63 @@ function onPortMessage(event, mp) {
   if (msg.type === "keepalive") return;
 }
 
+// Worker globals are lost when the browser suspends this service worker.
+// Ask the requesting preview for its baked-in identity instead of guessing
+// from a stripped path shared by several frames or falling through to the host.
+function hasPreviewClientBeenIdentified(client) {
+  if (!client || client.frameType !== "nested") return false;
+  if (client.id && previewClients.has(client.id)) return true;
+  if (!client.url) return false;
+  try {
+    const parsed = new URL(client.url);
+    const explicitPreview =
+      matchPreviewOrVirtualPath(parsed.pathname, "preview") ||
+      matchPreviewOrVirtualPath(parsed.pathname, "virtual");
+    if (explicitPreview) return true;
+    const strippedPath = stripPreviewPrefix(parsed.pathname);
+    if (lookupPodForClaimedPath(strippedPath)) return true;
+  } catch {}
+  return false;
+}
+
+function recoverPreviewClient(client) {
+  if (!client || client.frameType !== "nested") return Promise.resolve(null);
+  return new Promise((resolve) => {
+    const channel = new MessageChannel();
+    let finished = false;
+    const finish = (pod) => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      channel.port1.close();
+      channel.port2.close();
+      resolve(pod);
+    };
+    const timer = setTimeout(() => finish(null), 1000);
+    channel.port1.onmessage = (event) => {
+      const pod = event.data;
+      if (
+        !pod ||
+        typeof pod.instanceId !== "string" ||
+        !pod.instanceId ||
+        !Number.isInteger(pod.serverPort) ||
+        pod.serverPort < 1 ||
+        pod.serverPort > 65535
+      ) {
+        finish(null);
+        return;
+      }
+      adoptPreviewClient(client.id, pod);
+      finish(pod);
+    };
+    try {
+      client.postMessage({ type: "nodepod-recover-preview" }, [channel.port2]);
+    } catch {
+      finish(null);
+    }
+  });
+}
+
 // ── Fetch interception ──
 //
 // only proxy when we can positively attribute a request to a pod:
@@ -1076,7 +1133,7 @@ self.addEventListener("fetch", (event) => {
   if (!isNavigation) {
     const refererPod = refUrl ? lookupPodForClaimedPath(refUrl.pathname) : null;
     const mayResolveViaClient = !refUrl && clientId && pathClaims.size > 0;
-    if (refererPod || mayResolveViaClient) {
+    if (refererPod || mayResolveViaClient || clientId) {
       event.respondWith(
         (async () => {
           let pod = refererPod;
@@ -1091,6 +1148,13 @@ self.addEventListener("fetch", (event) => {
           if (client && client.frameType === "top-level") {
             return fetch(request);
           }
+          if (client && !hasPreviewClientBeenIdentified(client)) {
+            return fetch(request);
+          }
+          // A live iframe remains the authority even if another preview has
+          // since claimed the same stripped route.
+          const recovered = await recoverPreviewClient(client);
+          if (recovered) pod = recovered;
           if (!pod && client && client.url) {
             try {
               const clientPath = stripPreviewPrefix(new URL(client.url).pathname);
@@ -1428,6 +1492,14 @@ function getLocationPatchScript(instanceId, serverPort) {
 
   if (navigator.serviceWorker) {
     navigator.serviceWorker.addEventListener('controllerchange', claimPath);
+    navigator.serviceWorker.addEventListener('message', function(event) {
+      if (event.source !== navigator.serviceWorker.controller ||
+          !event.data || event.data.type !== 'nodepod-recover-preview' ||
+          !event.ports || !event.ports[0]) return;
+      event.ports[0].postMessage(POD);
+      event.ports[0].close();
+      claimPath();
+    });
     // A dedicated preview worker can be terminated by the browser even while
     // its tab remains open. Its MessagePorts are disposable worker-global
     // state, so recover through the bootstrap on the next request instead of

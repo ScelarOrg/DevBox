@@ -16,6 +16,15 @@ async function waitForGuest(page: Page): Promise<void> {
   await heading.waitFor({ state: "visible", timeout: 20_000 });
 }
 
+async function restartServiceWorker(page: Page): Promise<void> {
+  await page.evaluate(async () => {
+    const registrations = await navigator.serviceWorker.getRegistrations();
+    await Promise.all(registrations.map((registration) => registration.unregister()));
+    await navigator.serviceWorker.register("/__sw__.js", { scope: "/" });
+    await navigator.serviceWorker.ready;
+  });
+}
+
 test("clean preview works embedded, top-level, on deep links, and after reload", async ({
   page,
   context,
@@ -50,5 +59,33 @@ test("clean preview works embedded, top-level, on deep links, and after reload",
   await waitForGuest(preview);
   await expect(preview.locator("#request-path")).toHaveText(
     "/nested/route?from=browser-test",
+  );
+});
+
+test("preview iframe can recover its client identity after a service worker restart", async ({
+  page,
+  context,
+}) => {
+  await page.goto("/tests/browser/clean-preview.html");
+  await expect(page.locator("#status")).toHaveAttribute("data-ready", "true", {
+    timeout: 30_000,
+  });
+
+  const cleanUrl = (await page.locator("#status").textContent())!;
+  expect(cleanUrl).toMatch(/^http:\/\/pod[\w-]*-3000\.localhost:3333\//);
+
+  const previewPromise = context.waitForEvent("page");
+  await page.locator("#open").click();
+  const preview = await previewPromise;
+  await waitForGuest(preview);
+
+  await restartServiceWorker(preview);
+  await preview.reload();
+  await waitForGuest(preview);
+
+  await preview.goto(`${cleanUrl}nested/route?from=sw-recovery`);
+  await waitForGuest(preview);
+  await expect(preview.locator("#request-path")).toHaveText(
+    "/nested/route?from=sw-recovery",
   );
 });
