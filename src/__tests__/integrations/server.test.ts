@@ -61,6 +61,14 @@ describe("integrations/server", () => {
     expect(a).toBe(b);
   });
 
+  it("gates preview recovery to actual preview clients for same-origin iframes", async () => {
+    const src = await getServiceWorkerSource();
+    expect(src).toMatch(/hasPreviewClientBeenIdentified/);
+    expect(src).toMatch(/if \(client && !hasPreviewClientBeenIdentified\(client\)\)/);
+    expect(src).toMatch(/regular iframes keep/);
+    expect(src).not.toMatch(/refererPod \|\| mayResolveViaClient \|\| clientId/);
+  });
+
   it("serves both hostname-preview bridge assets", async () => {
     expect(DEFAULT_BRIDGE_HTML_PATH).toBe("/__nodepod_bridge__.html");
     expect(DEFAULT_BRIDGE_SCRIPT_PATH).toBe("/__nodepod_bridge__.js");

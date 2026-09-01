@@ -947,6 +947,22 @@ function onPortMessage(event, mp) {
 // Worker globals are lost when the browser suspends this service worker.
 // Ask the requesting preview for its baked-in identity instead of guessing
 // from a stripped path shared by several frames or falling through to the host.
+function hasPreviewClientBeenIdentified(client) {
+  if (!client || client.frameType !== "nested") return false;
+  if (client.id && previewClients.has(client.id)) return true;
+  if (!client.url) return false;
+  try {
+    const parsed = new URL(client.url);
+    const explicitPreview =
+      matchPreviewOrVirtualPath(parsed.pathname, "preview") ||
+      matchPreviewOrVirtualPath(parsed.pathname, "virtual");
+    if (explicitPreview) return true;
+    const strippedPath = stripPreviewPrefix(parsed.pathname);
+    if (lookupPodForClaimedPath(strippedPath)) return true;
+  } catch {}
+  return false;
+}
+
 function recoverPreviewClient(client) {
   if (!client || client.frameType !== "nested") return Promise.resolve(null);
   return new Promise((resolve) => {
@@ -1130,6 +1146,9 @@ self.addEventListener("fetch", (event) => {
             }
           }
           if (client && client.frameType === "top-level") {
+            return fetch(request);
+          }
+          if (client && !hasPreviewClientBeenIdentified(client)) {
             return fetch(request);
           }
           // A live iframe remains the authority even if another preview has
